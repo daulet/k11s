@@ -18,6 +18,7 @@ import (
 
 type BootstrapResult struct {
 	Spawned   bool
+	Restarted bool
 	Handshake protocol.HandshakeResponse
 }
 
@@ -46,7 +47,10 @@ func (e *DaemonUnavailableError) Unwrap() error {
 func Bootstrap(ctx context.Context, cfg config.Config, clientVersion string) (BootstrapResult, error) {
 	resp, err := handshake(ctx, cfg, clientVersion)
 	if err == nil {
-		return BootstrapResult{Spawned: false, Handshake: resp}, nil
+		if shouldUpgradeDaemon(clientVersion, resp.DaemonVersion) {
+			return restartDaemon(ctx, cfg, clientVersion, resp)
+		}
+		return BootstrapResult{Spawned: false, Restarted: false, Handshake: resp}, nil
 	}
 
 	var incompatibleErr *IncompatibleRPCError
@@ -63,20 +67,129 @@ func Bootstrap(ctx context.Context, cfg config.Config, clientVersion string) (Bo
 		return BootstrapResult{}, fmt.Errorf("start daemon: %w", err)
 	}
 
+	resp, err = waitForDaemonReady(ctx, cfg, clientVersion)
+	if err != nil {
+		return BootstrapResult{}, err
+	}
+
+	return BootstrapResult{Spawned: true, Restarted: false, Handshake: resp}, nil
+}
+
+func restartDaemon(ctx context.Context, cfg config.Config, clientVersion string, current protocol.HandshakeResponse) (BootstrapResult, error) {
+	if err := requestDaemonShutdown(ctx, cfg, clientVersion); err != nil {
+		if signalErr := signalDaemonProcess(current.PID); signalErr != nil {
+			return BootstrapResult{}, fmt.Errorf(
+				"request graceful daemon shutdown (pid=%d): %v (signal fallback failed: %v)",
+				current.PID,
+				err,
+				signalErr,
+			)
+		}
+	}
+
+	if err := waitForDaemonExit(ctx, cfg, clientVersion); err != nil {
+		return BootstrapResult{}, err
+	}
+
+	if err := spawnDaemon(cfg.SocketPath); err != nil {
+		return BootstrapResult{}, fmt.Errorf("start upgraded daemon: %w", err)
+	}
+
+	resp, err := waitForDaemonReady(ctx, cfg, clientVersion)
+	if err != nil {
+		return BootstrapResult{}, err
+	}
+	if shouldUpgradeDaemon(clientVersion, resp.DaemonVersion) {
+		return BootstrapResult{}, fmt.Errorf(
+			"daemon restart completed but version mismatch remains: client=%s daemon=%s",
+			clientVersion,
+			resp.DaemonVersion,
+		)
+	}
+
+	return BootstrapResult{Spawned: true, Restarted: true, Handshake: resp}, nil
+}
+
+func waitForDaemonReady(ctx context.Context, cfg config.Config, clientVersion string) (protocol.HandshakeResponse, error) {
 	deadline := time.Now().Add(cfg.SpawnTimeout)
 	for {
-		resp, err = handshake(ctx, cfg, clientVersion)
+		resp, err := handshake(ctx, cfg, clientVersion)
 		if err == nil {
-			return BootstrapResult{Spawned: true, Handshake: resp}, nil
+			return resp, nil
 		}
-		if errors.As(err, &incompatibleErr) {
-			return BootstrapResult{}, err
+		var unavailableErr *DaemonUnavailableError
+		if !errors.As(err, &unavailableErr) {
+			return protocol.HandshakeResponse{}, err
 		}
 		if time.Now().After(deadline) {
-			return BootstrapResult{}, fmt.Errorf("daemon did not become ready within %s: %w", cfg.SpawnTimeout, err)
+			return protocol.HandshakeResponse{}, fmt.Errorf("daemon did not become ready within %s: %w", cfg.SpawnTimeout, err)
 		}
 		time.Sleep(cfg.RetryInterval)
 	}
+}
+
+func requestDaemonShutdown(ctx context.Context, cfg config.Config, clientVersion string) error {
+	dialer := &net.Dialer{Timeout: cfg.ConnectTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", cfg.SocketPath)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(cfg.ConnectTimeout))
+
+	req := protocol.HandshakeRequest{
+		ClientName:    "k11s",
+		ClientVersion: clientVersion,
+		RPCVersion:    cfg.RPCVersion,
+		Intent:        "shutdown",
+	}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return fmt.Errorf("send shutdown request: %w", err)
+	}
+
+	var resp protocol.HandshakeResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return fmt.Errorf("receive shutdown response: %w", err)
+	}
+	if !resp.Compatible {
+		return fmt.Errorf("daemon refused shutdown request: %s", resp.Message)
+	}
+	if !resp.ShuttingDown {
+		return errors.New("daemon did not acknowledge shutdown")
+	}
+	return nil
+}
+
+func waitForDaemonExit(ctx context.Context, cfg config.Config, clientVersion string) error {
+	deadline := time.Now().Add(cfg.SpawnTimeout)
+	for time.Now().Before(deadline) {
+		_, err := handshake(ctx, cfg, clientVersion)
+		var unavailableErr *DaemonUnavailableError
+		if errors.As(err, &unavailableErr) {
+			return nil
+		}
+		time.Sleep(cfg.RetryInterval)
+	}
+	return fmt.Errorf("daemon did not stop within %s", cfg.SpawnTimeout)
+}
+
+func shouldUpgradeDaemon(clientVersion string, daemonVersion string) bool {
+	if clientVersion == "" || daemonVersion == "" {
+		return false
+	}
+	return clientVersion != daemonVersion
+}
+
+func signalDaemonProcess(pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid daemon pid: %d", pid)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return process.Signal(syscall.SIGTERM)
 }
 
 func handshake(ctx context.Context, cfg config.Config, clientVersion string) (protocol.HandshakeResponse, error) {

@@ -8,6 +8,7 @@ type HandshakeRequest struct {
 	ClientName    string `json:"clientName"`
 	ClientVersion string `json:"clientVersion"`
 	RPCVersion    string `json:"rpcVersion"`
+	Intent        string `json:"intent,omitempty"`
 }
 
 type HandshakeResponse struct {
@@ -15,6 +16,7 @@ type HandshakeResponse struct {
 	DaemonVersion string `json:"daemonVersion"`
 	RPCVersion    string `json:"rpcVersion"`
 	PID           int    `json:"pid"`
+	ShuttingDown  bool   `json:"shuttingDown,omitempty"`
 	Message       string `json:"message,omitempty"`
 }
 
@@ -38,5 +40,16 @@ func BuildHandshakeResponse(req HandshakeRequest, daemonVersion string, pid int)
 		resp.Message = fmt.Sprintf("incompatible rpc version: client=%s daemon=%s", req.RPCVersion, RPCVersion)
 	}
 
+	return resp
+}
+
+func BuildShutdownResponse(req HandshakeRequest, daemonVersion string, pid int) HandshakeResponse {
+	resp := BuildHandshakeResponse(req, daemonVersion, pid)
+	if !resp.Compatible {
+		return resp
+	}
+
+	resp.ShuttingDown = true
+	resp.Message = "shutdown acknowledged"
 	return resp
 }

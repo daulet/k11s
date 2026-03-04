@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/dzhanguzin/k11s/internal/config"
@@ -38,9 +39,17 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	logger := log.New(os.Stderr, "k11sd: ", log.LstdFlags)
 	logger.Printf("listening on %s", cfg.SocketPath)
 
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			logger.Print("graceful shutdown requested")
+			_ = listener.Close()
+		})
+	}
+
 	go func() {
 		<-ctx.Done()
-		_ = listener.Close()
+		shutdown()
 	}()
 
 	for {
@@ -53,11 +62,11 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 			continue
 		}
 
-		go handleConn(conn, daemonVersion)
+		go handleConn(conn, daemonVersion, shutdown)
 	}
 }
 
-func handleConn(conn net.Conn, daemonVersion string) {
+func handleConn(conn net.Conn, daemonVersion string, shutdown func()) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
@@ -70,6 +79,15 @@ func handleConn(conn net.Conn, daemonVersion string) {
 			PID:           os.Getpid(),
 			Message:       fmt.Sprintf("decode handshake: %v", err),
 		})
+		return
+	}
+
+	if req.Intent == "shutdown" {
+		resp := protocol.BuildShutdownResponse(req, daemonVersion, os.Getpid())
+		_ = json.NewEncoder(conn).Encode(resp)
+		if resp.Compatible {
+			shutdown()
+		}
 		return
 	}
 

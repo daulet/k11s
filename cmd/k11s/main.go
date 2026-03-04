@@ -34,7 +34,9 @@ func main() {
 	}
 
 	startMode := "warm"
-	if result.Spawned {
+	if result.Restarted {
+		startMode = "upgrade"
+	} else if result.Spawned {
 		startMode = "cold"
 	}
 

@@ -29,6 +29,7 @@ Primary goals:
 - `k11s` and `k11sd` binaries exist.
 - `k11s` performs warm connect first, then auto-spawns `k11sd` on cold start.
 - Daemon handshake enforces RPC version compatibility.
+- If daemon version differs from client version, `k11s` requests graceful daemon shutdown and starts a matching daemon.
 
 ## Quickstart
 
