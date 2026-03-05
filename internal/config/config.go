@@ -11,6 +11,7 @@ import (
 
 const (
 	socketFileName         = "k11sd.sock"
+	sessionFileName        = "session.json"
 	defaultConnectTimeout  = 150 * time.Millisecond
 	defaultSpawnTimeout    = 2 * time.Second
 	defaultRetryInterval   = 75 * time.Millisecond
@@ -19,6 +20,7 @@ const (
 
 type Config struct {
 	SocketPath      string
+	SessionPath     string
 	ConnectTimeout  time.Duration
 	SpawnTimeout    time.Duration
 	RetryInterval   time.Duration
@@ -36,8 +38,18 @@ func Load() (Config, error) {
 		socketPath = filepath.Join(runtimeDir, socketFileName)
 	}
 
+	sessionPath := os.Getenv("K11S_SESSION")
+	if sessionPath == "" {
+		stateDir, err := resolveStateDir()
+		if err != nil {
+			return Config{}, err
+		}
+		sessionPath = filepath.Join(stateDir, sessionFileName)
+	}
+
 	return Config{
 		SocketPath:      socketPath,
+		SessionPath:     sessionPath,
 		ConnectTimeout:  defaultConnectTimeout,
 		SpawnTimeout:    defaultSpawnTimeout,
 		RetryInterval:   defaultRetryInterval,
@@ -48,6 +60,14 @@ func Load() (Config, error) {
 
 func EnsureSocketDir(socketPath string) error {
 	dir := filepath.Dir(socketPath)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	return os.MkdirAll(dir, 0o700)
+}
+
+func EnsureSessionDir(sessionPath string) error {
+	dir := filepath.Dir(sessionPath)
 	if dir == "" || dir == "." {
 		return nil
 	}
@@ -68,4 +88,20 @@ func resolveRuntimeDir() (string, error) {
 	}
 
 	return "", errors.New("unable to resolve runtime directory for daemon socket")
+}
+
+func resolveStateDir() (string, error) {
+	if xdgState := os.Getenv("XDG_STATE_HOME"); xdgState != "" {
+		return filepath.Join(xdgState, "k11s"), nil
+	}
+
+	if configDir, err := os.UserConfigDir(); err == nil && configDir != "" {
+		return filepath.Join(configDir, "k11s"), nil
+	}
+
+	if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
+		return filepath.Join(homeDir, ".k11s"), nil
+	}
+
+	return "", errors.New("unable to resolve persistent state directory")
 }

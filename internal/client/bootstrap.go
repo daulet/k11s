@@ -142,7 +142,7 @@ func requestDaemonShutdown(ctx context.Context, cfg config.Config, clientVersion
 		ClientName:    "k11s",
 		ClientVersion: clientVersion,
 		RPCVersion:    cfg.RPCVersion,
-		Intent:        "shutdown",
+		Intent:        protocol.IntentShutdown,
 	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return fmt.Errorf("send shutdown request: %w", err)

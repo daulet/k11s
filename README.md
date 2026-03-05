@@ -30,6 +30,7 @@ Primary goals:
 - `k11s` performs warm connect first, then auto-spawns `k11sd` on cold start.
 - Daemon handshake enforces RPC version compatibility.
 - If daemon version differs from client version, `k11s` requests graceful daemon shutdown and starts a matching daemon.
+- Session state is persisted by daemon and restored on launch.
 
 ## Quickstart
 
@@ -42,3 +43,11 @@ K11SD_PATH="$PWD/bin/k11sd" ./bin/k11s
 Optional overrides:
 - `K11S_SOCKET`: explicit Unix socket path.
 - `K11SD_PATH`: explicit daemon binary path used for auto-spawn.
+- `K11S_SESSION`: explicit session state file path.
+
+Session override flags (persisted through daemon):
+- `--context`
+- `--namespace`
+- `--resource`
+- `--filter`
+- `--selection`

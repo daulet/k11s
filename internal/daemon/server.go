@@ -13,11 +13,15 @@ import (
 
 	"github.com/dzhanguzin/k11s/internal/config"
 	"github.com/dzhanguzin/k11s/internal/protocol"
+	"github.com/dzhanguzin/k11s/internal/session"
 )
 
 func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	if err := config.EnsureSocketDir(cfg.SocketPath); err != nil {
 		return fmt.Errorf("prepare socket directory: %w", err)
+	}
+	if err := config.EnsureSessionDir(cfg.SessionPath); err != nil {
+		return fmt.Errorf("prepare session directory: %w", err)
 	}
 	if err := removeStaleSocket(cfg.SocketPath, cfg.ConnectTimeout); err != nil {
 		return err
@@ -38,6 +42,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 
 	logger := log.New(os.Stderr, "k11sd: ", log.LstdFlags)
 	logger.Printf("listening on %s", cfg.SocketPath)
+	store := session.NewStore(cfg.SessionPath)
 
 	var shutdownOnce sync.Once
 	shutdown := func() {
@@ -62,11 +67,11 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 			continue
 		}
 
-		go handleConn(conn, daemonVersion, shutdown)
+		go handleConn(conn, daemonVersion, shutdown, store, logger)
 	}
 }
 
-func handleConn(conn net.Conn, daemonVersion string, shutdown func()) {
+func handleConn(conn net.Conn, daemonVersion string, shutdown func(), store *session.Store, logger *log.Logger) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
@@ -82,12 +87,55 @@ func handleConn(conn net.Conn, daemonVersion string, shutdown func()) {
 		return
 	}
 
-	if req.Intent == "shutdown" {
+	switch req.Intent {
+	case protocol.IntentShutdown:
 		resp := protocol.BuildShutdownResponse(req, daemonVersion, os.Getpid())
 		_ = json.NewEncoder(conn).Encode(resp)
 		if resp.Compatible {
 			shutdown()
 		}
+		return
+	case protocol.IntentSessionGet:
+		state, err := store.Load()
+		if err != nil && !errors.Is(err, session.ErrCorruptSession) {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       fmt.Sprintf("load session: %v", err),
+			})
+			return
+		}
+		if errors.Is(err, session.ErrCorruptSession) {
+			logger.Printf("session file corrupt, using defaults: %v", err)
+		}
+		resp := protocol.BuildSessionGetResponse(req, daemonVersion, os.Getpid(), state)
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
+	case protocol.IntentSessionSave:
+		if req.Session == nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "missing session payload",
+			})
+			return
+		}
+		if err := store.Save(*req.Session); err != nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       fmt.Sprintf("save session: %v", err),
+			})
+			return
+		}
+		resp := protocol.BuildSessionSaveResponse(req, daemonVersion, os.Getpid())
+		_ = json.NewEncoder(conn).Encode(resp)
 		return
 	}
 

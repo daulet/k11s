@@ -41,3 +41,31 @@ func TestBuildShutdownResponseIncompatible(t *testing.T) {
 		t.Fatalf("expected shuttingDown=false for incompatible response")
 	}
 }
+
+func TestBuildSessionGetResponse(t *testing.T) {
+	state := SessionState{
+		KubeContext: "ctx-a",
+		Namespace:   "ns-a",
+		Resource:    "pods",
+		Filter:      "app=web",
+		Selection:   "pod-a",
+		UpdatedAtMs: 10,
+	}
+
+	resp := BuildSessionGetResponse(
+		HandshakeRequest{RPCVersion: RPCVersion, Intent: IntentSessionGet},
+		"dev",
+		123,
+		state,
+	)
+
+	if !resp.Compatible {
+		t.Fatalf("expected compatible response")
+	}
+	if resp.Session == nil {
+		t.Fatalf("expected session payload")
+	}
+	if resp.Session.KubeContext != "ctx-a" {
+		t.Fatalf("unexpected session context: %q", resp.Session.KubeContext)
+	}
+}
