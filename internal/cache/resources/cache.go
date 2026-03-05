@@ -50,6 +50,7 @@ type cacheKey struct {
 	kubeContext string
 	namespace   string
 	resource    string
+	filter      string
 }
 
 type cacheEntry struct {
@@ -94,6 +95,7 @@ func (c *Cache) Get(query protocol.ResourceListQuery) protocol.ResourceListPaylo
 		kubeContext: query.KubeContext,
 		namespace:   query.Namespace,
 		resource:    query.Resource,
+		filter:      query.Filter,
 	}
 
 	c.mu.Lock()
@@ -125,11 +127,13 @@ func (c *Cache) GetDetail(query protocol.ResourceDetailQuery) protocol.ResourceD
 		kubeContext: query.KubeContext,
 		namespace:   query.Namespace,
 		resource:    query.Resource,
+		filter:      query.Filter,
 	}
 	listQuery := protocol.ResourceListQuery{
 		KubeContext:   query.KubeContext,
 		Resource:      query.Resource,
 		Namespace:     query.Namespace,
+		Filter:        query.Filter,
 		SimulateStale: query.SimulateStale,
 	}
 
@@ -385,6 +389,7 @@ func normalizeQuery(query protocol.ResourceListQuery) protocol.ResourceListQuery
 	}
 
 	query.KubeContext = strings.TrimSpace(query.KubeContext)
+	query.Filter = strings.TrimSpace(query.Filter)
 	return query
 }
 
@@ -399,6 +404,7 @@ func normalizeDetailQuery(query protocol.ResourceDetailQuery) protocol.ResourceD
 		query.Namespace = "default"
 	}
 	query.KubeContext = strings.TrimSpace(query.KubeContext)
+	query.Filter = strings.TrimSpace(query.Filter)
 	query.ItemNamespace = strings.TrimSpace(query.ItemNamespace)
 	query.Name = strings.TrimSpace(query.Name)
 	if query.Name == "" {

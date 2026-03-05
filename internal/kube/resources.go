@@ -10,8 +10,12 @@ import (
 	"github.com/daulet/k11s/internal/protocol"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 )
 
 type ResourceFetcher struct {
@@ -27,7 +31,7 @@ func NewResourceFetcher(clients *ClientFactory) *ResourceFetcher {
 
 func IsCoreResource(resource string) bool {
 	switch strings.ToLower(strings.TrimSpace(resource)) {
-	case "pods", "services", "deployments":
+	case "pods", "services", "deployments", "crds", "crs":
 		return true
 	default:
 		return false
@@ -37,7 +41,7 @@ func IsCoreResource(resource string) bool {
 func (f *ResourceFetcher) List(ctx context.Context, query protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
 	resource := strings.ToLower(strings.TrimSpace(query.Resource))
 	if !IsCoreResource(resource) {
-		return nil, fmt.Errorf("resource %q is not in phase-1 core set", resource)
+		return nil, fmt.Errorf("resource %q is not in supported cache-backed set", resource)
 	}
 
 	apiNamespace, displayNamespace := resolveListNamespace(query.Namespace)
@@ -66,6 +70,10 @@ func (f *ResourceFetcher) List(ctx context.Context, query protocol.ResourceListQ
 			return nil, fmt.Errorf("list deployments for namespace %q: %w", displayNamespace, err)
 		}
 		return deploymentsToItems(deployments.Items), nil
+	case "crds":
+		return f.listCRDs(ctx, query)
+	case "crs":
+		return f.listCRs(ctx, query)
 	}
 
 	return nil, fmt.Errorf("unsupported resource %q", resource)
@@ -79,7 +87,7 @@ func (f *ResourceFetcher) Watch(
 ) error {
 	resource := strings.ToLower(strings.TrimSpace(query.Resource))
 	if !IsCoreResource(resource) {
-		return fmt.Errorf("resource %q is not in phase-1 core set", resource)
+		return fmt.Errorf("resource %q is not in supported cache-backed set", resource)
 	}
 	if onUpdate == nil {
 		onUpdate = func([]protocol.ResourceItem) {}
@@ -153,9 +161,277 @@ func (f *ResourceFetcher) Watch(
 			onUpdate,
 			onError,
 		)
+	case "crds":
+		return f.watchCRDs(ctx, query, onUpdate, onError)
+	case "crs":
+		return f.watchCRs(ctx, query, onUpdate, onError)
 	default:
 		return fmt.Errorf("unsupported resource %q", resource)
 	}
+}
+
+func (f *ResourceFetcher) listCRDs(ctx context.Context, query protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
+	client, err := f.clients.APIExtensionsForContext(query.KubeContext)
+	if err != nil {
+		return nil, err
+	}
+
+	crds, err := client.ApiextensionsV1().CustomResourceDefinitions().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list crds: %w", err)
+	}
+	return crdsToItems(crds.Items), nil
+}
+
+func (f *ResourceFetcher) listCRs(ctx context.Context, query protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
+	selected, ok, err := f.resolveSelectedCRD(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+
+	dyn, err := f.clients.DynamicForContext(query.KubeContext)
+	if err != nil {
+		return nil, err
+	}
+	return listCRItems(ctx, dyn, selected, query.Namespace)
+}
+
+func (f *ResourceFetcher) watchCRDs(
+	ctx context.Context,
+	query protocol.ResourceListQuery,
+	onUpdate func(items []protocol.ResourceItem),
+	onError func(error),
+) error {
+	client, err := f.clients.APIExtensionsForContext(query.KubeContext)
+	if err != nil {
+		return err
+	}
+
+	return runListWatchLoop(
+		ctx,
+		func() ([]protocol.ResourceItem, string, error) {
+			crds, err := client.ApiextensionsV1().CustomResourceDefinitions().List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, "", fmt.Errorf("list crds: %w", err)
+			}
+			return crdsToItems(crds.Items), crds.ResourceVersion, nil
+		},
+		func(resourceVersion string) (watch.Interface, error) {
+			return client.ApiextensionsV1().CustomResourceDefinitions().Watch(ctx, metav1.ListOptions{
+				ResourceVersion:     resourceVersion,
+				AllowWatchBookmarks: true,
+			})
+		},
+		onUpdate,
+		onError,
+	)
+}
+
+func (f *ResourceFetcher) watchCRs(
+	ctx context.Context,
+	query protocol.ResourceListQuery,
+	onUpdate func(items []protocol.ResourceItem),
+	onError func(error),
+) error {
+	selected, ok, err := f.resolveSelectedCRD(ctx, query)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		onUpdate(nil)
+		<-ctx.Done()
+		return nil
+	}
+
+	dyn, err := f.clients.DynamicForContext(query.KubeContext)
+	if err != nil {
+		return err
+	}
+
+	return runListWatchLoop(
+		ctx,
+		func() ([]protocol.ResourceItem, string, error) {
+			items, rv, err := listCRItemsWithVersion(ctx, dyn, selected, query.Namespace)
+			if err != nil {
+				return nil, "", err
+			}
+			return items, rv, nil
+		},
+		func(resourceVersion string) (watch.Interface, error) {
+			return watchCRList(ctx, dyn, selected, query.Namespace, resourceVersion)
+		},
+		onUpdate,
+		onError,
+	)
+}
+
+type selectedCRD struct {
+	Name       string
+	GVR        schema.GroupVersionResource
+	Namespaced bool
+}
+
+func (f *ResourceFetcher) resolveSelectedCRD(
+	ctx context.Context,
+	query protocol.ResourceListQuery,
+) (selectedCRD, bool, error) {
+	filter := strings.TrimSpace(query.Filter)
+	if filter == "" {
+		return selectedCRD{}, false, nil
+	}
+
+	client, err := f.clients.APIExtensionsForContext(query.KubeContext)
+	if err != nil {
+		return selectedCRD{}, false, err
+	}
+
+	crds, err := client.ApiextensionsV1().CustomResourceDefinitions().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return selectedCRD{}, false, fmt.Errorf("list crds to resolve filter %q: %w", filter, err)
+	}
+
+	selected, ok := selectCRDByFilter(crds.Items, filter)
+	if !ok {
+		return selectedCRD{}, false, fmt.Errorf("crd %q not found", filter)
+	}
+	return selected, true, nil
+}
+
+func selectCRDByFilter(crds []apiextv1.CustomResourceDefinition, filter string) (selectedCRD, bool) {
+	filter = strings.TrimSpace(strings.ToLower(filter))
+	if filter == "" {
+		return selectedCRD{}, false
+	}
+	for _, crd := range crds {
+		if resolved, ok := resolveCRD(crd); ok {
+			if crdMatchesFilter(crd, filter) {
+				return resolved, true
+			}
+		}
+	}
+	return selectedCRD{}, false
+}
+
+func crdMatchesFilter(crd apiextv1.CustomResourceDefinition, filter string) bool {
+	name := strings.ToLower(strings.TrimSpace(crd.Name))
+	plural := strings.ToLower(strings.TrimSpace(crd.Spec.Names.Plural))
+	group := strings.ToLower(strings.TrimSpace(crd.Spec.Group))
+
+	if filter == name {
+		return true
+	}
+	if filter == plural+"."+group {
+		return true
+	}
+	if filter == group+"/"+plural {
+		return true
+	}
+	return false
+}
+
+func resolveCRD(crd apiextv1.CustomResourceDefinition) (selectedCRD, bool) {
+	version := ""
+	for _, candidate := range crd.Spec.Versions {
+		if candidate.Storage {
+			version = candidate.Name
+			break
+		}
+	}
+	if version == "" {
+		for _, candidate := range crd.Spec.Versions {
+			if candidate.Served {
+				version = candidate.Name
+				break
+			}
+		}
+	}
+	if version == "" {
+		return selectedCRD{}, false
+	}
+
+	return selectedCRD{
+		Name: crd.Name,
+		GVR: schema.GroupVersionResource{
+			Group:    crd.Spec.Group,
+			Version:  version,
+			Resource: crd.Spec.Names.Plural,
+		},
+		Namespaced: crd.Spec.Scope == apiextv1.NamespaceScoped,
+	}, true
+}
+
+func listCRItems(
+	ctx context.Context,
+	client dynamic.Interface,
+	selected selectedCRD,
+	namespace string,
+) ([]protocol.ResourceItem, error) {
+	items, _, err := listCRItemsWithVersion(ctx, client, selected, namespace)
+	return items, err
+}
+
+func listCRItemsWithVersion(
+	ctx context.Context,
+	client dynamic.Interface,
+	selected selectedCRD,
+	namespace string,
+) ([]protocol.ResourceItem, string, error) {
+	list, err := listCRUnstructured(ctx, client, selected, namespace, metav1.ListOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	return unstructuredToItems(list.Items), list.GetResourceVersion(), nil
+}
+
+func watchCRList(
+	ctx context.Context,
+	client dynamic.Interface,
+	selected selectedCRD,
+	namespace string,
+	resourceVersion string,
+) (watch.Interface, error) {
+	resource := client.Resource(selected.GVR)
+	listOptions := metav1.ListOptions{
+		ResourceVersion:     resourceVersion,
+		AllowWatchBookmarks: true,
+	}
+	if selected.Namespaced {
+		apiNamespace, _ := resolveListNamespace(namespace)
+		return resource.Namespace(apiNamespace).Watch(ctx, listOptions)
+	}
+	return resource.Watch(ctx, listOptions)
+}
+
+func listCRUnstructured(
+	ctx context.Context,
+	client dynamic.Interface,
+	selected selectedCRD,
+	namespace string,
+	opts metav1.ListOptions,
+) (*unstructured.UnstructuredList, error) {
+	resource := client.Resource(selected.GVR)
+	if selected.Namespaced {
+		apiNamespace, displayNamespace := resolveListNamespace(namespace)
+		list, err := resource.Namespace(apiNamespace).List(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"list %s in namespace %q: %w",
+				selected.GVR.Resource+"."+selected.GVR.Group,
+				displayNamespace,
+				err,
+			)
+		}
+		return list, nil
+	}
+
+	list, err := resource.List(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("list cluster-scoped %s: %w", selected.GVR.Resource+"."+selected.GVR.Group, err)
+	}
+	return list, nil
 }
 
 func runListWatchLoop(
@@ -296,6 +572,71 @@ func deploymentsToItems(deployments []appsv1.Deployment) []protocol.ResourceItem
 		items = append(items, protocol.ResourceItem{
 			Name:      deployment.Name,
 			Namespace: deployment.Namespace,
+			Status:    status,
+		})
+	}
+	sortResourceItems(items)
+	return items
+}
+
+func crdsToItems(crds []apiextv1.CustomResourceDefinition) []protocol.ResourceItem {
+	items := make([]protocol.ResourceItem, 0, len(crds))
+	for _, crd := range crds {
+		scope := "Cluster"
+		if crd.Spec.Scope == apiextv1.NamespaceScoped {
+			scope = "Namespaced"
+		}
+		storageVersion := ""
+		for _, version := range crd.Spec.Versions {
+			if version.Storage {
+				storageVersion = version.Name
+				break
+			}
+		}
+		if storageVersion == "" {
+			for _, version := range crd.Spec.Versions {
+				if version.Served {
+					storageVersion = version.Name
+					break
+				}
+			}
+		}
+		status := scope
+		if storageVersion != "" {
+			status = fmt.Sprintf("%s v%s", scope, storageVersion)
+		}
+		items = append(items, protocol.ResourceItem{
+			Name:      crd.Name,
+			Namespace: "-",
+			Status:    status,
+		})
+	}
+	sortResourceItems(items)
+	return items
+}
+
+func unstructuredToItems(values []unstructured.Unstructured) []protocol.ResourceItem {
+	items := make([]protocol.ResourceItem, 0, len(values))
+	for _, value := range values {
+		namespace := strings.TrimSpace(value.GetNamespace())
+		if namespace == "" {
+			namespace = "-"
+		}
+
+		status := "Unknown"
+		if phase, ok, _ := unstructured.NestedString(value.Object, "status", "phase"); ok && phase != "" {
+			status = phase
+		} else if ready, ok, _ := unstructured.NestedBool(value.Object, "status", "ready"); ok {
+			if ready {
+				status = "Ready"
+			} else {
+				status = "NotReady"
+			}
+		}
+
+		items = append(items, protocol.ResourceItem{
+			Name:      value.GetName(),
+			Namespace: namespace,
 			Status:    status,
 		})
 	}

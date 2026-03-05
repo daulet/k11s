@@ -34,7 +34,7 @@ Primary goals:
 - Session state is persisted by daemon and restored on launch.
 - Daemon serves `pods`, `services`, and `deployments` from a watch-backed cache with relist recovery, including detail lookups from the same cache.
 - Namespace autocomplete is loaded via daemon RPC and refreshed per selected kube context.
-- Other resources currently use placeholder responses with freshness metadata.
+- `crds` and `crs` views are backed by daemon cache; most other resources still use placeholder responses with freshness metadata.
 - Status bar renders freshness badge, age, snapshot time, source, and watch health.
 - `k11s` runs an interactive Bubble Tea TUI by default, with periodic background list refresh.
 
@@ -83,6 +83,8 @@ Command line examples:
 - `:ns all` (all namespaces view)
 - `:ctx dev-cluster` or `:context dev-cluster`
 - `:pods`, `:services`, `:deployments` (switch resource view)
+- `:crds` (list custom resource definitions)
+- `:crs widgets.example.com` or `:crd widgets.example.com` (list CRs for a selected CRD)
 
 Autocomplete notes:
 - `:ctx ` / `:context ` suggestions are loaded from kubeconfig (`KUBECONFIG` or `~/.kube/config`).

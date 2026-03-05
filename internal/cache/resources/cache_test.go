@@ -3,6 +3,7 @@ package resources
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -121,6 +122,47 @@ func TestCacheKeysIncludeKubeContext(t *testing.T) {
 
 	if devPayload.Items[0].Name == prodPayload.Items[0].Name {
 		t.Fatalf("expected separate cache entries per context, got %q", devPayload.Items[0].Name)
+	}
+}
+
+func TestCacheKeysIncludeFilter(t *testing.T) {
+	fetcher := &filterAwareFetcher{}
+	cache := New(context.Background(), fetcher, nil)
+
+	_ = cache.Get(protocol.ResourceListQuery{
+		KubeContext: "dev",
+		Resource:    "crs",
+		Namespace:   "all",
+		Filter:      "widgets.example.com",
+	})
+	widgetsPayload := waitForCondition(t, 250*time.Millisecond, func() (protocol.ResourceListPayload, bool) {
+		next := cache.Get(protocol.ResourceListQuery{
+			KubeContext: "dev",
+			Resource:    "crs",
+			Namespace:   "all",
+			Filter:      "widgets.example.com",
+		})
+		return next, next.Freshness.State == protocol.FreshnessStateLive && len(next.Items) == 1
+	})
+
+	_ = cache.Get(protocol.ResourceListQuery{
+		KubeContext: "dev",
+		Resource:    "crs",
+		Namespace:   "all",
+		Filter:      "gadgets.example.com",
+	})
+	gadgetsPayload := waitForCondition(t, 250*time.Millisecond, func() (protocol.ResourceListPayload, bool) {
+		next := cache.Get(protocol.ResourceListQuery{
+			KubeContext: "dev",
+			Resource:    "crs",
+			Namespace:   "all",
+			Filter:      "gadgets.example.com",
+		})
+		return next, next.Freshness.State == protocol.FreshnessStateLive && len(next.Items) == 1
+	})
+
+	if widgetsPayload.Items[0].Name == gadgetsPayload.Items[0].Name {
+		t.Fatalf("expected separate cache entries per filter, got %q", widgetsPayload.Items[0].Name)
 	}
 }
 
@@ -276,6 +318,18 @@ func (f *contextAwareFetcher) List(ctx context.Context, query protocol.ResourceL
 	}
 	return []protocol.ResourceItem{
 		{Name: name, Namespace: query.Namespace, Status: "Running"},
+	}, nil
+}
+
+type filterAwareFetcher struct{}
+
+func (f *filterAwareFetcher) List(ctx context.Context, query protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
+	name := strings.TrimSpace(query.Filter)
+	if name == "" {
+		name = "no-filter"
+	}
+	return []protocol.ResourceItem{
+		{Name: name + "-item", Namespace: query.Namespace, Status: "Running"},
 	}, nil
 }
 

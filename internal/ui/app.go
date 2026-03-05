@@ -512,16 +512,70 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 		}
 		m.session.KubeContext = fields[1]
 		return true, fmt.Sprintf("context switched to %s", m.session.KubeContext), true, nil
+	case "filter":
+		if len(fields) < 2 {
+			return false, "", false, fmt.Errorf("filter value required: try `:filter widgets.example.com`")
+		}
+		m.session.Filter = fields[1]
+		return true, fmt.Sprintf("filter set to %s", m.session.Filter), true, nil
+	case "crd":
+		if len(fields) < 2 {
+			return false, "", false, fmt.Errorf("crd value required: try `:crd widgets.example.com`")
+		}
+		m.session.Filter = fields[1]
+		m.session.Resource = "crs"
+		return true, fmt.Sprintf("custom resource target set to %s", m.session.Filter), true, nil
+	case "crs":
+		if len(fields) >= 2 {
+			m.session.Filter = fields[1]
+		} else if strings.EqualFold(strings.TrimSpace(m.session.Resource), "crds") {
+			if item, ok := m.currentItem(); ok {
+				m.session.Filter = item.Name
+			}
+		}
+		m.session.Resource = "crs"
+		if m.session.Filter != "" {
+			return true, fmt.Sprintf("resource switched to crs (%s)", m.session.Filter), true, nil
+		}
+		return true, "resource switched to crs", true, nil
 	case "resource":
 		if len(fields) < 2 {
 			return false, "", false, fmt.Errorf("resource value required: try `:resource pods`")
 		}
-		m.session.Resource = strings.ToLower(fields[1])
+		resource := strings.ToLower(fields[1])
+		if !isKnownResource(resource) {
+			return false, "", false, fmt.Errorf("unknown resource %q", fields[1])
+		}
+		if resource == "crs" {
+			if len(fields) >= 3 {
+				m.session.Filter = fields[2]
+			} else if strings.EqualFold(strings.TrimSpace(m.session.Resource), "crds") {
+				if item, ok := m.currentItem(); ok {
+					m.session.Filter = item.Name
+				}
+			}
+		}
+		m.session.Resource = resource
+		if m.session.Resource == "crs" && m.session.Filter != "" {
+			return true, fmt.Sprintf("resource switched to %s (%s)", m.session.Resource, m.session.Filter), true, nil
+		}
 		return true, fmt.Sprintf("resource switched to %s", m.session.Resource), true, nil
 	default:
 		resource := strings.ToLower(fields[0])
 		if isKnownResource(resource) {
+			if resource == "crs" {
+				if len(fields) >= 2 {
+					m.session.Filter = fields[1]
+				} else if strings.EqualFold(strings.TrimSpace(m.session.Resource), "crds") {
+					if item, ok := m.currentItem(); ok {
+						m.session.Filter = item.Name
+					}
+				}
+			}
 			m.session.Resource = resource
+			if m.session.Resource == "crs" && m.session.Filter != "" {
+				return true, fmt.Sprintf("resource switched to %s (%s)", m.session.Resource, m.session.Filter), true, nil
+			}
 			return true, fmt.Sprintf("resource switched to %s", m.session.Resource), true, nil
 		}
 		return false, "", false, fmt.Errorf("unknown command %q", fields[0])
@@ -537,6 +591,7 @@ func (m model) startListReload() (tea.Model, tea.Cmd) {
 		KubeContext:   m.session.KubeContext,
 		Resource:      m.session.Resource,
 		Namespace:     m.session.Namespace,
+		Filter:        m.session.Filter,
 		SimulateStale: m.simulateStale,
 	}
 	return m, m.loadListCmd(m.activeSeq, query, true)
@@ -550,6 +605,7 @@ func (m model) startBackgroundReload() (tea.Model, tea.Cmd) {
 		KubeContext:   m.session.KubeContext,
 		Resource:      m.session.Resource,
 		Namespace:     m.session.Namespace,
+		Filter:        m.session.Filter,
 		SimulateStale: m.simulateStale,
 	}
 	return m, m.loadListCmd(m.activeSeq, query, false)
@@ -706,7 +762,7 @@ func (m model) renderInputBox(width int) string {
 }
 
 func (m model) renderMainPane(width int, innerHeight int) string {
-	title := m.styles.Title.Render(fmt.Sprintf("%s > %s > %s", displayContext(m.session), m.session.Namespace, m.session.Resource))
+	title := m.styles.Title.Render(fmt.Sprintf("%s > %s > %s", displayContext(m.session), m.session.Namespace, displayResource(m.session)))
 	return drawBox(width, title, m.listLines(), innerHeight)
 }
 
@@ -888,6 +944,7 @@ func (m model) buildSelectedDetailQuery() (protocol.ResourceDetailQuery, bool) {
 		KubeContext:   m.session.KubeContext,
 		Resource:      m.session.Resource,
 		Namespace:     m.session.Namespace,
+		Filter:        m.session.Filter,
 		ItemNamespace: item.Namespace,
 		Name:          item.Name,
 		SimulateStale: m.simulateStale,
@@ -996,6 +1053,8 @@ func (m model) commandSuggestions(input string) []string {
 		return prefixMatches(m.namespaceCandidates(), valuePrefix)
 	case "ctx", "context":
 		return prefixMatches(m.contextCandidates(), valuePrefix)
+	case "crs", "crd", "filter":
+		return prefixMatches(m.crdCandidates(), valuePrefix)
 	case "resource":
 		return prefixMatches(defaultResources, valuePrefix)
 	default:
@@ -1129,6 +1188,9 @@ func (m model) autocompleteOptions(input string) []string {
 		token := strings.ToLower(fields[0])
 		if prefersArgumentCompletion(token, candidates) {
 			valueCandidates := m.commandSuggestions(token + " ")
+			if len(valueCandidates) == 0 {
+				return []string{token + " "}
+			}
 			argumentOptions := make([]string, 0, len(valueCandidates))
 			for _, choice := range valueCandidates {
 				argumentOptions = append(argumentOptions, token+" "+choice)
@@ -1137,7 +1199,7 @@ func (m model) autocompleteOptions(input string) []string {
 		}
 		for _, choice := range candidates {
 			newValue := choice
-			if choice == "ns" || choice == "namespace" || choice == "ctx" || choice == "context" || choice == "resource" {
+			if choice == "ns" || choice == "namespace" || choice == "ctx" || choice == "context" || choice == "resource" || choice == "crd" || choice == "filter" || choice == "crs" {
 				newValue += " "
 			}
 			options = append(options, newValue)
@@ -1213,12 +1275,38 @@ func (m model) contextCandidates() []string {
 	return values
 }
 
+func (m model) crdCandidates() []string {
+	seen := map[string]struct{}{}
+	values := make([]string, 0, len(m.resourceList.Items)+1)
+	appendUnique := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+
+	appendUnique(m.session.Filter)
+	if strings.EqualFold(m.resourceList.Resource, "crds") {
+		for _, item := range m.resourceList.Items {
+			appendUnique(item.Name)
+		}
+	}
+	return values
+}
+
 func baseSuggestions() []string {
 	return []string{
 		"ctx",
 		"context",
 		"ns",
 		"namespace",
+		"crd",
+		"filter",
 		"resource",
 		"pods",
 		"services",
@@ -1237,6 +1325,13 @@ func displayContext(session protocol.SessionState) string {
 		return "default-context"
 	}
 	return session.KubeContext
+}
+
+func displayResource(session protocol.SessionState) string {
+	if session.Resource == "crs" && strings.TrimSpace(session.Filter) != "" {
+		return fmt.Sprintf("crs(%s)", strings.TrimSpace(session.Filter))
+	}
+	return session.Resource
 }
 
 func isKnownResource(value string) bool {
@@ -1319,7 +1414,7 @@ func equalStringSlices(a []string, b []string) bool {
 }
 
 func prefersArgumentCompletion(token string, commandCandidates []string) bool {
-	if token != "ns" && token != "namespace" && token != "ctx" && token != "context" && token != "resource" {
+	if token != "ns" && token != "namespace" && token != "ctx" && token != "context" && token != "resource" && token != "crd" && token != "filter" && token != "crs" {
 		return false
 	}
 	if len(commandCandidates) < 2 {

@@ -212,12 +212,13 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 			KubeContext:   sessionState.KubeContext,
 			Resource:      sessionState.Resource,
 			Namespace:     sessionState.Namespace,
+			Filter:        sessionState.Filter,
 			SimulateStale: opts.simulateStale,
 		},
 	)
-	recorder.AddDuration("placeholder_list", time.Since(listLoadStart))
+	recorder.AddDuration("initial_list", time.Since(listLoadStart))
 	if err != nil {
-		return startupState{}, fmt.Errorf("load placeholder resource list: %w", err)
+		return startupState{}, fmt.Errorf("load initial resource list: %w", err)
 	}
 
 	return startupState{
@@ -266,7 +267,7 @@ func renderStartupOutput(out io.Writer, state startupState, startMode string) ti
 		state.ResourceList.Namespace,
 		len(state.ResourceList.Items),
 	)
-	fmt.Fprintln(out, "ui: placeholder ready (session restored)")
+	fmt.Fprintln(out, "ui: ready (session restored)")
 	return time.Since(firstPaintStart)
 }
 

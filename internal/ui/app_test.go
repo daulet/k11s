@@ -69,6 +69,65 @@ func TestApplyCommandResourceAlias(t *testing.T) {
 	}
 }
 
+func TestApplyCommandCRDTargetsCRs(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	updated, _, reload, err := m.applyCommand("crd widgets.example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected command to update session and trigger reload")
+	}
+	if m.session.Resource != "crs" {
+		t.Fatalf("expected resource crs, got %q", m.session.Resource)
+	}
+	if m.session.Filter != "widgets.example.com" {
+		t.Fatalf("expected filter widgets.example.com, got %q", m.session.Filter)
+	}
+}
+
+func TestApplyCommandCRsUsesSelectedCRDWhenInCRDView(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "crds",
+			Selection: "widgets.example.com",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "crds",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "widgets.example.com", Namespace: "-", Status: "Namespaced v1"},
+			},
+		},
+	})
+	m.selectFromSession()
+
+	updated, _, reload, err := m.applyCommand("crs")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected command to update session and trigger reload")
+	}
+	if m.session.Resource != "crs" {
+		t.Fatalf("expected resource crs, got %q", m.session.Resource)
+	}
+	if m.session.Filter != "widgets.example.com" {
+		t.Fatalf("expected filter widgets.example.com, got %q", m.session.Filter)
+	}
+}
+
 func TestCommandSuggestionsForNamespace(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -159,6 +218,32 @@ func TestContextSuggestionsUseConfiguredContexts(t *testing.T) {
 	}
 }
 
+func TestCRDSuggestionsFromCRDList(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "crds",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "crds",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "widgets.example.com", Namespace: "-", Status: "Namespaced v1"},
+				{Name: "gadgets.example.com", Namespace: "-", Status: "Cluster v1"},
+			},
+		},
+	})
+
+	suggestions := m.commandSuggestions("crs w")
+	if len(suggestions) == 0 {
+		t.Fatalf("expected crd suggestions for crs command")
+	}
+	if suggestions[0] != "widgets.example.com" {
+		t.Fatalf("expected widgets.example.com suggestion, got %q", suggestions[0])
+	}
+}
+
 func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 	var seen protocol.ResourceListQuery
 
@@ -167,6 +252,7 @@ func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 			KubeContext: "dev-cluster",
 			Namespace:   "default",
 			Resource:    "pods",
+			Filter:      "widgets.example.com",
 		},
 		ResourceList: protocol.ResourceListPayload{
 			Resource:  "pods",
@@ -208,6 +294,9 @@ func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 	final := updatedModel.(model)
 	if seen.KubeContext != "dev-cluster" {
 		t.Fatalf("expected kube context in list query, got %q", seen.KubeContext)
+	}
+	if seen.Filter != "widgets.example.com" {
+		t.Fatalf("expected filter in list query, got %q", seen.Filter)
 	}
 	if final.resourceList.Resource != "services" {
 		t.Fatalf("expected reloaded resource services, got %q", final.resourceList.Resource)

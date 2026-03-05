@@ -5,6 +5,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -16,7 +17,8 @@ func TestIsCoreResource(t *testing.T) {
 		{resource: "pods", want: true},
 		{resource: "services", want: true},
 		{resource: "deployments", want: true},
-		{resource: "crds", want: false},
+		{resource: "crds", want: true},
+		{resource: "crs", want: true},
 		{resource: "jobs", want: false},
 	}
 
@@ -24,6 +26,37 @@ func TestIsCoreResource(t *testing.T) {
 		if got := IsCoreResource(tc.resource); got != tc.want {
 			t.Fatalf("resource=%q expected %v got %v", tc.resource, tc.want, got)
 		}
+	}
+}
+
+func TestSelectCRDByFilter(t *testing.T) {
+	crds := []apiextv1.CustomResourceDefinition{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "widgets.example.com"},
+			Spec: apiextv1.CustomResourceDefinitionSpec{
+				Group: "example.com",
+				Names: apiextv1.CustomResourceDefinitionNames{
+					Plural: "widgets",
+				},
+				Scope: apiextv1.NamespaceScoped,
+				Versions: []apiextv1.CustomResourceDefinitionVersion{
+					{Name: "v1", Served: true, Storage: true},
+				},
+			},
+		},
+	}
+
+	selected, ok := selectCRDByFilter(crds, "widgets.example.com")
+	if !ok {
+		t.Fatalf("expected crd match by name")
+	}
+	if selected.GVR.Group != "example.com" || selected.GVR.Resource != "widgets" || selected.GVR.Version != "v1" {
+		t.Fatalf("unexpected selected gvr: %#v", selected.GVR)
+	}
+
+	selected, ok = selectCRDByFilter(crds, "example.com/widgets")
+	if !ok || selected.Name != "widgets.example.com" {
+		t.Fatalf("expected crd match by group/plural")
 	}
 }
 

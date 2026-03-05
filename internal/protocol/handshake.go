@@ -67,6 +67,7 @@ type ResourceListQuery struct {
 	KubeContext   string `json:"kubeContext,omitempty"`
 	Resource      string `json:"resource"`
 	Namespace     string `json:"namespace"`
+	Filter        string `json:"filter,omitempty"`
 	SimulateStale bool   `json:"simulateStale,omitempty"`
 }
 
@@ -87,6 +88,7 @@ type ResourceDetailQuery struct {
 	KubeContext   string `json:"kubeContext,omitempty"`
 	Resource      string `json:"resource"`
 	Namespace     string `json:"namespace"`
+	Filter        string `json:"filter,omitempty"`
 	ItemNamespace string `json:"itemNamespace,omitempty"`
 	Name          string `json:"name"`
 	SimulateStale bool   `json:"simulateStale,omitempty"`
