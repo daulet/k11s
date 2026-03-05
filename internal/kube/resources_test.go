@@ -17,6 +17,7 @@ func TestIsCoreResource(t *testing.T) {
 		{resource: "pods", want: true},
 		{resource: "services", want: true},
 		{resource: "deployments", want: true},
+		{resource: "nodes", want: true},
 		{resource: "crds", want: true},
 		{resource: "crs", want: true},
 		{resource: "jobs", want: false},
@@ -125,6 +126,38 @@ func TestServicesToItems(t *testing.T) {
 		t.Fatalf("unexpected first item: %#v", items[0])
 	}
 	if items[1].Name != "b" || items[1].Status != "NodePort" {
+		t.Fatalf("unexpected second item: %#v", items[1])
+	}
+}
+
+func TestNodesToItems(t *testing.T) {
+	items := nodesToItems([]corev1.Node{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-b"},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionFalse},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+			Spec:       corev1.NodeSpec{Unschedulable: true},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				},
+			},
+		},
+	})
+
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if items[0].Name != "node-a" || items[0].Namespace != "<cluster>" || items[0].Status != "Ready (cordoned)" {
+		t.Fatalf("unexpected first item: %#v", items[0])
+	}
+	if items[1].Name != "node-b" || items[1].Namespace != "<cluster>" || items[1].Status != "NotReady" {
 		t.Fatalf("unexpected second item: %#v", items[1])
 	}
 }

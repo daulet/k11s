@@ -21,6 +21,7 @@ var defaultResources = []string{
 	"pods",
 	"services",
 	"deployments",
+	"nodes",
 	"statefulsets",
 	"daemonsets",
 	"jobs",
@@ -432,11 +433,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if errText := strings.TrimSpace(msg.payload.Freshness.Error); errText != "" {
 			m.commandMessage = "list error: " + errText
 		} else if msg.announce {
+			scope := fmt.Sprintf("namespace %s", msg.payload.Namespace)
+			if !resourceUsesNamespace(msg.payload.Resource) {
+				scope = "<cluster>"
+			}
 			m.commandMessage = fmt.Sprintf(
-				"loaded %d %s in namespace %s",
+				"loaded %d %s in %s",
 				len(m.resourceList.Items),
 				m.resourceList.Resource,
-				m.resourceList.Namespace,
+				scope,
 			)
 		}
 		return m, nil
@@ -980,7 +985,7 @@ func (m model) startListReloadWithAnnouncement(announce bool) (tea.Model, tea.Cm
 	query := protocol.ResourceListQuery{
 		KubeContext:   m.session.KubeContext,
 		Resource:      m.session.Resource,
-		Namespace:     m.session.Namespace,
+		Namespace:     effectiveNamespace(m.session.Resource, m.session.Namespace),
 		Filter:        m.session.Filter,
 		SimulateStale: m.simulateStale,
 	}
@@ -994,7 +999,7 @@ func (m model) startBackgroundReload() (tea.Model, tea.Cmd) {
 	query := protocol.ResourceListQuery{
 		KubeContext:   m.session.KubeContext,
 		Resource:      m.session.Resource,
-		Namespace:     m.session.Namespace,
+		Namespace:     effectiveNamespace(m.session.Resource, m.session.Namespace),
 		Filter:        m.session.Filter,
 		SimulateStale: m.simulateStale,
 	}
@@ -1263,7 +1268,7 @@ func (m model) renderInputBox(width int) string {
 }
 
 func (m model) renderMainPane(width int, innerHeight int) string {
-	title := m.styles.Title.Render(fmt.Sprintf("%s > %s > %s", displayContext(m.session), m.session.Namespace, displayResource(m.session)))
+	title := m.styles.Title.Render(fmt.Sprintf("%s > %s > %s", displayContext(m.session), displayNamespace(m.session), displayResource(m.session)))
 	if len(m.resourceList.Items) == 0 {
 		innerWidth := width - 2
 		if innerWidth < 1 {
@@ -1599,7 +1604,7 @@ func (m model) buildSelectedDetailQuery() (protocol.ResourceDetailQuery, bool) {
 	return protocol.ResourceDetailQuery{
 		KubeContext:   m.session.KubeContext,
 		Resource:      m.session.Resource,
-		Namespace:     m.session.Namespace,
+		Namespace:     effectiveNamespace(m.session.Resource, m.session.Namespace),
 		Filter:        m.session.Filter,
 		ItemNamespace: item.Namespace,
 		Name:          item.Name,
@@ -2111,6 +2116,7 @@ func baseSuggestions() []string {
 		"pods",
 		"services",
 		"deployments",
+		"nodes",
 		"statefulsets",
 		"daemonsets",
 		"jobs",
@@ -2130,6 +2136,33 @@ func displayResource(session protocol.SessionState) string {
 		return fmt.Sprintf("crs(%s)", strings.TrimSpace(session.Filter))
 	}
 	return session.Resource
+}
+
+func displayNamespace(session protocol.SessionState) string {
+	if !resourceUsesNamespace(session.Resource) {
+		return "<cluster>"
+	}
+	return effectiveNamespace(session.Resource, session.Namespace)
+}
+
+func resourceUsesNamespace(resource string) bool {
+	switch strings.ToLower(strings.TrimSpace(resource)) {
+	case "nodes", "crds":
+		return false
+	default:
+		return true
+	}
+}
+
+func effectiveNamespace(resource string, namespace string) string {
+	if !resourceUsesNamespace(resource) {
+		return "all"
+	}
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		return "default"
+	}
+	return namespace
 }
 
 func isKnownResource(value string) bool {
@@ -2158,6 +2191,7 @@ func resourceSuggestions() []string {
 		"pods",
 		"services",
 		"deployments",
+		"nodes",
 		"statefulsets",
 		"daemonsets",
 		"jobs",

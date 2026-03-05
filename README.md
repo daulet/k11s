@@ -78,12 +78,13 @@ TUI layout:
 - Bottom single row:
   - Left: status box + age box
   - Right: keyboard legend
+- For cluster-scoped resources (`nodes`, `crds`), the middle segment renders as `<cluster>`.
 
 Command line examples:
 - `:ns payments` or `:namespace payments`
 - `:ns all` (all namespaces view)
 - `:ctx dev-cluster` or `:context dev-cluster`
-- `:pods`, `:services`, `:deployments` (switch resource view)
+- `:pods`, `:services`, `:deployments`, `:nodes` (switch resource view)
 - `:crds` (list custom resource definitions)
 - `:crs widgets.example.com` or `:crd widgets.example.com` (list CRs for a selected CRD)
 - `:delete` (delete selected row), `:delete <name>`, or `:delete <namespace>/<name>` when in `all` namespace

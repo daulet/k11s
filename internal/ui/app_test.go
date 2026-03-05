@@ -72,6 +72,30 @@ func TestApplyCommandResourceAlias(t *testing.T) {
 	}
 }
 
+func TestApplyCommandNodesAlias(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	updated, _, reload, err := m.applyCommand("nodes")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected command to update session and trigger reload")
+	}
+	if m.session.Resource != "nodes" {
+		t.Fatalf("expected resource nodes, got %q", m.session.Resource)
+	}
+}
+
 func TestApplyCommandCRDTargetsCRs(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -1034,6 +1058,25 @@ func TestRenderMainPaneCentersNoItemsState(t *testing.T) {
 	}
 }
 
+func TestRenderMainPaneTitleUsesClusterScopeForNodes(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "payments",
+			Resource:    "nodes",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "nodes",
+			Namespace: "payments",
+		},
+	})
+
+	mainPane := m.renderMainPane(80, 8)
+	if !strings.Contains(mainPane, "dev-cluster > <cluster> > nodes") {
+		t.Fatalf("expected cluster-scoped title for nodes, got %q", mainPane)
+	}
+}
+
 func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 	var seen protocol.ResourceListQuery
 
@@ -1093,6 +1136,61 @@ func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 	}
 	if final.session.Selection != "svc-a" {
 		t.Fatalf("expected selection svc-a, got %q", final.session.Selection)
+	}
+}
+
+func TestNodesReloadUsesAllNamespaceForClusterScope(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "payments",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "payments",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "payments", Status: "Running"},
+			},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("nodes")
+
+	updatedModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updatedModel.(model)
+	if !next.loading {
+		t.Fatalf("expected loading after nodes command execution")
+	}
+	if next.session.Resource != "nodes" {
+		t.Fatalf("expected resource nodes, got %q", next.session.Resource)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command for nodes")
+	}
+
+	msg := cmd()
+	updatedModel, _ = next.Update(msg)
+	final := updatedModel.(model)
+	if seen.Namespace != "all" {
+		t.Fatalf("expected nodes list query namespace=all, got %q", seen.Namespace)
+	}
+	if final.resourceList.Resource != "nodes" {
+		t.Fatalf("expected nodes payload after reload, got %q", final.resourceList.Resource)
 	}
 }
 

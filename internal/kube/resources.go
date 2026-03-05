@@ -31,7 +31,7 @@ func NewResourceFetcher(clients *ClientFactory) *ResourceFetcher {
 
 func IsCoreResource(resource string) bool {
 	switch strings.ToLower(strings.TrimSpace(resource)) {
-	case "pods", "services", "deployments", "crds", "crs":
+	case "pods", "services", "deployments", "nodes", "crds", "crs":
 		return true
 	default:
 		return false
@@ -70,6 +70,12 @@ func (f *ResourceFetcher) List(ctx context.Context, query protocol.ResourceListQ
 			return nil, fmt.Errorf("list deployments for namespace %q: %w", displayNamespace, err)
 		}
 		return deploymentsToItems(deployments.Items), nil
+	case "nodes":
+		nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list nodes: %w", err)
+		}
+		return nodesToItems(nodes.Items), nil
 	case "crds":
 		return f.listCRDs(ctx, query)
 	case "crs":
@@ -154,6 +160,25 @@ func (f *ResourceFetcher) Watch(
 			},
 			func(resourceVersion string) (watch.Interface, error) {
 				return client.AppsV1().Deployments(apiNamespace).Watch(ctx, metav1.ListOptions{
+					ResourceVersion:     resourceVersion,
+					AllowWatchBookmarks: true,
+				})
+			},
+			onUpdate,
+			onError,
+		)
+	case "nodes":
+		return runListWatchLoop(
+			ctx,
+			func() ([]protocol.ResourceItem, string, error) {
+				nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+				if err != nil {
+					return nil, "", fmt.Errorf("list nodes: %w", err)
+				}
+				return nodesToItems(nodes.Items), nodes.ResourceVersion, nil
+			},
+			func(resourceVersion string) (watch.Interface, error) {
+				return client.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
 					ResourceVersion:     resourceVersion,
 					AllowWatchBookmarks: true,
 				})
@@ -572,6 +597,34 @@ func deploymentsToItems(deployments []appsv1.Deployment) []protocol.ResourceItem
 		items = append(items, protocol.ResourceItem{
 			Name:      deployment.Name,
 			Namespace: deployment.Namespace,
+			Status:    status,
+		})
+	}
+	sortResourceItems(items)
+	return items
+}
+
+func nodesToItems(nodes []corev1.Node) []protocol.ResourceItem {
+	items := make([]protocol.ResourceItem, 0, len(nodes))
+	for _, node := range nodes {
+		status := "Unknown"
+		for _, condition := range node.Status.Conditions {
+			if condition.Type != corev1.NodeReady {
+				continue
+			}
+			if condition.Status == corev1.ConditionTrue {
+				status = "Ready"
+			} else {
+				status = "NotReady"
+			}
+			break
+		}
+		if node.Spec.Unschedulable {
+			status += " (cordoned)"
+		}
+		items = append(items, protocol.ResourceItem{
+			Name:      node.Name,
+			Namespace: "<cluster>",
 			Status:    status,
 		})
 	}
