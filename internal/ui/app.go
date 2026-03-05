@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -728,16 +729,56 @@ func (m model) actionQueryFromCommand(input string) (protocol.ActionQuery, bool,
 	command := strings.ToLower(strings.TrimSpace(fields[0]))
 	switch command {
 	case "delete", "del", "rm":
+		name, itemNamespace, err := m.actionTargetFromFields(fields[1:])
+		if err != nil {
+			return protocol.ActionQuery{}, true, err
+		}
+		return protocol.ActionQuery{
+			Action:        protocol.ActionDelete,
+			KubeContext:   m.session.KubeContext,
+			Resource:      m.session.Resource,
+			Namespace:     m.session.Namespace,
+			Filter:        m.session.Filter,
+			ItemNamespace: itemNamespace,
+			Name:          name,
+		}, true, nil
+	case "scale":
+		if len(fields) < 2 {
+			return protocol.ActionQuery{}, true, fmt.Errorf("scale requires replicas: try `:scale 3`")
+		}
+		replicasValue, err := strconv.Atoi(strings.TrimSpace(fields[1]))
+		if err != nil {
+			return protocol.ActionQuery{}, true, fmt.Errorf("invalid replicas %q", fields[1])
+		}
+		if replicasValue < 0 {
+			return protocol.ActionQuery{}, true, fmt.Errorf("replicas must be >= 0")
+		}
+		name, itemNamespace, targetErr := m.actionTargetFromFields(fields[2:])
+		if targetErr != nil {
+			return protocol.ActionQuery{}, true, targetErr
+		}
+		replicas := int32(replicasValue)
+		return protocol.ActionQuery{
+			Action:        protocol.ActionScale,
+			KubeContext:   m.session.KubeContext,
+			Resource:      m.session.Resource,
+			Namespace:     m.session.Namespace,
+			Filter:        m.session.Filter,
+			ItemNamespace: itemNamespace,
+			Name:          name,
+			Replicas:      &replicas,
+		}, true, nil
 	default:
 		return protocol.ActionQuery{}, false, nil
 	}
+}
 
-	var name string
-	itemNamespace := ""
-	if len(fields) >= 2 {
-		target := strings.TrimSpace(fields[1])
+func (m model) actionTargetFromFields(args []string) (name string, itemNamespace string, err error) {
+	itemNamespace = ""
+	if len(args) >= 1 {
+		target := strings.TrimSpace(args[0])
 		if target == "" {
-			return protocol.ActionQuery{}, true, fmt.Errorf("delete target name is required")
+			return "", "", fmt.Errorf("action target name is required")
 		}
 		if ns, itemName, ok := strings.Cut(target, "/"); ok {
 			itemNamespace = strings.TrimSpace(ns)
@@ -748,28 +789,19 @@ func (m model) actionQueryFromCommand(input string) (protocol.ActionQuery, bool,
 	} else {
 		item, ok := m.currentItem()
 		if !ok {
-			return protocol.ActionQuery{}, true, fmt.Errorf("delete target required: select an item or run `:delete <name>`")
+			return "", "", fmt.Errorf("action target required: select an item or pass `<name>`")
 		}
 		name = strings.TrimSpace(item.Name)
 		itemNamespace = strings.TrimSpace(item.Namespace)
 	}
 
 	if name == "" {
-		return protocol.ActionQuery{}, true, fmt.Errorf("delete target name is required")
+		return "", "", fmt.Errorf("action target name is required")
 	}
 	if itemNamespace == "-" || strings.EqualFold(itemNamespace, "<cluster>") {
 		itemNamespace = ""
 	}
-
-	return protocol.ActionQuery{
-		Action:        protocol.ActionDelete,
-		KubeContext:   m.session.KubeContext,
-		Resource:      m.session.Resource,
-		Namespace:     m.session.Namespace,
-		Filter:        m.session.Filter,
-		ItemNamespace: itemNamespace,
-		Name:          name,
-	}, true, nil
+	return name, itemNamespace, nil
 }
 
 func (m model) startListReload() (tea.Model, tea.Cmd) {
@@ -1466,6 +1498,11 @@ func (m model) commandSuggestions(input string) []string {
 		return prefixMatches(m.crdCandidates(), valuePrefix)
 	case "delete", "del", "rm":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
+	case "scale":
+		if len(fields) <= 1 || (len(fields) == 2 && !hasTrailingSpace) {
+			return nil
+		}
+		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "resource":
 		return prefixMatches(resourceSuggestions(), valuePrefix)
 	default:
@@ -1767,6 +1804,7 @@ func baseSuggestions() []string {
 		"delete",
 		"del",
 		"rm",
+		"scale",
 		"ns",
 		"namespace",
 		"filter",
@@ -1942,7 +1980,7 @@ func prefersArgumentCompletion(token string, commandCandidates []string) bool {
 
 func commandSupportsArgument(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
-	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm":
+	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm", "scale":
 		return true
 	default:
 		return false

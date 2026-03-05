@@ -78,6 +78,57 @@ func (e *ActionExecutor) Delete(ctx context.Context, query protocol.ActionQuery)
 	}
 }
 
+func (e *ActionExecutor) Scale(ctx context.Context, query protocol.ActionQuery) error {
+	resource := strings.ToLower(strings.TrimSpace(query.Resource))
+	name := strings.TrimSpace(query.Name)
+	if name == "" {
+		return fmt.Errorf("%w: item name is required", ErrActionValidation)
+	}
+	if query.Replicas == nil {
+		return fmt.Errorf("%w: replicas value is required", ErrActionValidation)
+	}
+	if *query.Replicas < 0 {
+		return fmt.Errorf("%w: replicas must be >= 0", ErrActionValidation)
+	}
+
+	switch resource {
+	case "deployments":
+		client, err := e.clients.ClientForContext(query.KubeContext)
+		if err != nil {
+			return err
+		}
+		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
+		if err != nil {
+			return err
+		}
+		scale, err := client.AppsV1().Deployments(ns).GetScale(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		scale.Spec.Replicas = *query.Replicas
+		_, err = client.AppsV1().Deployments(ns).UpdateScale(ctx, name, scale, metav1.UpdateOptions{})
+		return err
+	case "statefulsets":
+		client, err := e.clients.ClientForContext(query.KubeContext)
+		if err != nil {
+			return err
+		}
+		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
+		if err != nil {
+			return err
+		}
+		scale, err := client.AppsV1().StatefulSets(ns).GetScale(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		scale.Spec.Replicas = *query.Replicas
+		_, err = client.AppsV1().StatefulSets(ns).UpdateScale(ctx, name, scale, metav1.UpdateOptions{})
+		return err
+	default:
+		return fmt.Errorf("%w: %s", ErrUnsupportedActionResource, resource)
+	}
+}
+
 func (e *ActionExecutor) deleteCR(ctx context.Context, query protocol.ActionQuery) error {
 	if strings.TrimSpace(query.Filter) == "" {
 		return fmt.Errorf("%w: crd filter is required for cr delete", ErrActionValidation)

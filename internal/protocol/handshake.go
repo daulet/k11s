@@ -131,6 +131,7 @@ const (
 )
 
 const ActionDelete = "delete"
+const ActionScale = "scale"
 
 type ActionQuery struct {
 	Action        string `json:"action"`
@@ -140,6 +141,7 @@ type ActionQuery struct {
 	Filter        string `json:"filter,omitempty"`
 	ItemNamespace string `json:"itemNamespace,omitempty"`
 	Name          string `json:"name"`
+	Replicas      *int32 `json:"replicas,omitempty"`
 }
 
 type ActionResult struct {

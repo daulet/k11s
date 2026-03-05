@@ -220,6 +220,116 @@ func TestDeleteCommandRunsActionAndReloadsList(t *testing.T) {
 	}
 }
 
+func TestScaleCommandRunsActionAndReloadsList(t *testing.T) {
+	var actionSeen protocol.ActionQuery
+	var listSeen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "3/3"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadAction: func(_ context.Context, query protocol.ActionQuery) (protocol.ActionResult, error) {
+			actionSeen = query
+			return protocol.ActionResult{
+				Success: true,
+				Code:    protocol.ActionCodeOK,
+				Message: "scaled deployments default/api to 5",
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listSeen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: query.Namespace, Status: "5/5"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("scale 5")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterApply := updated.(model)
+	if !afterApply.actionLoading {
+		t.Fatalf("expected action to start loading")
+	}
+	if cmd == nil {
+		t.Fatalf("expected action command")
+	}
+
+	msg := cmd()
+	updated, nextCmd := afterApply.Update(msg)
+	afterAction := updated.(model)
+	if nextCmd == nil {
+		t.Fatalf("expected list reload after successful action")
+	}
+	if afterAction.commandMessage != "scaled deployments default/api to 5" {
+		t.Fatalf("expected action feedback preserved, got %q", afterAction.commandMessage)
+	}
+	if actionSeen.Action != protocol.ActionScale || actionSeen.Name != "api" || actionSeen.Replicas == nil || *actionSeen.Replicas != 5 {
+		t.Fatalf("unexpected scale action query: %#v", actionSeen)
+	}
+
+	reloadMsg := nextCmd()
+	updated, _ = afterAction.Update(reloadMsg)
+	final := updated.(model)
+	if listSeen.Resource != "deployments" || listSeen.Namespace != "default" {
+		t.Fatalf("unexpected list reload query: %#v", listSeen)
+	}
+	if final.commandMessage != "scaled deployments default/api to 5" {
+		t.Fatalf("expected action message to remain after silent reload, got %q", final.commandMessage)
+	}
+}
+
+func TestScaleCommandRequiresReplicas(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "3/3"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("scale")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected no async command for validation error")
+	}
+	if !next.commandMode {
+		t.Fatalf("expected to remain in command mode on validation error")
+	}
+	if !strings.Contains(strings.ToLower(next.commandMessage), "replicas") {
+		t.Fatalf("expected replicas validation message, got %q", next.commandMessage)
+	}
+}
+
 func TestApplyCommandCRsUsesSelectedCRDWhenInCRDView(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{

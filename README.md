@@ -87,6 +87,7 @@ Command line examples:
 - `:crds` (list custom resource definitions)
 - `:crs widgets.example.com` or `:crd widgets.example.com` (list CRs for a selected CRD)
 - `:delete` (delete selected row), `:delete <name>`, or `:delete <namespace>/<name>` when in `all` namespace
+- `:scale <replicas>` (scale selected item), or `:scale <replicas> <name>`
 
 Autocomplete notes:
 - `:ctx ` / `:context ` suggestions are loaded from kubeconfig (`KUBECONFIG` or `~/.kube/config`).

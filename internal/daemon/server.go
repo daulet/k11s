@@ -261,7 +261,7 @@ func executeAction(
 			Message: "action is required",
 		}
 	}
-	if query.Action != protocol.ActionDelete {
+	if query.Action != protocol.ActionDelete && query.Action != protocol.ActionScale {
 		return protocol.ActionResult{
 			Success: false,
 			Code:    protocol.ActionCodeUnsupported,
@@ -307,7 +307,16 @@ func executeAction(
 		}
 	}
 
-	if err := actionExecutor.Delete(ctx, query); err != nil {
+	var err error
+	switch query.Action {
+	case protocol.ActionDelete:
+		err = actionExecutor.Delete(ctx, query)
+	case protocol.ActionScale:
+		err = actionExecutor.Scale(ctx, query)
+	default:
+		err = fmt.Errorf("%w: %s", kube.ErrUnsupportedActionResource, query.Action)
+	}
+	if err != nil {
 		return mapActionError(err)
 	}
 
@@ -315,10 +324,18 @@ func executeAction(
 	if query.ItemNamespace != "" {
 		target = query.ItemNamespace + "/" + query.Name
 	}
+	successMessage := fmt.Sprintf("deleted %s %s", query.Resource, target)
+	if query.Action == protocol.ActionScale {
+		replicas := int32(0)
+		if query.Replicas != nil {
+			replicas = *query.Replicas
+		}
+		successMessage = fmt.Sprintf("scaled %s %s to %d", query.Resource, target, replicas)
+	}
 	return protocol.ActionResult{
 		Success: true,
 		Code:    protocol.ActionCodeOK,
-		Message: fmt.Sprintf("deleted %s %s", query.Resource, target),
+		Message: successMessage,
 	}
 }
 
