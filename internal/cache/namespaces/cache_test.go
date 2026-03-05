@@ -69,6 +69,42 @@ func TestNamespaceCachePreservesDataWhenRefreshFails(t *testing.T) {
 	}
 }
 
+func TestNamespaceCacheAuthExpiryErrorShowsReloginPrompt(t *testing.T) {
+	fetcher := &queueFetcher{
+		responses: []fetchResponse{
+			{namespaces: []string{"default", "kube-system"}},
+			{err: errors.New(`list namespaces: getting credentials: exec: executable /usr/local/bin/tsh failed with exit code 1`)},
+		},
+	}
+	cache := New(context.Background(), fetcher, nil)
+	query := protocol.NamespaceListQuery{KubeContext: "mc1-lab1"}
+
+	_ = cache.Get(query)
+	_ = waitForCondition(t, 250*time.Millisecond, func() (protocol.NamespaceListPayload, bool) {
+		next := cache.Get(query)
+		return next, next.Freshness.State == protocol.FreshnessStateLive
+	})
+
+	kctx := "mc1-lab1"
+	cache.mu.Lock()
+	ent := cache.entries[kctx]
+	ent.refreshing = true
+	cache.refreshInterval = time.Hour
+	cache.mu.Unlock()
+
+	cache.refresh(kctx)
+	payload := cache.Get(query)
+	if !strings.Contains(strings.ToLower(payload.Freshness.Error), "authentication expired") {
+		t.Fatalf("expected auth-expiry message, got %q", payload.Freshness.Error)
+	}
+	if !strings.Contains(payload.Freshness.Error, "tsh login") {
+		t.Fatalf("expected tsh relogin hint, got %q", payload.Freshness.Error)
+	}
+	if !strings.Contains(payload.Freshness.Error, "mc1-lab1") {
+		t.Fatalf("expected context in relogin prompt, got %q", payload.Freshness.Error)
+	}
+}
+
 func TestNamespaceCacheKeysByContext(t *testing.T) {
 	fetcher := &contextFetcher{}
 	cache := New(context.Background(), fetcher, nil)

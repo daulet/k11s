@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	cacheutil "github.com/daulet/k11s/internal/cache"
 	"github.com/daulet/k11s/internal/protocol"
 )
 
@@ -206,7 +207,7 @@ func (c *Cache) refresh(key cacheKey, query protocol.ResourceListQuery) {
 	entry.refreshing = false
 
 	if err != nil {
-		entry.lastErr = err.Error()
+		entry.lastErr = cacheutil.FriendlyKubeAccessError(err, query.KubeContext)
 		c.mu.Unlock()
 		if c.logger != nil {
 			c.logger.Printf(
@@ -255,7 +256,7 @@ func (c *Cache) watch(key cacheKey, query protocol.ResourceListQuery) {
 			c.mu.Unlock()
 			return
 		}
-		entry.lastErr = err.Error()
+		entry.lastErr = cacheutil.FriendlyKubeAccessError(err, query.KubeContext)
 		entry.refreshing = true
 		c.mu.Unlock()
 

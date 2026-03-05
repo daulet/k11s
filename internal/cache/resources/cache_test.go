@@ -91,6 +91,58 @@ func TestCachePreservesItemsWhenRefreshFails(t *testing.T) {
 	}
 }
 
+func TestCacheAuthExpiryErrorShowsReloginPrompt(t *testing.T) {
+	fetcher := &queueFetcher{
+		responses: []fetchResponse{
+			{
+				items: []protocol.ResourceItem{
+					{Name: "svc-a", Namespace: "default", Status: "ClusterIP"},
+				},
+			},
+			{
+				err: errors.New(`Get "https://nv-stg-hw.teleport.sh:443/api/v1/pods?watch=true": getting credentials: exec: executable /usr/local/bin/tsh failed with exit code 1`),
+			},
+		},
+	}
+	cache := New(context.Background(), fetcher, nil)
+	query := protocol.ResourceListQuery{
+		KubeContext: "mc1-lab1",
+		Resource:    "pods",
+		Namespace:   "default",
+	}
+
+	_ = cache.Get(query)
+	_ = waitForCondition(t, 250*time.Millisecond, func() (protocol.ResourceListPayload, bool) {
+		next := cache.Get(query)
+		return next, next.Freshness.State == protocol.FreshnessStateLive
+	})
+
+	normalized := normalizeQuery(query)
+	key := cacheKey{
+		kubeContext: normalized.KubeContext,
+		namespace:   normalized.Namespace,
+		resource:    normalized.Resource,
+	}
+	cache.mu.Lock()
+	entry := cache.entries[key]
+	entry.refreshing = true
+	cache.refreshInterval = time.Hour
+	cache.mu.Unlock()
+
+	cache.refresh(key, normalized)
+
+	payload := cache.Get(query)
+	if !strings.Contains(strings.ToLower(payload.Freshness.Error), "authentication expired") {
+		t.Fatalf("expected auth-expiry message, got %q", payload.Freshness.Error)
+	}
+	if !strings.Contains(payload.Freshness.Error, "tsh login") {
+		t.Fatalf("expected tsh relogin hint, got %q", payload.Freshness.Error)
+	}
+	if !strings.Contains(payload.Freshness.Error, "mc1-lab1") {
+		t.Fatalf("expected context in relogin prompt, got %q", payload.Freshness.Error)
+	}
+}
+
 func TestCacheKeysIncludeKubeContext(t *testing.T) {
 	fetcher := &contextAwareFetcher{}
 	cache := New(context.Background(), fetcher, nil)

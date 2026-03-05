@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	cacheutil "github.com/daulet/k11s/internal/cache"
 	"github.com/daulet/k11s/internal/protocol"
 )
 
@@ -107,7 +108,7 @@ func (c *Cache) refresh(kubeContext string) {
 	ent.refreshing = false
 
 	if err != nil {
-		ent.lastErr = err.Error()
+		ent.lastErr = cacheutil.FriendlyKubeAccessError(err, kubeContext)
 		c.mu.Unlock()
 		if c.logger != nil {
 			c.logger.Printf("namespace refresh failed (ctx=%s): %v", kubeContext, err)
