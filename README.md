@@ -14,6 +14,7 @@ Primary goals:
 - [Architecture](docs/ARCHITECTURE.md)
 - [Performance Budgets](docs/PERF_BUDGETS.md)
 - [RPC Contract](docs/RPC.md)
+- [Failure And Degraded Mode Policy](docs/FAILURE_POLICY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Phase 0 Tickets](docs/PHASE0_TICKETS.md)
 
@@ -33,6 +34,7 @@ Primary goals:
 - Session state is persisted by daemon and restored on launch.
 - Placeholder resource list responses include freshness metadata.
 - Status bar renders freshness badge, age, snapshot time, source, and watch health.
+- `k11s` runs an interactive Bubble Tea TUI by default.
 
 ## Quickstart
 
@@ -58,3 +60,26 @@ Session override flags (persisted through daemon):
 Perf measurement:
 - `k11s debug perf` prints startup output, span timings, and JSON report.
 - `k11s debug perf --json-only` prints machine-readable JSON only.
+
+TUI keybindings:
+- `j` / `k` or arrow keys: move selection
+- `q`: quit (current selection is persisted into session)
+- `:`: open command line
+
+TUI layout:
+- Top untitled input field (command line, `:` to activate)
+- Middle large bordered pane titled with `context > namespace > resource`
+- Bottom single row:
+  - Left: status box + age box
+  - Right: keyboard legend
+
+Command line examples:
+- `:ns payments` or `:namespace payments`
+- `:ctx dev-cluster` or `:context dev-cluster`
+- `:pods`, `:services`, `:deployments` (switch resource view)
+
+Autocomplete notes:
+- `:ctx ` / `:context ` suggestions are loaded from kubeconfig (`KUBECONFIG` or `~/.kube/config`).
+
+CI checks:
+- `.github/workflows/ci.yml` runs format, vet, tests, startup smoke test, and advisory perf sanity.

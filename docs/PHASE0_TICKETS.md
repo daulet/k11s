@@ -1,5 +1,8 @@
 # Phase 0 Tickets
 
+Current status:
+- `T0-01` through `T0-07` are implemented.
+
 ## T0-01 Initialize Go workspace
 
 Scope:

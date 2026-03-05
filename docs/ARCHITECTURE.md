@@ -122,6 +122,8 @@ On startup, restore session before live sync to avoid blank initial experience.
 - Watch broken: transition `LIVE -> CATCHING_UP -> LIVE/STALE`.
 - Corrupt cache/session store: fallback to safe defaults and continue.
 
+Detailed policy: [Failure And Degraded Mode Policy](FAILURE_POLICY.md)
+
 ## 9) Suggested Go module layout
 
 ```text

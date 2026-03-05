@@ -14,8 +14,10 @@ import (
 	"github.com/dzhanguzin/k11s/internal/buildinfo"
 	"github.com/dzhanguzin/k11s/internal/client"
 	"github.com/dzhanguzin/k11s/internal/config"
+	"github.com/dzhanguzin/k11s/internal/kubeconfig"
 	"github.com/dzhanguzin/k11s/internal/perf"
 	"github.com/dzhanguzin/k11s/internal/protocol"
+	"github.com/dzhanguzin/k11s/internal/ui"
 )
 
 func main() {
@@ -51,12 +53,14 @@ type startupOptions struct {
 }
 
 type startupState struct {
-	Config       config.Config
-	Bootstrap    client.BootstrapResult
-	Session      protocol.SessionState
-	ResourceList protocol.ResourceListPayload
-	Recorder     *perf.Recorder
-	ProcessTime  time.Time
+	Config             config.Config
+	Bootstrap          client.BootstrapResult
+	Session            protocol.SessionState
+	ContextSuggestions []string
+	ResourceList       protocol.ResourceListPayload
+	SimulateStale      bool
+	Recorder           *perf.Recorder
+	ProcessTime        time.Time
 }
 
 func runStartup(processStart time.Time, args []string, includePerfOutput bool) error {
@@ -69,16 +73,17 @@ func runStartup(processStart time.Time, args []string, includePerfOutput bool) e
 	if err != nil {
 		return err
 	}
-
-	outputWriter := io.Writer(os.Stdout)
-	if includePerfOutput && jsonOnly {
-		outputWriter = io.Discard
-	}
-
-	firstPaintDuration := renderStartupOutput(outputWriter, state)
-	state.Recorder.AddDuration("first_paint", firstPaintDuration)
+	startMode := startupMode(state.Bootstrap)
 
 	if includePerfOutput {
+		outputWriter := io.Writer(os.Stdout)
+		if jsonOnly {
+			outputWriter = io.Discard
+		}
+
+		firstPaintDuration := renderStartupOutput(outputWriter, state, startMode)
+		state.Recorder.AddDuration("first_paint", firstPaintDuration)
+
 		report := state.Recorder.Snapshot()
 		if !jsonOnly {
 			fmt.Print(perf.FormatReport(report))
@@ -89,9 +94,10 @@ func runStartup(processStart time.Time, args []string, includePerfOutput bool) e
 			return fmt.Errorf("marshal perf report: %w", err)
 		}
 		fmt.Println(string(raw))
+		return nil
 	}
 
-	return nil
+	return runTUI(state, startMode)
 }
 
 func runDebugPerf(processStart time.Time, args []string) error {
@@ -180,6 +186,12 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 		}
 	}
 
+	contextSuggestions, err := kubeconfig.LoadContextNames()
+	if err != nil {
+		log.Printf("warning: unable to load kubeconfig contexts for autocomplete: %v", err)
+		contextSuggestions = nil
+	}
+
 	listLoadStart := time.Now()
 	resourceList, err := client.ListResources(
 		context.Background(),
@@ -197,23 +209,18 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 	}
 
 	return startupState{
-		Config:       cfg,
-		Bootstrap:    result,
-		Session:      sessionState,
-		ResourceList: resourceList,
-		Recorder:     recorder,
-		ProcessTime:  processStart,
+		Config:             cfg,
+		Bootstrap:          result,
+		Session:            sessionState,
+		ContextSuggestions: contextSuggestions,
+		ResourceList:       resourceList,
+		SimulateStale:      opts.simulateStale,
+		Recorder:           recorder,
+		ProcessTime:        processStart,
 	}, nil
 }
 
-func renderStartupOutput(out io.Writer, state startupState) time.Duration {
-	startMode := "warm"
-	if state.Bootstrap.Restarted {
-		startMode = "upgrade"
-	} else if state.Bootstrap.Spawned {
-		startMode = "cold"
-	}
-
+func renderStartupOutput(out io.Writer, state startupState, startMode string) time.Duration {
 	firstPaintStart := time.Now()
 	fmt.Fprintln(out, buildinfo.Banner("k11s", state.Config.RPCVersion))
 	fmt.Fprintf(out, "bootstrap: socket=%s\n", state.Config.SocketPath)
@@ -248,6 +255,40 @@ func renderStartupOutput(out io.Writer, state startupState) time.Duration {
 	)
 	fmt.Fprintln(out, "ui: placeholder ready (session restored)")
 	return time.Since(firstPaintStart)
+}
+
+func startupMode(result client.BootstrapResult) string {
+	startMode := "warm"
+	if result.Restarted {
+		startMode = "upgrade"
+	} else if result.Spawned {
+		startMode = "cold"
+	}
+	return startMode
+}
+
+func runTUI(state startupState, startMode string) error {
+	result, err := ui.Run(ui.Options{
+		Session:            state.Session,
+		ResourceList:       state.ResourceList,
+		ContextSuggestions: state.ContextSuggestions,
+		UseColor:           enableColor(),
+		SimulateStale:      state.SimulateStale,
+		LoadResourceList: func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			return client.ListResources(ctx, state.Config, buildinfo.Version, query)
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("run tui (%s): %w", startMode, err)
+	}
+
+	if result.Session != state.Session {
+		if err := client.SaveSession(context.Background(), state.Config, buildinfo.Version, result.Session); err != nil {
+			return fmt.Errorf("persist session after tui exit: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func enableColor() bool {
