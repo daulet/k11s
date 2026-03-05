@@ -2,21 +2,25 @@ package kube
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strings"
 
 	"github.com/dzhanguzin/k11s/internal/protocol"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type ResourceFetcher struct {
-	binary string
+	clients *ClientFactory
 }
 
-func NewResourceFetcher() *ResourceFetcher {
-	return &ResourceFetcher{binary: "kubectl"}
+func NewResourceFetcher(clients *ClientFactory) *ResourceFetcher {
+	if clients == nil {
+		clients = NewClientFactory()
+	}
+	return &ResourceFetcher{clients: clients}
 }
 
 func IsCoreResource(resource string) bool {
@@ -39,114 +43,97 @@ func (f *ResourceFetcher) List(ctx context.Context, query protocol.ResourceListQ
 		namespace = "default"
 	}
 
-	args := []string{
-		"get",
-		resource,
-		"-n",
-		namespace,
-		"-o",
-		"json",
-		"--request-timeout=1s",
-	}
-	if query.KubeContext != "" {
-		args = append(args, "--context", query.KubeContext)
-	}
-
-	cmd := exec.CommandContext(ctx, f.binary, args...)
-	output, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr := strings.TrimSpace(string(exitErr.Stderr))
-			if stderr == "" {
-				stderr = exitErr.Error()
-			}
-			return nil, fmt.Errorf("kubectl get %s failed: %s", resource, stderr)
-		}
-		return nil, fmt.Errorf("kubectl get %s failed: %w", resource, err)
-	}
-
-	items, err := parseResourceListJSON(output, resource, namespace)
+	client, err := f.clients.ClientForContext(query.KubeContext)
 	if err != nil {
 		return nil, err
 	}
 
-	return items, nil
-}
-
-type kubectlResourceList struct {
-	Items []kubectlResourceItem `json:"items"`
-}
-
-type kubectlResourceItem struct {
-	Metadata struct {
-		Name      string `json:"name"`
-		Namespace string `json:"namespace"`
-	} `json:"metadata"`
-	Spec struct {
-		Type string `json:"type"`
-	} `json:"spec"`
-	Status struct {
-		Phase             string `json:"phase"`
-		Replicas          int    `json:"replicas"`
-		AvailableReplicas int    `json:"availableReplicas"`
-	} `json:"status"`
-}
-
-func parseResourceListJSON(
-	raw []byte,
-	resource string,
-	fallbackNamespace string,
-) ([]protocol.ResourceItem, error) {
-	var payload kubectlResourceList
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, fmt.Errorf("parse kubectl JSON for %s: %w", resource, err)
+	switch resource {
+	case "pods":
+		pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list pods for namespace %q: %w", namespace, err)
+		}
+		return podsToItems(pods.Items), nil
+	case "services":
+		services, err := client.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list services for namespace %q: %w", namespace, err)
+		}
+		return servicesToItems(services.Items), nil
+	case "deployments":
+		deployments, err := client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list deployments for namespace %q: %w", namespace, err)
+		}
+		return deploymentsToItems(deployments.Items), nil
 	}
 
-	items := make([]protocol.ResourceItem, 0, len(payload.Items))
-	for _, item := range payload.Items {
-		namespace := item.Metadata.Namespace
-		if namespace == "" {
-			namespace = fallbackNamespace
+	return nil, fmt.Errorf("unsupported resource %q", resource)
+}
+
+func podsToItems(pods []corev1.Pod) []protocol.ResourceItem {
+	items := make([]protocol.ResourceItem, 0, len(pods))
+	for _, pod := range pods {
+		status := "Unknown"
+		if pod.Status.Phase != "" {
+			status = string(pod.Status.Phase)
 		}
 		items = append(items, protocol.ResourceItem{
-			Name:      item.Metadata.Name,
-			Namespace: namespace,
-			Status:    summarizeResourceStatus(resource, item),
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+			Status:    status,
 		})
 	}
+	sortResourceItems(items)
+	return items
+}
 
+func servicesToItems(services []corev1.Service) []protocol.ResourceItem {
+	items := make([]protocol.ResourceItem, 0, len(services))
+	for _, service := range services {
+		status := "ClusterIP"
+		if service.Spec.Type != "" {
+			status = string(service.Spec.Type)
+		}
+		items = append(items, protocol.ResourceItem{
+			Name:      service.Name,
+			Namespace: service.Namespace,
+			Status:    status,
+		})
+	}
+	sortResourceItems(items)
+	return items
+}
+
+func deploymentsToItems(deployments []appsv1.Deployment) []protocol.ResourceItem {
+	items := make([]protocol.ResourceItem, 0, len(deployments))
+	for _, deployment := range deployments {
+		replicas := deployment.Status.Replicas
+		available := deployment.Status.AvailableReplicas
+		status := "0/0"
+		if replicas > 0 {
+			if available >= replicas {
+				status = "Available"
+			} else {
+				status = fmt.Sprintf("%d/%d available", available, replicas)
+			}
+		}
+		items = append(items, protocol.ResourceItem{
+			Name:      deployment.Name,
+			Namespace: deployment.Namespace,
+			Status:    status,
+		})
+	}
+	sortResourceItems(items)
+	return items
+}
+
+func sortResourceItems(items []protocol.ResourceItem) {
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].Namespace == items[j].Namespace {
 			return items[i].Name < items[j].Name
 		}
 		return items[i].Namespace < items[j].Namespace
 	})
-	return items, nil
-}
-
-func summarizeResourceStatus(resource string, item kubectlResourceItem) string {
-	switch resource {
-	case "pods":
-		if item.Status.Phase == "" {
-			return "Unknown"
-		}
-		return item.Status.Phase
-	case "services":
-		if item.Spec.Type == "" {
-			return "ClusterIP"
-		}
-		return item.Spec.Type
-	case "deployments":
-		replicas := item.Status.Replicas
-		available := item.Status.AvailableReplicas
-		if replicas <= 0 {
-			return "0/0"
-		}
-		if available >= replicas {
-			return "Available"
-		}
-		return fmt.Sprintf("%d/%d available", available, replicas)
-	default:
-		return "Unknown"
-	}
 }

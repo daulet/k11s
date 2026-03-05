@@ -2,69 +2,43 @@ package kube
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type NamespaceFetcher struct {
-	binary string
+	clients *ClientFactory
 }
 
-func NewNamespaceFetcher() *NamespaceFetcher {
-	return &NamespaceFetcher{binary: "kubectl"}
+func NewNamespaceFetcher(clients *ClientFactory) *NamespaceFetcher {
+	if clients == nil {
+		clients = NewClientFactory()
+	}
+	return &NamespaceFetcher{clients: clients}
 }
 
 func (f *NamespaceFetcher) List(ctx context.Context, kubeContext string) ([]string, error) {
-	args := []string{
-		"get",
-		"namespaces",
-		"-o",
-		"json",
-		"--request-timeout=1s",
-	}
-	if strings.TrimSpace(kubeContext) != "" {
-		args = append(args, "--context", kubeContext)
-	}
-
-	cmd := exec.CommandContext(ctx, f.binary, args...)
-	output, err := cmd.Output()
+	client, err := f.clients.ClientForContext(kubeContext)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr := strings.TrimSpace(string(exitErr.Stderr))
-			if stderr == "" {
-				stderr = exitErr.Error()
-			}
-			return nil, fmt.Errorf("kubectl get namespaces failed: %s", stderr)
-		}
-		return nil, fmt.Errorf("kubectl get namespaces failed: %w", err)
+		return nil, err
 	}
 
-	return parseNamespaceListJSON(output)
-}
-
-type kubectlNamespaceList struct {
-	Items []kubectlNamespaceItem `json:"items"`
-}
-
-type kubectlNamespaceItem struct {
-	Metadata struct {
-		Name string `json:"name"`
-	} `json:"metadata"`
-}
-
-func parseNamespaceListJSON(raw []byte) ([]string, error) {
-	var payload kubectlNamespaceList
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, fmt.Errorf("parse kubectl JSON for namespaces: %w", err)
+	namespaces, err := client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list namespaces for context %q: %w", strings.TrimSpace(kubeContext), err)
 	}
+	return namespacesToNames(namespaces.Items), nil
+}
 
+func namespacesToNames(namespaces []corev1.Namespace) []string {
 	seen := map[string]struct{}{}
-	values := make([]string, 0, len(payload.Items))
-	for _, item := range payload.Items {
-		name := strings.TrimSpace(item.Metadata.Name)
+	values := make([]string, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		name := strings.TrimSpace(namespace.Name)
 		if name == "" {
 			continue
 		}
@@ -76,5 +50,5 @@ func parseNamespaceListJSON(raw []byte) ([]string, error) {
 	}
 
 	sort.Strings(values)
-	return values, nil
+	return values
 }

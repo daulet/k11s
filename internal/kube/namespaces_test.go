@@ -1,21 +1,20 @@
 package kube
 
-import "testing"
+import (
+	"testing"
 
-func TestParseNamespaceListJSON(t *testing.T) {
-	raw := []byte(`{
-	  "items": [
-	    {"metadata": {"name": "kube-system"}},
-	    {"metadata": {"name": "default"}},
-	    {"metadata": {"name": "payments"}},
-	    {"metadata": {"name": "default"}}
-	  ]
-	}`)
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
-	values, err := parseNamespaceListJSON(raw)
-	if err != nil {
-		t.Fatalf("unexpected parse error: %v", err)
-	}
+func TestNamespacesToNames(t *testing.T) {
+	values := namespacesToNames([]corev1.Namespace{
+		{ObjectMeta: metav1.ObjectMeta{Name: "kube-system"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "payments"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+	})
+
 	if len(values) != 3 {
 		t.Fatalf("expected 3 namespaces, got %d", len(values))
 	}

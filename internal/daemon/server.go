@@ -47,8 +47,9 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	logger := log.New(os.Stderr, "k11sd: ", log.LstdFlags)
 	logger.Printf("listening on %s", cfg.SocketPath)
 	store := session.NewStore(cfg.SessionPath)
-	resourceCache := resourcecache.New(ctx, kube.NewResourceFetcher(), logger)
-	namespaceCache := namespacecache.New(ctx, kube.NewNamespaceFetcher(), logger)
+	clientFactory := kube.NewClientFactory()
+	resourceCache := resourcecache.New(ctx, kube.NewResourceFetcher(clientFactory), logger)
+	namespaceCache := namespacecache.New(ctx, kube.NewNamespaceFetcher(clientFactory), logger)
 
 	var shutdownOnce sync.Once
 	shutdown := func() {

@@ -2,6 +2,10 @@ package kube
 
 import (
 	"testing"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestIsCoreResource(t *testing.T) {
@@ -23,24 +27,18 @@ func TestIsCoreResource(t *testing.T) {
 	}
 }
 
-func TestParseResourceListJSONPods(t *testing.T) {
-	raw := []byte(`{
-	  "items": [
-	    {
-	      "metadata": { "name": "worker", "namespace": "payments" },
-	      "status": { "phase": "Running" }
-	    },
-	    {
-	      "metadata": { "name": "api", "namespace": "payments" },
-	      "status": { "phase": "Pending" }
-	    }
-	  ]
-	}`)
+func TestPodsToItems(t *testing.T) {
+	items := podsToItems([]corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "payments"},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "payments"},
+			Status:     corev1.PodStatus{Phase: corev1.PodPending},
+		},
+	})
 
-	items, err := parseResourceListJSON(raw, "pods", "default")
-	if err != nil {
-		t.Fatalf("unexpected parse error: %v", err)
-	}
 	if len(items) != 2 {
 		t.Fatalf("expected 2 items, got %d", len(items))
 	}
@@ -52,24 +50,18 @@ func TestParseResourceListJSONPods(t *testing.T) {
 	}
 }
 
-func TestParseResourceListJSONDeployments(t *testing.T) {
-	raw := []byte(`{
-	  "items": [
-	    {
-	      "metadata": { "name": "web", "namespace": "default" },
-	      "status": { "replicas": 3, "availableReplicas": 1 }
-	    },
-	    {
-	      "metadata": { "name": "api", "namespace": "default" },
-	      "status": { "replicas": 2, "availableReplicas": 2 }
-	    }
-	  ]
-	}`)
+func TestDeploymentsToItems(t *testing.T) {
+	items := deploymentsToItems([]appsv1.Deployment{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+			Status:     appsv1.DeploymentStatus{Replicas: 3, AvailableReplicas: 1},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "default"},
+			Status:     appsv1.DeploymentStatus{Replicas: 2, AvailableReplicas: 2},
+		},
+	})
 
-	items, err := parseResourceListJSON(raw, "deployments", "default")
-	if err != nil {
-		t.Fatalf("unexpected parse error: %v", err)
-	}
 	if len(items) != 2 {
 		t.Fatalf("expected 2 items, got %d", len(items))
 	}
@@ -77,6 +69,29 @@ func TestParseResourceListJSONDeployments(t *testing.T) {
 		t.Fatalf("unexpected first item: %#v", items[0])
 	}
 	if items[1].Name != "web" || items[1].Status != "1/3 available" {
+		t.Fatalf("unexpected second item: %#v", items[1])
+	}
+}
+
+func TestServicesToItems(t *testing.T) {
+	items := servicesToItems([]corev1.Service{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{},
+		},
+	})
+
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if items[0].Name != "a" || items[0].Status != "ClusterIP" {
+		t.Fatalf("unexpected first item: %#v", items[0])
+	}
+	if items[1].Name != "b" || items[1].Status != "NodePort" {
 		t.Fatalf("unexpected second item: %#v", items[1])
 	}
 }
