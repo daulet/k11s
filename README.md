@@ -89,6 +89,7 @@ Command line examples:
 - `:delete` (delete selected row), `:delete <name>`, or `:delete <namespace>/<name>` when in `all` namespace
 - `:scale <replicas>` (scale selected item), or `:scale <replicas> <name>`
 - `:restart` (rollout restart selected item), or `:rollout restart [name]`
+- `:logs` (tail selected pod logs), or `:logs <pod-name> [tail-lines]`
 
 Autocomplete notes:
 - `:ctx ` / `:context ` suggestions are loaded from kubeconfig (`KUBECONFIG` or `~/.kube/config`).

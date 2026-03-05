@@ -317,6 +317,9 @@ func runTUI(state startupState, startMode string) error {
 		LoadAction: func(ctx context.Context, query protocol.ActionQuery) (protocol.ActionResult, error) {
 			return client.ExecuteAction(ctx, state.Config, buildinfo.Version, query)
 		},
+		LoadLogs: func(ctx context.Context, query protocol.LogsQuery) (protocol.LogsPayload, error) {
+			return client.GetLogs(ctx, state.Config, buildinfo.Version, query)
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("run tui (%s): %w", startMode, err)

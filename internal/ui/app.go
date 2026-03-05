@@ -40,6 +40,7 @@ type LoadResourceDetailFunc func(ctx context.Context, query protocol.ResourceDet
 type LoadNamespacesFunc func(ctx context.Context, kubeContext string) (protocol.NamespaceListPayload, error)
 type LoadCRDsFunc func(ctx context.Context, kubeContext string) ([]string, error)
 type LoadActionFunc func(ctx context.Context, query protocol.ActionQuery) (protocol.ActionResult, error)
+type LoadLogsFunc func(ctx context.Context, query protocol.LogsQuery) (protocol.LogsPayload, error)
 
 type Options struct {
 	Session              protocol.SessionState
@@ -54,6 +55,7 @@ type Options struct {
 	LoadNamespaces       LoadNamespacesFunc
 	LoadCRDs             LoadCRDsFunc
 	LoadAction           LoadActionFunc
+	LoadLogs             LoadLogsFunc
 }
 
 type Result struct {
@@ -90,6 +92,16 @@ type actionLoadedMsg struct {
 }
 
 type actionFailedMsg struct {
+	seq int
+	err error
+}
+
+type logsLoadedMsg struct {
+	seq     int
+	payload protocol.LogsPayload
+}
+
+type logsFailedMsg struct {
 	seq int
 	err error
 }
@@ -257,6 +269,7 @@ type model struct {
 	loadNamespaces     LoadNamespacesFunc
 	loadCRDs           LoadCRDsFunc
 	loadAction         LoadActionFunc
+	loadLogs           LoadLogsFunc
 
 	input          textinput.Model
 	commandMode    bool
@@ -276,6 +289,10 @@ type model struct {
 	actionLoading      bool
 	actionRequestSeq   int
 	actionActiveSeq    int
+	logs               protocol.LogsPayload
+	logsLoading        bool
+	logsRequestSeq     int
+	logsActiveSeq      int
 	pollEvery          time.Duration
 	namespacePollEvery time.Duration
 	crdPollEvery       time.Duration
@@ -332,6 +349,7 @@ func newModel(opts Options) model {
 		loadNamespaces:       opts.LoadNamespaces,
 		loadCRDs:             opts.LoadCRDs,
 		loadAction:           opts.LoadAction,
+		loadLogs:             opts.LoadLogs,
 		input:                input,
 		keys:                 keys,
 		help:                 h,
@@ -391,6 +409,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resourceList = msg.payload
 		m.selectFromSession()
 		m.syncDetailSelection()
+		m.syncLogsSelection()
 		if errText := strings.TrimSpace(msg.payload.Freshness.Error); errText != "" {
 			m.commandMessage = "list error: " + errText
 		} else if msg.announce {
@@ -455,6 +474,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.actionLoading = false
 		m.commandMessage = fmt.Sprintf("action request failed: %v", msg.err)
+		return m, nil
+	case logsLoadedMsg:
+		if msg.seq != m.logsActiveSeq {
+			return m, nil
+		}
+		m.logsLoading = false
+		m.logs = msg.payload
+		m.commandMessage = fmt.Sprintf("logs loaded: %d lines for %s", len(msg.payload.Lines), msg.payload.Name)
+		return m, nil
+	case logsFailedMsg:
+		if msg.seq != m.logsActiveSeq {
+			return m, nil
+		}
+		m.logsLoading = false
+		m.commandMessage = fmt.Sprintf("logs failed: %v", msg.err)
 		return m, nil
 	case namespacesLoadedMsg:
 		if msg.kubeContext != strings.TrimSpace(m.session.KubeContext) {
@@ -569,6 +603,17 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clearAutocomplete()
 		if commandText == "" {
 			return m, nil
+		}
+		if logsQuery, isLogs, logsErr := m.logsQueryFromCommand(commandText); isLogs {
+			if logsErr != nil {
+				m.commandMode = true
+				m.input.Focus()
+				m.input.SetValue(commandText)
+				m.commandMessage = logsErr.Error()
+				m.suggestions = m.commandSuggestions(m.input.Value())
+				return m, nil
+			}
+			return m.startLogs(logsQuery)
 		}
 		if actionQuery, isAction, actionErr := m.actionQueryFromCommand(commandText); isAction {
 			if actionErr != nil {
@@ -835,6 +880,47 @@ func (m model) actionTargetFromFields(args []string) (name string, itemNamespace
 	return name, itemNamespace, nil
 }
 
+func (m model) logsQueryFromCommand(input string) (protocol.LogsQuery, bool, error) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return protocol.LogsQuery{}, false, nil
+	}
+	command := strings.ToLower(strings.TrimSpace(fields[0]))
+	if command != "logs" {
+		return protocol.LogsQuery{}, false, nil
+	}
+	if !strings.EqualFold(m.session.Resource, "pods") {
+		return protocol.LogsQuery{}, true, fmt.Errorf("logs are currently supported in pods view only")
+	}
+
+	name, itemNamespace, err := m.actionTargetFromFields(fields[1:])
+	if err != nil {
+		return protocol.LogsQuery{}, true, err
+	}
+
+	tailLines := int64(200)
+	if len(fields) >= 3 {
+		parsed, parseErr := strconv.Atoi(strings.TrimSpace(fields[2]))
+		if parseErr != nil {
+			return protocol.LogsQuery{}, true, fmt.Errorf("invalid logs tail lines %q", fields[2])
+		}
+		if parsed <= 0 {
+			return protocol.LogsQuery{}, true, fmt.Errorf("logs tail lines must be > 0")
+		}
+		tailLines = int64(parsed)
+	}
+
+	return protocol.LogsQuery{
+		KubeContext:   m.session.KubeContext,
+		Resource:      m.session.Resource,
+		Namespace:     m.session.Namespace,
+		Filter:        m.session.Filter,
+		ItemNamespace: itemNamespace,
+		Name:          name,
+		TailLines:     tailLines,
+	}, true, nil
+}
+
 func (m model) startListReload() (tea.Model, tea.Cmd) {
 	return m.startListReloadWithAnnouncement(true)
 }
@@ -886,6 +972,15 @@ func (m model) startAction(query protocol.ActionQuery) (tea.Model, tea.Cmd) {
 	m.actionLoading = true
 	m.commandMessage = fmt.Sprintf("%s %s...", query.Action, query.Name)
 	return m, m.loadActionCmd(m.actionActiveSeq, query)
+}
+
+func (m model) startLogs(query protocol.LogsQuery) (tea.Model, tea.Cmd) {
+	m.logsRequestSeq++
+	m.logsActiveSeq = m.logsRequestSeq
+	m.logsLoading = true
+	m.logs = protocol.LogsPayload{}
+	m.commandMessage = fmt.Sprintf("loading logs for %s...", query.Name)
+	return m, m.loadLogsCmd(m.logsActiveSeq, query)
 }
 
 func (m model) loadListCmd(seq int, query protocol.ResourceListQuery, announce bool) tea.Cmd {
@@ -953,6 +1048,27 @@ func (m model) loadActionCmd(seq int, query protocol.ActionQuery) tea.Cmd {
 			return actionFailedMsg{seq: seq, err: err}
 		}
 		return actionLoadedMsg{seq: seq, result: result}
+	}
+}
+
+func (m model) loadLogsCmd(seq int, query protocol.LogsQuery) tea.Cmd {
+	if m.loadLogs == nil {
+		return func() tea.Msg {
+			return logsFailedMsg{
+				seq: seq,
+				err: fmt.Errorf("logs loader is not configured"),
+			}
+		}
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+
+		payload, err := m.loadLogs(ctx, query)
+		if err != nil {
+			return logsFailedMsg{seq: seq, err: err}
+		}
+		return logsLoadedMsg{seq: seq, payload: payload}
 	}
 }
 
@@ -1132,6 +1248,10 @@ func (m model) listLines() []string {
 	if detailLines := m.detailLines(); len(detailLines) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, detailLines...)
+	}
+	if logsLines := m.logsLines(); len(logsLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, logsLines...)
 	}
 	return lines
 }
@@ -1428,6 +1548,14 @@ func (m *model) clearDetail() {
 	m.detailActiveSeq = m.detailRequestSeq
 	m.detailLoading = false
 	m.detail = protocol.ResourceDetailPayload{}
+	m.clearLogs()
+}
+
+func (m *model) clearLogs() {
+	m.logsRequestSeq++
+	m.logsActiveSeq = m.logsRequestSeq
+	m.logsLoading = false
+	m.logs = protocol.LogsPayload{}
 }
 
 func (m *model) syncDetailSelection() {
@@ -1455,6 +1583,29 @@ func (m *model) syncDetailSelection() {
 	}
 	if detailNamespace != "" && detailNamespace != item.Namespace {
 		m.clearDetail()
+	}
+}
+
+func (m *model) syncLogsSelection() {
+	if m.logs.Name == "" && len(m.logs.Lines) == 0 && !m.logsLoading {
+		return
+	}
+
+	item, ok := m.currentItem()
+	if !ok {
+		m.clearLogs()
+		return
+	}
+
+	logName := strings.TrimSpace(m.logs.Name)
+	if logName != item.Name {
+		m.clearLogs()
+		return
+	}
+
+	logNamespace := strings.TrimSpace(m.logs.ItemNamespace)
+	if logNamespace != "" && logNamespace != item.Namespace {
+		m.clearLogs()
 	}
 }
 
@@ -1499,6 +1650,32 @@ func (m model) detailLines() []string {
 	}
 }
 
+func (m model) logsLines() []string {
+	if m.logsLoading {
+		return []string{"logs: loading..."}
+	}
+	if m.logs.Name == "" && len(m.logs.Lines) == 0 {
+		return nil
+	}
+
+	lines := []string{
+		fmt.Sprintf("logs: %s/%s", strings.TrimSpace(m.logs.ItemNamespace), strings.TrimSpace(m.logs.Name)),
+	}
+	displayLines := m.logs.Lines
+	const maxLines = 20
+	if len(displayLines) > maxLines {
+		lines = append(lines, fmt.Sprintf("  ... %d earlier lines omitted", len(displayLines)-maxLines))
+		displayLines = displayLines[len(displayLines)-maxLines:]
+	}
+	for _, line := range displayLines {
+		lines = append(lines, "  "+line)
+	}
+	if m.logs.Truncated {
+		lines = append(lines, "  ... output truncated")
+	}
+	return lines
+}
+
 func (m model) commandSuggestions(input string) []string {
 	trimmed := strings.TrimLeft(input, " ")
 	if trimmed == "" {
@@ -1528,6 +1705,8 @@ func (m model) commandSuggestions(input string) []string {
 	case "cr", "crs", "crd", "filter", "customresource", "customresources":
 		return prefixMatches(m.crdCandidates(), valuePrefix)
 	case "delete", "del", "rm":
+		return prefixMatches(m.deleteCandidates(), valuePrefix)
+	case "logs":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "scale":
 		if len(fields) <= 1 || (len(fields) == 2 && !hasTrailingSpace) {
@@ -1848,6 +2027,7 @@ func baseSuggestions() []string {
 		"delete",
 		"del",
 		"rm",
+		"logs",
 		"restart",
 		"rollout",
 		"scale",
@@ -2026,7 +2206,7 @@ func prefersArgumentCompletion(token string, commandCandidates []string) bool {
 
 func commandSupportsArgument(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
-	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm", "scale", "restart", "rollout":
+	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm", "logs", "scale", "restart", "rollout":
 		return true
 	default:
 		return false

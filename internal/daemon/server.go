@@ -52,6 +52,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	resourceCache := resourcecache.New(ctx, kube.NewResourceFetcher(clientFactory), logger)
 	namespaceCache := namespacecache.New(ctx, kube.NewNamespaceFetcher(clientFactory), logger)
 	actionExecutor := kube.NewActionExecutor(clientFactory)
+	logsFetcher := kube.NewLogsFetcher(clientFactory)
 
 	var shutdownOnce sync.Once
 	shutdown := func() {
@@ -76,7 +77,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 			continue
 		}
 
-		go handleConn(conn, daemonVersion, shutdown, store, resourceCache, namespaceCache, actionExecutor, logger)
+		go handleConn(conn, daemonVersion, shutdown, store, resourceCache, namespaceCache, actionExecutor, logsFetcher, logger)
 	}
 }
 
@@ -88,6 +89,7 @@ func handleConn(
 	resourceCache *resourcecache.Cache,
 	namespaceCache *namespacecache.Cache,
 	actionExecutor *kube.ActionExecutor,
+	logsFetcher *kube.LogsFetcher,
 	logger *log.Logger,
 ) {
 	defer conn.Close()
@@ -242,6 +244,54 @@ func handleConn(
 		resp := protocol.BuildActionResponse(req, daemonVersion, os.Getpid(), result)
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
+	case protocol.IntentLogs:
+		if req.LogsQuery == nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "missing logs query payload",
+			})
+			return
+		}
+
+		query := normalizeLogsQuery(*req.LogsQuery)
+		if strings.TrimSpace(query.Name) == "" {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "logs query requires target name",
+			})
+			return
+		}
+		if logsFetcher == nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "logs fetcher is not configured",
+			})
+			return
+		}
+
+		payload, err := logsFetcher.Fetch(context.Background(), query)
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       fmt.Sprintf("logs fetch failed: %v", err),
+			})
+			return
+		}
+		resp := protocol.BuildLogsResponse(req, daemonVersion, os.Getpid(), payload)
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
 	}
 
 	resp := protocol.BuildHandshakeResponse(req, daemonVersion, os.Getpid())
@@ -378,6 +428,25 @@ func normalizeActionQuery(query protocol.ActionQuery) protocol.ActionQuery {
 	query.Filter = strings.TrimSpace(query.Filter)
 	query.ItemNamespace = strings.TrimSpace(query.ItemNamespace)
 	query.Name = strings.TrimSpace(query.Name)
+	return query
+}
+
+func normalizeLogsQuery(query protocol.LogsQuery) protocol.LogsQuery {
+	query.KubeContext = strings.TrimSpace(query.KubeContext)
+	query.Resource = strings.TrimSpace(strings.ToLower(query.Resource))
+	if query.Resource == "" {
+		query.Resource = "pods"
+	}
+	query.Namespace = strings.TrimSpace(query.Namespace)
+	if query.Namespace == "" {
+		query.Namespace = "default"
+	}
+	query.Filter = strings.TrimSpace(query.Filter)
+	query.ItemNamespace = strings.TrimSpace(query.ItemNamespace)
+	query.Name = strings.TrimSpace(query.Name)
+	if query.TailLines <= 0 {
+		query.TailLines = 200
+	}
 	return query
 }
 

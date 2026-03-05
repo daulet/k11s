@@ -13,6 +13,7 @@ const (
 	IntentResourceDetail = "resource_detail"
 	IntentNamespaceList  = "namespace_list"
 	IntentAction         = "action"
+	IntentLogs           = "logs"
 )
 
 type HandshakeRequest struct {
@@ -25,6 +26,7 @@ type HandshakeRequest struct {
 	DetailQuery    *ResourceDetailQuery `json:"detailQuery,omitempty"`
 	NamespaceQuery *NamespaceListQuery  `json:"namespaceQuery,omitempty"`
 	ActionQuery    *ActionQuery         `json:"actionQuery,omitempty"`
+	LogsQuery      *LogsQuery           `json:"logsQuery,omitempty"`
 }
 
 type HandshakeResponse struct {
@@ -38,6 +40,7 @@ type HandshakeResponse struct {
 	ResourceDetail *ResourceDetailPayload `json:"resourceDetail,omitempty"`
 	NamespaceList  *NamespaceListPayload  `json:"namespaceList,omitempty"`
 	ActionResult   *ActionResult          `json:"actionResult,omitempty"`
+	LogsPayload    *LogsPayload           `json:"logsPayload,omitempty"`
 	Message        string                 `json:"message,omitempty"`
 }
 
@@ -149,6 +152,25 @@ type ActionResult struct {
 	Success bool       `json:"success"`
 	Code    ActionCode `json:"code,omitempty"`
 	Message string     `json:"message"`
+}
+
+type LogsQuery struct {
+	KubeContext   string `json:"kubeContext,omitempty"`
+	Resource      string `json:"resource"`
+	Namespace     string `json:"namespace"`
+	Filter        string `json:"filter,omitempty"`
+	ItemNamespace string `json:"itemNamespace,omitempty"`
+	Name          string `json:"name"`
+	TailLines     int64  `json:"tailLines,omitempty"`
+}
+
+type LogsPayload struct {
+	Resource      string   `json:"resource"`
+	Namespace     string   `json:"namespace"`
+	ItemNamespace string   `json:"itemNamespace,omitempty"`
+	Name          string   `json:"name"`
+	Lines         []string `json:"lines"`
+	Truncated     bool     `json:"truncated,omitempty"`
 }
 
 func BuildHandshakeResponse(req HandshakeRequest, daemonVersion string, pid int) HandshakeResponse {
@@ -267,6 +289,22 @@ func BuildActionResponse(
 
 	resp.ActionResult = &payload
 	resp.Message = "action result ready"
+	return resp
+}
+
+func BuildLogsResponse(
+	req HandshakeRequest,
+	daemonVersion string,
+	pid int,
+	payload LogsPayload,
+) HandshakeResponse {
+	resp := BuildHandshakeResponse(req, daemonVersion, pid)
+	if !resp.Compatible {
+		return resp
+	}
+
+	resp.LogsPayload = &payload
+	resp.Message = "logs payload ready"
 	return resp
 }
 

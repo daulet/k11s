@@ -391,6 +391,96 @@ func TestRestartCommandRunsAction(t *testing.T) {
 	}
 }
 
+func TestLogsCommandLoadsPayload(t *testing.T) {
+	var logsSeen protocol.LogsQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadLogs: func(_ context.Context, query protocol.LogsQuery) (protocol.LogsPayload, error) {
+			logsSeen = query
+			return protocol.LogsPayload{
+				Resource:      "pods",
+				Namespace:     "default",
+				ItemNamespace: "default",
+				Name:          "api",
+				Lines:         []string{"line one", "line two"},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("logs")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterApply := updated.(model)
+	if !afterApply.logsLoading {
+		t.Fatalf("expected logs request to start")
+	}
+	if cmd == nil {
+		t.Fatalf("expected logs command")
+	}
+
+	msg := cmd()
+	updated, _ = afterApply.Update(msg)
+	final := updated.(model)
+	if final.logsLoading {
+		t.Fatalf("expected logs loading cleared")
+	}
+	if final.logs.Name != "api" || len(final.logs.Lines) != 2 {
+		t.Fatalf("unexpected logs payload: %#v", final.logs)
+	}
+	if logsSeen.Name != "api" || logsSeen.TailLines != 200 {
+		t.Fatalf("unexpected logs query: %#v", logsSeen)
+	}
+}
+
+func TestLogsCommandRequiresPodsView(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "3/3"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("logs")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected no async command on validation error")
+	}
+	if !next.commandMode {
+		t.Fatalf("expected command mode to remain open")
+	}
+	if !strings.Contains(strings.ToLower(next.commandMessage), "pods view") {
+		t.Fatalf("expected pods-view validation message, got %q", next.commandMessage)
+	}
+}
+
 func TestApplyCommandCRsUsesSelectedCRDWhenInCRDView(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{

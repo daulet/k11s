@@ -208,3 +208,29 @@ func TestBuildActionResponse(t *testing.T) {
 		t.Fatalf("unexpected action code: %q", resp.ActionResult.Code)
 	}
 }
+
+func TestBuildLogsResponse(t *testing.T) {
+	payload := LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api-0",
+		Lines:         []string{"line-1", "line-2"},
+		Truncated:     false,
+	}
+	resp := BuildLogsResponse(
+		HandshakeRequest{RPCVersion: RPCVersion, Intent: IntentLogs},
+		"dev",
+		123,
+		payload,
+	)
+	if !resp.Compatible {
+		t.Fatalf("expected compatible response")
+	}
+	if resp.LogsPayload == nil {
+		t.Fatalf("expected logs payload")
+	}
+	if resp.LogsPayload.Name != "api-0" || len(resp.LogsPayload.Lines) != 2 {
+		t.Fatalf("unexpected logs payload: %#v", resp.LogsPayload)
+	}
+}
