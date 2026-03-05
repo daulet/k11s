@@ -31,6 +31,8 @@ Primary goals:
 - Daemon handshake enforces RPC version compatibility.
 - If daemon version differs from client version, `k11s` requests graceful daemon shutdown and starts a matching daemon.
 - Session state is persisted by daemon and restored on launch.
+- Placeholder resource list responses include freshness metadata.
+- Status bar renders freshness badge, age, snapshot time, source, and watch health.
 
 ## Quickstart
 
@@ -51,6 +53,7 @@ Session override flags (persisted through daemon):
 - `--resource`
 - `--filter`
 - `--selection`
+- `--simulate-stale` (for stale-state visual validation)
 
 Perf measurement:
 - `k11s debug perf` prints startup output, span timings, and JSON report.

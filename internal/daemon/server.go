@@ -137,10 +137,71 @@ func handleConn(conn net.Conn, daemonVersion string, shutdown func(), store *ses
 		resp := protocol.BuildSessionSaveResponse(req, daemonVersion, os.Getpid())
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
+	case protocol.IntentResourceList:
+		if req.ListQuery == nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "missing list query payload",
+			})
+			return
+		}
+
+		payload := buildPlaceholderResourceList(*req.ListQuery)
+		resp := protocol.BuildResourceListResponse(req, daemonVersion, os.Getpid(), payload)
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
 	}
 
 	resp := protocol.BuildHandshakeResponse(req, daemonVersion, os.Getpid())
 	_ = json.NewEncoder(conn).Encode(resp)
+}
+
+func buildPlaceholderResourceList(query protocol.ResourceListQuery) protocol.ResourceListPayload {
+	namespace := query.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	now := time.Now()
+	freshness := protocol.FreshnessMeta{
+		State:              protocol.FreshnessStateLive,
+		SnapshotTimeUnixMs: now.UnixMilli(),
+		AgeMs:              0,
+		WatchHealthy:       true,
+		Source:             "cache",
+	}
+
+	if query.SimulateStale {
+		snapshot := now.Add(-3 * time.Minute)
+		freshness = protocol.FreshnessMeta{
+			State:              protocol.FreshnessStateStale,
+			SnapshotTimeUnixMs: snapshot.UnixMilli(),
+			AgeMs:              now.Sub(snapshot).Milliseconds(),
+			WatchHealthy:       false,
+			Source:             "cache-stale",
+		}
+	}
+
+	resource := query.Resource
+	if resource == "" {
+		resource = "pods"
+	}
+
+	items := []protocol.ResourceItem{
+		{Name: "api-7d9b", Namespace: namespace, Status: "Running"},
+		{Name: "worker-5f8a", Namespace: namespace, Status: "Running"},
+		{Name: "db-migration-2821", Namespace: namespace, Status: "Completed"},
+	}
+
+	return protocol.ResourceListPayload{
+		Resource:  resource,
+		Namespace: namespace,
+		Items:     items,
+		Freshness: freshness,
+	}
 }
 
 func removeStaleSocket(socketPath string, timeout time.Duration) error {

@@ -47,14 +47,16 @@ type startupOptions struct {
 	resourceOverride    string
 	filterOverride      string
 	selectionOverride   string
+	simulateStale       bool
 }
 
 type startupState struct {
-	Config      config.Config
-	Bootstrap   client.BootstrapResult
-	Session     protocol.SessionState
-	Recorder    *perf.Recorder
-	ProcessTime time.Time
+	Config       config.Config
+	Bootstrap    client.BootstrapResult
+	Session      protocol.SessionState
+	ResourceList protocol.ResourceListPayload
+	Recorder     *perf.Recorder
+	ProcessTime  time.Time
 }
 
 func runStartup(processStart time.Time, args []string, includePerfOutput bool) error {
@@ -106,6 +108,7 @@ func parseStartupFlags(args []string, includePerfFlags bool, stderr io.Writer) (
 	resourceOverride := fs.String("resource", "", "override restored resource and persist it")
 	filterOverride := fs.String("filter", "", "override restored filter and persist it")
 	selectionOverride := fs.String("selection", "", "override restored selection and persist it")
+	simulateStale := fs.Bool("simulate-stale", false, "simulate stale view freshness for status bar validation")
 
 	jsonOnly := false
 	if includePerfFlags {
@@ -133,6 +136,7 @@ func parseStartupFlags(args []string, includePerfFlags bool, stderr io.Writer) (
 		resourceOverride:    *resourceOverride,
 		filterOverride:      *filterOverride,
 		selectionOverride:   *selectionOverride,
+		simulateStale:       *simulateStale,
 	}, jsonOnly, nil
 }
 
@@ -176,12 +180,29 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 		}
 	}
 
+	listLoadStart := time.Now()
+	resourceList, err := client.ListResources(
+		context.Background(),
+		cfg,
+		buildinfo.Version,
+		protocol.ResourceListQuery{
+			Resource:      sessionState.Resource,
+			Namespace:     sessionState.Namespace,
+			SimulateStale: opts.simulateStale,
+		},
+	)
+	recorder.AddDuration("placeholder_list", time.Since(listLoadStart))
+	if err != nil {
+		return startupState{}, fmt.Errorf("load placeholder resource list: %w", err)
+	}
+
 	return startupState{
-		Config:      cfg,
-		Bootstrap:   result,
-		Session:     sessionState,
-		Recorder:    recorder,
-		ProcessTime: processStart,
+		Config:       cfg,
+		Bootstrap:    result,
+		Session:      sessionState,
+		ResourceList: resourceList,
+		Recorder:     recorder,
+		ProcessTime:  processStart,
 	}, nil
 }
 
@@ -213,8 +234,87 @@ func renderStartupOutput(out io.Writer, state startupState) time.Duration {
 		state.Session.Filter,
 		state.Session.Selection,
 	)
+	fmt.Fprintf(
+		out,
+		"status: %s\n",
+		formatStatusBar(state.ResourceList.Freshness, enableColor()),
+	)
+	fmt.Fprintf(
+		out,
+		"view: resource=%q namespace=%q items=%d\n",
+		state.ResourceList.Resource,
+		state.ResourceList.Namespace,
+		len(state.ResourceList.Items),
+	)
 	fmt.Fprintln(out, "ui: placeholder ready (session restored)")
 	return time.Since(firstPaintStart)
+}
+
+func enableColor() bool {
+	return os.Getenv("NO_COLOR") == ""
+}
+
+func formatStatusBar(meta protocol.FreshnessMeta, useColor bool) string {
+	stateLabel := string(meta.State)
+	badge := "[" + stateLabel + "]"
+
+	switch meta.State {
+	case protocol.FreshnessStateLive:
+		if useColor {
+			badge = "\x1b[30;42m LIVE \x1b[0m"
+		}
+	case protocol.FreshnessStateCatchingUp:
+		if useColor {
+			badge = "\x1b[30;43m CATCHING_UP \x1b[0m"
+		} else {
+			badge = "[CATCHING_UP]"
+		}
+	case protocol.FreshnessStateStale:
+		if useColor {
+			badge = "\x1b[97;41m !!! STALE !!! \x1b[0m"
+		} else {
+			badge = "[!!! STALE !!!]"
+		}
+	default:
+		if useColor {
+			badge = "\x1b[37;45m UNKNOWN \x1b[0m"
+		} else {
+			badge = "[UNKNOWN]"
+		}
+	}
+
+	return fmt.Sprintf(
+		"%s age=%s as_of=%s source=%s watch=%s",
+		badge,
+		formatAge(meta.AgeMs),
+		formatSnapshot(meta.SnapshotTimeUnixMs),
+		meta.Source,
+		formatWatchHealth(meta.WatchHealthy),
+	)
+}
+
+func formatAge(ageMs int64) string {
+	if ageMs < 1000 {
+		return fmt.Sprintf("%dms", ageMs)
+	}
+	if ageMs < 60_000 {
+		return fmt.Sprintf("%ds", ageMs/1000)
+	}
+	return fmt.Sprintf("%dm%ds", ageMs/60_000, (ageMs%60_000)/1000)
+}
+
+func formatSnapshot(snapshotUnixMs int64) string {
+	if snapshotUnixMs <= 0 {
+		return "unknown"
+	}
+	return time.UnixMilli(snapshotUnixMs).UTC().Format(time.RFC3339)
+}
+
+func formatWatchHealth(healthy bool) string {
+	if healthy {
+		return "healthy"
+	}
+	return "degraded"
 }
 
 func applySessionOverrides(

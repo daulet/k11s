@@ -69,3 +69,42 @@ func TestBuildSessionGetResponse(t *testing.T) {
 		t.Fatalf("unexpected session context: %q", resp.Session.KubeContext)
 	}
 }
+
+func TestBuildResourceListResponse(t *testing.T) {
+	payload := ResourceListPayload{
+		Resource:  "pods",
+		Namespace: "default",
+		Items: []ResourceItem{
+			{Name: "api-0", Namespace: "default", Status: "Running"},
+		},
+		Freshness: FreshnessMeta{
+			State:              FreshnessStateLive,
+			SnapshotTimeUnixMs: 100,
+			AgeMs:              0,
+			WatchHealthy:       true,
+			Source:             "cache",
+		},
+	}
+
+	resp := BuildResourceListResponse(
+		HandshakeRequest{RPCVersion: RPCVersion, Intent: IntentResourceList},
+		"dev",
+		123,
+		payload,
+	)
+	if !resp.Compatible {
+		t.Fatalf("expected compatible response")
+	}
+	if resp.ResourceList == nil {
+		t.Fatalf("expected resource list payload")
+	}
+	if resp.ResourceList.Resource != "pods" {
+		t.Fatalf("unexpected resource: %q", resp.ResourceList.Resource)
+	}
+	if len(resp.ResourceList.Items) != 1 {
+		t.Fatalf("expected one item, got %d", len(resp.ResourceList.Items))
+	}
+	if resp.ResourceList.Freshness.State != FreshnessStateLive {
+		t.Fatalf("unexpected freshness state: %q", resp.ResourceList.Freshness.State)
+	}
+}
