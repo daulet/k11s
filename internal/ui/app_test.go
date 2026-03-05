@@ -255,6 +255,157 @@ func TestLoadNamespacesUsesSessionContext(t *testing.T) {
 	}
 }
 
+func TestEnterInNormalModeLoadsSelectedDetail(t *testing.T) {
+	var seen protocol.ResourceDetailQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			seen = query
+			return protocol.ResourceDetailPayload{
+				Resource:      query.Resource,
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Found:         true,
+				Item: &protocol.ResourceItem{
+					Name:      query.Name,
+					Namespace: query.ItemNamespace,
+					Status:    "Running",
+				},
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 10,
+					AgeMs:              2,
+					WatchHealthy:       true,
+					Source:             "watch-cache",
+				},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updated.(model)
+	if !next.detailLoading {
+		t.Fatalf("expected detail loading after enter in normal mode")
+	}
+	if cmd == nil {
+		t.Fatalf("expected detail load command")
+	}
+
+	msg := cmd()
+	updated, _ = next.Update(msg)
+	final := updated.(model)
+
+	if final.detailLoading {
+		t.Fatalf("expected detail loading cleared after response")
+	}
+	if !final.detail.Found || final.detail.Item == nil {
+		t.Fatalf("expected found detail payload, got %#v", final.detail)
+	}
+	if seen.Name != "api" || seen.ItemNamespace != "default" {
+		t.Fatalf("unexpected detail query: %#v", seen)
+	}
+}
+
+func TestSelectionMoveClearsDetail(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+				{Name: "worker", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Found:         true,
+		Item: &protocol.ResourceItem{
+			Name:      "api",
+			Namespace: "default",
+			Status:    "Running",
+		},
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	next := updated.(model)
+	if next.detail.Name != "" || next.detail.Item != nil {
+		t.Fatalf("expected detail cleared on selection move, got %#v", next.detail)
+	}
+}
+
+func TestListReloadKeepsDetailForSameSelection(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Found:         true,
+		Item: &protocol.ResourceItem{
+			Name:      "api",
+			Namespace: "default",
+			Status:    "Running",
+		},
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+
+	updated, _ := m.Update(listLoadedMsg{
+		seq: 0,
+		payload: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	next := updated.(model)
+	if next.detail.Name != "api" || next.detail.Item == nil {
+		t.Fatalf("expected detail preserved for same selected item, got %#v", next.detail)
+	}
+}
+
 func TestTabUsesLongestCommonPrefixWithoutAccepting(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{

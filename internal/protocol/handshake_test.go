@@ -141,3 +141,44 @@ func TestBuildNamespaceListResponse(t *testing.T) {
 		t.Fatalf("expected two namespaces, got %d", len(resp.NamespaceList.Namespaces))
 	}
 }
+
+func TestBuildResourceDetailResponse(t *testing.T) {
+	payload := ResourceDetailPayload{
+		Resource:      "pods",
+		Namespace:     "all",
+		ItemNamespace: "payments",
+		Name:          "api-0",
+		Found:         true,
+		Item: &ResourceItem{
+			Name:      "api-0",
+			Namespace: "payments",
+			Status:    "Running",
+		},
+		Freshness: FreshnessMeta{
+			State:              FreshnessStateLive,
+			SnapshotTimeUnixMs: 300,
+			AgeMs:              10,
+			WatchHealthy:       true,
+			Source:             "watch-cache",
+		},
+	}
+
+	resp := BuildResourceDetailResponse(
+		HandshakeRequest{RPCVersion: RPCVersion, Intent: IntentResourceDetail},
+		"dev",
+		123,
+		payload,
+	)
+	if !resp.Compatible {
+		t.Fatalf("expected compatible response")
+	}
+	if resp.ResourceDetail == nil {
+		t.Fatalf("expected resource detail payload")
+	}
+	if !resp.ResourceDetail.Found {
+		t.Fatalf("expected found=true")
+	}
+	if resp.ResourceDetail.Item == nil || resp.ResourceDetail.Item.Name != "api-0" {
+		t.Fatalf("unexpected detail item: %#v", resp.ResourceDetail.Item)
+	}
+}

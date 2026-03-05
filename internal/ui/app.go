@@ -33,6 +33,7 @@ const (
 )
 
 type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error)
+type LoadResourceDetailFunc func(ctx context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error)
 type LoadNamespacesFunc func(ctx context.Context, kubeContext string) (protocol.NamespaceListPayload, error)
 
 type Options struct {
@@ -43,6 +44,7 @@ type Options struct {
 	UseColor             bool
 	SimulateStale        bool
 	LoadResourceList     LoadResourceListFunc
+	LoadResourceDetail   LoadResourceDetailFunc
 	LoadNamespaces       LoadNamespacesFunc
 }
 
@@ -57,6 +59,18 @@ type listLoadedMsg struct {
 }
 
 type listFailedMsg struct {
+	seq      int
+	err      error
+	announce bool
+}
+
+type detailLoadedMsg struct {
+	seq      int
+	payload  protocol.ResourceDetailPayload
+	announce bool
+}
+
+type detailFailedMsg struct {
 	seq      int
 	err      error
 	announce bool
@@ -84,6 +98,7 @@ type autocompleteState struct {
 type keyMap struct {
 	Up           key.Binding
 	Down         key.Binding
+	Detail       key.Binding
 	Command      key.Binding
 	Autocomplete key.Binding
 	Accept       key.Binding
@@ -100,6 +115,10 @@ func defaultKeyMap() keyMap {
 		Down: key.NewBinding(
 			key.WithKeys("down", "j"),
 			key.WithHelp("", ""),
+		),
+		Detail: key.NewBinding(
+			key.WithKeys("enter"),
+			key.WithHelp("enter", "detail"),
 		),
 		Command: key.NewBinding(
 			key.WithKeys(":"),
@@ -125,11 +144,11 @@ func defaultKeyMap() keyMap {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Command, k.Autocomplete, k.Accept, k.Apply, k.Quit}
+	return []key.Binding{k.Up, k.Detail, k.Command, k.Autocomplete, k.Accept, k.Apply, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{{k.Up, k.Down, k.Command, k.Autocomplete, k.Accept, k.Apply, k.Quit}}
+	return [][]key.Binding{{k.Up, k.Down, k.Detail, k.Command, k.Autocomplete, k.Accept, k.Apply, k.Quit}}
 }
 
 type styles struct {
@@ -184,10 +203,11 @@ type model struct {
 	contextSuggestions   []string
 	namespaceSuggestions []string
 
-	useColor         bool
-	simulateStale    bool
-	loadResourceList LoadResourceListFunc
-	loadNamespaces   LoadNamespacesFunc
+	useColor           bool
+	simulateStale      bool
+	loadResourceList   LoadResourceListFunc
+	loadResourceDetail LoadResourceDetailFunc
+	loadNamespaces     LoadNamespacesFunc
 
 	input          textinput.Model
 	commandMode    bool
@@ -199,6 +219,10 @@ type model struct {
 	loading            bool
 	requestSeq         int
 	activeSeq          int
+	detail             protocol.ResourceDetailPayload
+	detailLoading      bool
+	detailRequestSeq   int
+	detailActiveSeq    int
 	pollEvery          time.Duration
 	namespacePollEvery time.Duration
 
@@ -249,6 +273,7 @@ func newModel(opts Options) model {
 		useColor:             opts.UseColor,
 		simulateStale:        opts.SimulateStale,
 		loadResourceList:     opts.LoadResourceList,
+		loadResourceDetail:   opts.LoadResourceDetail,
 		loadNamespaces:       opts.LoadNamespaces,
 		input:                input,
 		keys:                 keys,
@@ -298,6 +323,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.resourceList = msg.payload
 		m.selectFromSession()
+		m.syncDetailSelection()
 		if msg.announce {
 			m.commandMessage = fmt.Sprintf(
 				"loaded %d %s in namespace %s",
@@ -314,6 +340,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		if msg.announce {
 			m.commandMessage = fmt.Sprintf("load failed: %v", msg.err)
+		}
+		return m, nil
+	case detailLoadedMsg:
+		if msg.seq != m.detailActiveSeq {
+			return m, nil
+		}
+		m.detailLoading = false
+		m.detail = msg.payload
+		if msg.announce {
+			m.commandMessage = m.formatDetailMessage(msg.payload)
+		}
+		return m, nil
+	case detailFailedMsg:
+		if msg.seq != m.detailActiveSeq {
+			return m, nil
+		}
+		m.detailLoading = false
+		if msg.announce {
+			m.commandMessage = fmt.Sprintf("detail load failed: %v", msg.err)
 		}
 		return m, nil
 	case namespacesLoadedMsg:
@@ -341,6 +386,12 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
+	case key.Matches(msg, m.keys.Detail):
+		if len(m.resourceList.Items) == 0 {
+			m.commandMessage = "no selected item for detail"
+			return m, nil
+		}
+		return m.startDetailReload(true)
 	case key.Matches(msg, m.keys.Command):
 		m.commandMode = true
 		m.input.SetValue("")
@@ -352,11 +403,13 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.selected > 0 {
 			m.selected--
 			m.session.Selection = m.currentSelection()
+			m.clearDetail()
 		}
 	case key.Matches(msg, m.keys.Down):
 		if m.selected < len(m.resourceList.Items)-1 {
 			m.selected++
 			m.session.Selection = m.currentSelection()
+			m.clearDetail()
 		}
 	}
 
@@ -413,6 +466,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.commandMessage = message
 		if updated {
 			m.session.Selection = ""
+			m.clearDetail()
 		}
 		if reload {
 			updatedModel, listCmd := m.startListReload()
@@ -501,6 +555,18 @@ func (m model) startBackgroundReload() (tea.Model, tea.Cmd) {
 	return m, m.loadListCmd(m.activeSeq, query, false)
 }
 
+func (m model) startDetailReload(announce bool) (tea.Model, tea.Cmd) {
+	query, ok := m.buildSelectedDetailQuery()
+	if !ok {
+		return m, nil
+	}
+
+	m.detailRequestSeq++
+	m.detailActiveSeq = m.detailRequestSeq
+	m.detailLoading = true
+	return m, m.loadDetailCmd(m.detailActiveSeq, query, announce)
+}
+
 func (m model) loadListCmd(seq int, query protocol.ResourceListQuery, announce bool) tea.Cmd {
 	if m.loadResourceList == nil {
 		return func() tea.Msg {
@@ -521,6 +587,29 @@ func (m model) loadListCmd(seq int, query protocol.ResourceListQuery, announce b
 			return listFailedMsg{seq: seq, err: err, announce: announce}
 		}
 		return listLoadedMsg{seq: seq, payload: payload, announce: announce}
+	}
+}
+
+func (m model) loadDetailCmd(seq int, query protocol.ResourceDetailQuery, announce bool) tea.Cmd {
+	if m.loadResourceDetail == nil {
+		return func() tea.Msg {
+			return detailFailedMsg{
+				seq:      seq,
+				err:      fmt.Errorf("resource detail loader is not configured"),
+				announce: announce,
+			}
+		}
+	}
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		payload, err := m.loadResourceDetail(ctx, query)
+		if err != nil {
+			return detailFailedMsg{seq: seq, err: err, announce: announce}
+		}
+		return detailLoadedMsg{seq: seq, payload: payload, announce: announce}
 	}
 }
 
@@ -638,6 +727,11 @@ func (m model) listLines() []string {
 			line = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(line, "  "))
 		}
 		lines = append(lines, line)
+	}
+
+	if detailLines := m.detailLines(); len(detailLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, detailLines...)
 	}
 	return lines
 }
@@ -773,6 +867,107 @@ func (m model) currentSelection() string {
 		return ""
 	}
 	return m.resourceList.Items[m.selected].Name
+}
+
+func (m model) currentItem() (protocol.ResourceItem, bool) {
+	if len(m.resourceList.Items) == 0 {
+		return protocol.ResourceItem{}, false
+	}
+	if m.selected < 0 || m.selected >= len(m.resourceList.Items) {
+		return protocol.ResourceItem{}, false
+	}
+	return m.resourceList.Items[m.selected], true
+}
+
+func (m model) buildSelectedDetailQuery() (protocol.ResourceDetailQuery, bool) {
+	item, ok := m.currentItem()
+	if !ok {
+		return protocol.ResourceDetailQuery{}, false
+	}
+	return protocol.ResourceDetailQuery{
+		KubeContext:   m.session.KubeContext,
+		Resource:      m.session.Resource,
+		Namespace:     m.session.Namespace,
+		ItemNamespace: item.Namespace,
+		Name:          item.Name,
+		SimulateStale: m.simulateStale,
+	}, true
+}
+
+func (m *model) clearDetail() {
+	m.detailRequestSeq++
+	m.detailActiveSeq = m.detailRequestSeq
+	m.detailLoading = false
+	m.detail = protocol.ResourceDetailPayload{}
+}
+
+func (m *model) syncDetailSelection() {
+	if m.detail.Name == "" && m.detail.Item == nil && !m.detailLoading {
+		return
+	}
+	item, ok := m.currentItem()
+	if !ok {
+		m.clearDetail()
+		return
+	}
+
+	detailName := strings.TrimSpace(m.detail.Name)
+	if detailName == "" && m.detail.Item != nil {
+		detailName = m.detail.Item.Name
+	}
+	if detailName != item.Name {
+		m.clearDetail()
+		return
+	}
+
+	detailNamespace := strings.TrimSpace(m.detail.ItemNamespace)
+	if detailNamespace == "" && m.detail.Item != nil {
+		detailNamespace = m.detail.Item.Namespace
+	}
+	if detailNamespace != "" && detailNamespace != item.Namespace {
+		m.clearDetail()
+	}
+}
+
+func (m model) formatDetailMessage(payload protocol.ResourceDetailPayload) string {
+	if !payload.Found {
+		if payload.Name == "" {
+			return "detail unavailable"
+		}
+		return fmt.Sprintf("detail not found in cache for %s", payload.Name)
+	}
+	if payload.Item == nil {
+		return fmt.Sprintf("detail loaded for %s", payload.Name)
+	}
+	return fmt.Sprintf("detail %s/%s status=%s", payload.Item.Namespace, payload.Item.Name, payload.Item.Status)
+}
+
+func (m model) detailLines() []string {
+	if m.detailLoading {
+		return []string{"detail: loading..."}
+	}
+	if m.detail.Name == "" && m.detail.Item == nil {
+		return nil
+	}
+	if !m.detail.Found {
+		return []string{fmt.Sprintf("detail: %s not found in cache", m.detail.Name)}
+	}
+	if m.detail.Item == nil {
+		return []string{fmt.Sprintf("detail: %s (unavailable)", m.detail.Name)}
+	}
+
+	return []string{
+		"detail:",
+		fmt.Sprintf("  name: %s", m.detail.Item.Name),
+		fmt.Sprintf("  namespace: %s", m.detail.Item.Namespace),
+		fmt.Sprintf("  status: %s", m.detail.Item.Status),
+		fmt.Sprintf(
+			"  freshness: %s age=%s source=%s",
+			m.detail.Freshness.State,
+			formatAgeMs(m.detail.Freshness.AgeMs),
+			m.detail.Freshness.Source,
+		),
+	}
 }
 
 func (m model) commandSuggestions(input string) []string {

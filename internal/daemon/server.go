@@ -179,6 +179,34 @@ func handleConn(
 		resp := protocol.BuildResourceListResponse(req, daemonVersion, os.Getpid(), payload)
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
+	case protocol.IntentResourceDetail:
+		if req.DetailQuery == nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "missing detail query payload",
+			})
+			return
+		}
+
+		query := *req.DetailQuery
+		resource := strings.ToLower(strings.TrimSpace(query.Resource))
+		if resource == "" {
+			resource = "pods"
+		}
+		query.Resource = resource
+
+		var payload protocol.ResourceDetailPayload
+		if kube.IsCoreResource(resource) {
+			payload = resourceCache.GetDetail(query)
+		} else {
+			payload = buildPlaceholderResourceDetail(query)
+		}
+		resp := protocol.BuildResourceDetailResponse(req, daemonVersion, os.Getpid(), payload)
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
 	case protocol.IntentNamespaceList:
 		if req.NamespaceQuery == nil {
 			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
@@ -242,6 +270,47 @@ func buildPlaceholderResourceList(query protocol.ResourceListQuery) protocol.Res
 		Namespace: namespace,
 		Items:     items,
 		Freshness: freshness,
+	}
+}
+
+func buildPlaceholderResourceDetail(query protocol.ResourceDetailQuery) protocol.ResourceDetailPayload {
+	listPayload := buildPlaceholderResourceList(protocol.ResourceListQuery{
+		KubeContext:   query.KubeContext,
+		Resource:      query.Resource,
+		Namespace:     query.Namespace,
+		SimulateStale: query.SimulateStale,
+	})
+
+	name := strings.TrimSpace(query.Name)
+	itemNamespace := strings.TrimSpace(query.ItemNamespace)
+	if itemNamespace == "" && !strings.EqualFold(strings.TrimSpace(query.Namespace), "all") {
+		itemNamespace = strings.TrimSpace(query.Namespace)
+	}
+
+	var item *protocol.ResourceItem
+	for _, candidate := range listPayload.Items {
+		if candidate.Name != name {
+			continue
+		}
+		if itemNamespace != "" && candidate.Namespace != itemNamespace {
+			continue
+		}
+		value := candidate
+		item = &value
+		if itemNamespace == "" {
+			itemNamespace = candidate.Namespace
+		}
+		break
+	}
+
+	return protocol.ResourceDetailPayload{
+		Resource:      listPayload.Resource,
+		Namespace:     listPayload.Namespace,
+		ItemNamespace: itemNamespace,
+		Name:          name,
+		Found:         item != nil,
+		Item:          item,
+		Freshness:     listPayload.Freshness,
 	}
 }
 

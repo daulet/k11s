@@ -160,6 +160,67 @@ func TestCacheUsesWatcherWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestCacheDetailColdStartIsCatchingUp(t *testing.T) {
+	fetcher := &queueFetcher{
+		responses: []fetchResponse{
+			{
+				items: []protocol.ResourceItem{
+					{Name: "api", Namespace: "default", Status: "Running"},
+				},
+			},
+		},
+	}
+	cache := New(context.Background(), fetcher, nil)
+
+	detail := cache.GetDetail(protocol.ResourceDetailQuery{
+		Resource:  "pods",
+		Namespace: "default",
+		Name:      "api",
+	})
+	if detail.Found {
+		t.Fatalf("expected cold-start detail to be unresolved before initial sync")
+	}
+	if detail.Freshness.State != protocol.FreshnessStateCatchingUp {
+		t.Fatalf("expected CATCHING_UP on cold detail, got %s", detail.Freshness.State)
+	}
+}
+
+func TestCacheDetailResolvesWithItemNamespaceInAllScope(t *testing.T) {
+	fetcher := &queueFetcher{
+		responses: []fetchResponse{
+			{
+				items: []protocol.ResourceItem{
+					{Name: "api", Namespace: "default", Status: "Running"},
+					{Name: "api", Namespace: "payments", Status: "Running"},
+				},
+			},
+		},
+	}
+	cache := New(context.Background(), fetcher, nil)
+	query := protocol.ResourceListQuery{Resource: "pods", Namespace: "all"}
+	_ = cache.Get(query)
+	_ = waitForCondition(t, 250*time.Millisecond, func() (protocol.ResourceListPayload, bool) {
+		next := cache.Get(query)
+		return next, next.Freshness.State == protocol.FreshnessStateLive && len(next.Items) == 2
+	})
+
+	detail := cache.GetDetail(protocol.ResourceDetailQuery{
+		Resource:      "pods",
+		Namespace:     "all",
+		Name:          "api",
+		ItemNamespace: "payments",
+	})
+	if !detail.Found || detail.Item == nil {
+		t.Fatalf("expected detail item to be found")
+	}
+	if detail.Item.Namespace != "payments" {
+		t.Fatalf("expected detail namespace payments, got %q", detail.Item.Namespace)
+	}
+	if detail.Freshness.State != protocol.FreshnessStateLive {
+		t.Fatalf("expected live detail freshness, got %s", detail.Freshness.State)
+	}
+}
+
 func waitForCondition(
 	t *testing.T,
 	timeout time.Duration,

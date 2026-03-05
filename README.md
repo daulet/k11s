@@ -32,7 +32,7 @@ Primary goals:
 - Daemon handshake enforces RPC version compatibility.
 - If daemon version differs from client version, `k11s` requests graceful daemon shutdown and starts a matching daemon.
 - Session state is persisted by daemon and restored on launch.
-- Daemon serves `pods`, `services`, and `deployments` from a watch-backed cache with relist recovery.
+- Daemon serves `pods`, `services`, and `deployments` from a watch-backed cache with relist recovery, including detail lookups from the same cache.
 - Namespace autocomplete is loaded via daemon RPC and refreshed per selected kube context.
 - Other resources currently use placeholder responses with freshness metadata.
 - Status bar renders freshness badge, age, snapshot time, source, and watch health.
@@ -65,6 +65,7 @@ Perf measurement:
 
 TUI keybindings:
 - `j` / `k` or arrow keys: move selection
+- `enter` (normal mode): load detail for selected row from daemon cache
 - `q`: quit (current selection is persisted into session)
 - `:`: open command line
 - In command mode autocomplete: `tab` expands/cycles suggestions, `enter`/`->` accepts current suggestion, `esc` clears suggestion.

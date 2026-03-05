@@ -32,3 +32,28 @@ func ListResources(
 
 	return *resp.ResourceList, nil
 }
+
+func GetResourceDetail(
+	ctx context.Context,
+	cfg config.Config,
+	clientVersion string,
+	query protocol.ResourceDetailQuery,
+) (protocol.ResourceDetailPayload, error) {
+	req := protocol.HandshakeRequest{
+		ClientName:    "k11s",
+		ClientVersion: clientVersion,
+		RPCVersion:    cfg.RPCVersion,
+		Intent:        protocol.IntentResourceDetail,
+		DetailQuery:   &query,
+	}
+
+	resp, err := sendControlRequest(ctx, cfg, req)
+	if err != nil {
+		return protocol.ResourceDetailPayload{}, err
+	}
+	if resp.ResourceDetail == nil {
+		return protocol.ResourceDetailPayload{}, errors.New("daemon returned empty resource detail payload")
+	}
+
+	return *resp.ResourceDetail, nil
+}

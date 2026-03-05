@@ -5,34 +5,37 @@ import "fmt"
 const RPCVersion = "v0alpha1"
 
 const (
-	IntentHandshake     = ""
-	IntentShutdown      = "shutdown"
-	IntentSessionGet    = "session_get"
-	IntentSessionSave   = "session_save"
-	IntentResourceList  = "resource_list"
-	IntentNamespaceList = "namespace_list"
+	IntentHandshake      = ""
+	IntentShutdown       = "shutdown"
+	IntentSessionGet     = "session_get"
+	IntentSessionSave    = "session_save"
+	IntentResourceList   = "resource_list"
+	IntentResourceDetail = "resource_detail"
+	IntentNamespaceList  = "namespace_list"
 )
 
 type HandshakeRequest struct {
-	ClientName     string              `json:"clientName"`
-	ClientVersion  string              `json:"clientVersion"`
-	RPCVersion     string              `json:"rpcVersion"`
-	Intent         string              `json:"intent,omitempty"`
-	Session        *SessionState       `json:"session,omitempty"`
-	ListQuery      *ResourceListQuery  `json:"listQuery,omitempty"`
-	NamespaceQuery *NamespaceListQuery `json:"namespaceQuery,omitempty"`
+	ClientName     string               `json:"clientName"`
+	ClientVersion  string               `json:"clientVersion"`
+	RPCVersion     string               `json:"rpcVersion"`
+	Intent         string               `json:"intent,omitempty"`
+	Session        *SessionState        `json:"session,omitempty"`
+	ListQuery      *ResourceListQuery   `json:"listQuery,omitempty"`
+	DetailQuery    *ResourceDetailQuery `json:"detailQuery,omitempty"`
+	NamespaceQuery *NamespaceListQuery  `json:"namespaceQuery,omitempty"`
 }
 
 type HandshakeResponse struct {
-	Compatible    bool                  `json:"compatible"`
-	DaemonVersion string                `json:"daemonVersion"`
-	RPCVersion    string                `json:"rpcVersion"`
-	PID           int                   `json:"pid"`
-	ShuttingDown  bool                  `json:"shuttingDown,omitempty"`
-	Session       *SessionState         `json:"session,omitempty"`
-	ResourceList  *ResourceListPayload  `json:"resourceList,omitempty"`
-	NamespaceList *NamespaceListPayload `json:"namespaceList,omitempty"`
-	Message       string                `json:"message,omitempty"`
+	Compatible     bool                   `json:"compatible"`
+	DaemonVersion  string                 `json:"daemonVersion"`
+	RPCVersion     string                 `json:"rpcVersion"`
+	PID            int                    `json:"pid"`
+	ShuttingDown   bool                   `json:"shuttingDown,omitempty"`
+	Session        *SessionState          `json:"session,omitempty"`
+	ResourceList   *ResourceListPayload   `json:"resourceList,omitempty"`
+	ResourceDetail *ResourceDetailPayload `json:"resourceDetail,omitempty"`
+	NamespaceList  *NamespaceListPayload  `json:"namespaceList,omitempty"`
+	Message        string                 `json:"message,omitempty"`
 }
 
 type SessionState struct {
@@ -78,6 +81,25 @@ type ResourceListPayload struct {
 	Namespace string         `json:"namespace"`
 	Items     []ResourceItem `json:"items"`
 	Freshness FreshnessMeta  `json:"freshness"`
+}
+
+type ResourceDetailQuery struct {
+	KubeContext   string `json:"kubeContext,omitempty"`
+	Resource      string `json:"resource"`
+	Namespace     string `json:"namespace"`
+	ItemNamespace string `json:"itemNamespace,omitempty"`
+	Name          string `json:"name"`
+	SimulateStale bool   `json:"simulateStale,omitempty"`
+}
+
+type ResourceDetailPayload struct {
+	Resource      string        `json:"resource"`
+	Namespace     string        `json:"namespace"`
+	ItemNamespace string        `json:"itemNamespace,omitempty"`
+	Name          string        `json:"name"`
+	Found         bool          `json:"found"`
+	Item          *ResourceItem `json:"item,omitempty"`
+	Freshness     FreshnessMeta `json:"freshness"`
 }
 
 type NamespaceListQuery struct {
@@ -174,6 +196,22 @@ func BuildNamespaceListResponse(
 
 	resp.NamespaceList = &payload
 	resp.Message = "namespace list ready"
+	return resp
+}
+
+func BuildResourceDetailResponse(
+	req HandshakeRequest,
+	daemonVersion string,
+	pid int,
+	payload ResourceDetailPayload,
+) HandshakeResponse {
+	resp := BuildHandshakeResponse(req, daemonVersion, pid)
+	if !resp.Compatible {
+		return resp
+	}
+
+	resp.ResourceDetail = &payload
+	resp.Message = "resource detail ready"
 	return resp
 }
 

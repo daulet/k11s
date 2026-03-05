@@ -118,6 +118,62 @@ func (c *Cache) Get(query protocol.ResourceListQuery) protocol.ResourceListPaylo
 	return payload
 }
 
+func (c *Cache) GetDetail(query protocol.ResourceDetailQuery) protocol.ResourceDetailPayload {
+	query = normalizeDetailQuery(query)
+	now := c.now()
+	key := cacheKey{
+		kubeContext: query.KubeContext,
+		namespace:   query.Namespace,
+		resource:    query.Resource,
+	}
+	listQuery := protocol.ResourceListQuery{
+		KubeContext:   query.KubeContext,
+		Resource:      query.Resource,
+		Namespace:     query.Namespace,
+		SimulateStale: query.SimulateStale,
+	}
+
+	c.mu.Lock()
+	entry, ok := c.entries[key]
+	if !ok {
+		entry = &cacheEntry{}
+		c.entries[key] = entry
+	}
+
+	if c.watcher != nil && !entry.watching {
+		entry.watching = true
+		entry.refreshing = true
+		go c.watch(key, listQuery)
+	} else if c.shouldRefresh(entry, now) {
+		entry.refreshing = true
+		go c.refresh(key, listQuery)
+	}
+
+	item, found := findDetailItem(entry.items, query)
+	meta := c.buildFreshnessMeta(entry, now, query.SimulateStale)
+	c.mu.Unlock()
+
+	var itemCopy *protocol.ResourceItem
+	itemNamespace := query.ItemNamespace
+	if found {
+		value := item
+		itemCopy = &value
+		if itemNamespace == "" {
+			itemNamespace = item.Namespace
+		}
+	}
+
+	return protocol.ResourceDetailPayload{
+		Resource:      query.Resource,
+		Namespace:     query.Namespace,
+		ItemNamespace: itemNamespace,
+		Name:          query.Name,
+		Found:         found,
+		Item:          itemCopy,
+		Freshness:     meta,
+	}
+}
+
 func (c *Cache) shouldRefresh(entry *cacheEntry, now time.Time) bool {
 	if entry.watching {
 		return false
@@ -243,6 +299,16 @@ func (c *Cache) buildPayload(
 	entry *cacheEntry,
 	now time.Time,
 ) protocol.ResourceListPayload {
+	meta := c.buildFreshnessMeta(entry, now, query.SimulateStale)
+	return protocol.ResourceListPayload{
+		Resource:  query.Resource,
+		Namespace: query.Namespace,
+		Items:     append([]protocol.ResourceItem(nil), entry.items...),
+		Freshness: meta,
+	}
+}
+
+func (c *Cache) buildFreshnessMeta(entry *cacheEntry, now time.Time, simulateStale bool) protocol.FreshnessMeta {
 	meta := protocol.FreshnessMeta{
 		State:              protocol.FreshnessStateCatchingUp,
 		SnapshotTimeUnixMs: 0,
@@ -295,7 +361,7 @@ func (c *Cache) buildPayload(
 		}
 	}
 
-	if query.SimulateStale {
+	if simulateStale {
 		snapshot := now.Add(-3 * time.Minute)
 		meta.State = protocol.FreshnessStateStale
 		meta.SnapshotTimeUnixMs = snapshot.UnixMilli()
@@ -304,12 +370,7 @@ func (c *Cache) buildPayload(
 		meta.Source = "cache-simulated-stale"
 	}
 
-	return protocol.ResourceListPayload{
-		Resource:  query.Resource,
-		Namespace: query.Namespace,
-		Items:     append([]protocol.ResourceItem(nil), entry.items...),
-		Freshness: meta,
-	}
+	return meta
 }
 
 func normalizeQuery(query protocol.ResourceListQuery) protocol.ResourceListQuery {
@@ -325,6 +386,53 @@ func normalizeQuery(query protocol.ResourceListQuery) protocol.ResourceListQuery
 
 	query.KubeContext = strings.TrimSpace(query.KubeContext)
 	return query
+}
+
+func normalizeDetailQuery(query protocol.ResourceDetailQuery) protocol.ResourceDetailQuery {
+	query.Resource = strings.TrimSpace(strings.ToLower(query.Resource))
+	if query.Resource == "" {
+		query.Resource = "pods"
+	}
+
+	query.Namespace = strings.TrimSpace(query.Namespace)
+	if query.Namespace == "" {
+		query.Namespace = "default"
+	}
+	query.KubeContext = strings.TrimSpace(query.KubeContext)
+	query.ItemNamespace = strings.TrimSpace(query.ItemNamespace)
+	query.Name = strings.TrimSpace(query.Name)
+	if query.Name == "" {
+		return query
+	}
+
+	if query.ItemNamespace == "" {
+		if ns, name, ok := strings.Cut(query.Name, "/"); ok {
+			query.ItemNamespace = strings.TrimSpace(ns)
+			query.Name = strings.TrimSpace(name)
+		}
+	}
+	if query.ItemNamespace == "" && !strings.EqualFold(query.Namespace, "all") {
+		query.ItemNamespace = query.Namespace
+	}
+	return query
+}
+
+func findDetailItem(items []protocol.ResourceItem, query protocol.ResourceDetailQuery) (protocol.ResourceItem, bool) {
+	name := strings.TrimSpace(query.Name)
+	if name == "" {
+		return protocol.ResourceItem{}, false
+	}
+	itemNamespace := strings.TrimSpace(query.ItemNamespace)
+	for _, item := range items {
+		if item.Name != name {
+			continue
+		}
+		if itemNamespace != "" && item.Namespace != itemNamespace {
+			continue
+		}
+		return item, true
+	}
+	return protocol.ResourceItem{}, false
 }
 
 type noopFetcher struct{}
