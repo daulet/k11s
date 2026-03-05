@@ -22,6 +22,7 @@ var defaultResources = []string{
 	"services",
 	"deployments",
 	"nodes",
+	"namespaces",
 	"statefulsets",
 	"daemonsets",
 	"jobs",
@@ -2117,6 +2118,7 @@ func baseSuggestions() []string {
 		"services",
 		"deployments",
 		"nodes",
+		"namespaces",
 		"statefulsets",
 		"daemonsets",
 		"jobs",
@@ -2147,7 +2149,7 @@ func displayNamespace(session protocol.SessionState) string {
 
 func resourceUsesNamespace(resource string) bool {
 	switch strings.ToLower(strings.TrimSpace(resource)) {
-	case "nodes", "crds":
+	case "nodes", "namespaces", "crds":
 		return false
 	default:
 		return true
@@ -2192,6 +2194,7 @@ func resourceSuggestions() []string {
 		"services",
 		"deployments",
 		"nodes",
+		"namespaces",
 		"statefulsets",
 		"daemonsets",
 		"jobs",

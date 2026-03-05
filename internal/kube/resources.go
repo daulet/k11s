@@ -31,7 +31,7 @@ func NewResourceFetcher(clients *ClientFactory) *ResourceFetcher {
 
 func IsCoreResource(resource string) bool {
 	switch strings.ToLower(strings.TrimSpace(resource)) {
-	case "pods", "services", "deployments", "nodes", "crds", "crs":
+	case "pods", "services", "deployments", "nodes", "namespaces", "crds", "crs":
 		return true
 	default:
 		return false
@@ -76,6 +76,12 @@ func (f *ResourceFetcher) List(ctx context.Context, query protocol.ResourceListQ
 			return nil, fmt.Errorf("list nodes: %w", err)
 		}
 		return nodesToItems(nodes.Items), nil
+	case "namespaces":
+		namespaces, err := client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list namespaces: %w", err)
+		}
+		return namespacesToItems(namespaces.Items), nil
 	case "crds":
 		return f.listCRDs(ctx, query)
 	case "crs":
@@ -179,6 +185,25 @@ func (f *ResourceFetcher) Watch(
 			},
 			func(resourceVersion string) (watch.Interface, error) {
 				return client.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
+					ResourceVersion:     resourceVersion,
+					AllowWatchBookmarks: true,
+				})
+			},
+			onUpdate,
+			onError,
+		)
+	case "namespaces":
+		return runListWatchLoop(
+			ctx,
+			func() ([]protocol.ResourceItem, string, error) {
+				namespaces, err := client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+				if err != nil {
+					return nil, "", fmt.Errorf("list namespaces: %w", err)
+				}
+				return namespacesToItems(namespaces.Items), namespaces.ResourceVersion, nil
+			},
+			func(resourceVersion string) (watch.Interface, error) {
+				return client.CoreV1().Namespaces().Watch(ctx, metav1.ListOptions{
 					ResourceVersion:     resourceVersion,
 					AllowWatchBookmarks: true,
 				})
@@ -624,6 +649,23 @@ func nodesToItems(nodes []corev1.Node) []protocol.ResourceItem {
 		}
 		items = append(items, protocol.ResourceItem{
 			Name:      node.Name,
+			Namespace: "<cluster>",
+			Status:    status,
+		})
+	}
+	sortResourceItems(items)
+	return items
+}
+
+func namespacesToItems(namespaces []corev1.Namespace) []protocol.ResourceItem {
+	items := make([]protocol.ResourceItem, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		status := "Unknown"
+		if namespace.Status.Phase != "" {
+			status = string(namespace.Status.Phase)
+		}
+		items = append(items, protocol.ResourceItem{
+			Name:      namespace.Name,
 			Namespace: "<cluster>",
 			Status:    status,
 		})

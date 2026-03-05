@@ -18,6 +18,7 @@ func TestIsCoreResource(t *testing.T) {
 		{resource: "services", want: true},
 		{resource: "deployments", want: true},
 		{resource: "nodes", want: true},
+		{resource: "namespaces", want: true},
 		{resource: "crds", want: true},
 		{resource: "crs", want: true},
 		{resource: "jobs", want: false},
@@ -158,6 +159,29 @@ func TestNodesToItems(t *testing.T) {
 		t.Fatalf("unexpected first item: %#v", items[0])
 	}
 	if items[1].Name != "node-b" || items[1].Namespace != "<cluster>" || items[1].Status != "NotReady" {
+		t.Fatalf("unexpected second item: %#v", items[1])
+	}
+}
+
+func TestNamespacesToItems(t *testing.T) {
+	items := namespacesToItems([]corev1.Namespace{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "payments"},
+			Status:     corev1.NamespaceStatus{Phase: corev1.NamespaceActive},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "legacy"},
+			Status:     corev1.NamespaceStatus{Phase: corev1.NamespaceTerminating},
+		},
+	})
+
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if items[0].Name != "legacy" || items[0].Namespace != "<cluster>" || items[0].Status != "Terminating" {
+		t.Fatalf("unexpected first item: %#v", items[0])
+	}
+	if items[1].Name != "payments" || items[1].Namespace != "<cluster>" || items[1].Status != "Active" {
 		t.Fatalf("unexpected second item: %#v", items[1])
 	}
 }
