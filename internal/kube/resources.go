@@ -579,14 +579,30 @@ func podsToItems(pods []corev1.Pod) []protocol.ResourceItem {
 		if pod.Status.Phase != "" {
 			status = string(pod.Status.Phase)
 		}
+		ownerKind, ownerName := podOwner(pod)
 		items = append(items, protocol.ResourceItem{
 			Name:      pod.Name,
 			Namespace: pod.Namespace,
 			Status:    status,
+			Node:      pod.Spec.NodeName,
+			OwnerKind: ownerKind,
+			OwnerName: ownerName,
 		})
 	}
 	sortResourceItems(items)
 	return items
+}
+
+func podOwner(pod corev1.Pod) (kind string, name string) {
+	if len(pod.OwnerReferences) == 0 {
+		return "", ""
+	}
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller {
+			return owner.Kind, owner.Name
+		}
+	}
+	return pod.OwnerReferences[0].Kind, pod.OwnerReferences[0].Name
 }
 
 func servicesToItems(services []corev1.Service) []protocol.ResourceItem {

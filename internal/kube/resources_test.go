@@ -66,11 +66,19 @@ func TestPodsToItems(t *testing.T) {
 	items := podsToItems([]corev1.Pod{
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "payments"},
+			Spec:       corev1.PodSpec{NodeName: "node-b"},
 			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
 		},
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "payments"},
-			Status:     corev1.PodStatus{Phase: corev1.PodPending},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "api",
+				Namespace: "payments",
+				OwnerReferences: []metav1.OwnerReference{
+					{Kind: "ReplicaSet", Name: "api-67984d84", Controller: boolPtr(true)},
+				},
+			},
+			Spec:   corev1.PodSpec{NodeName: "node-a"},
+			Status: corev1.PodStatus{Phase: corev1.PodPending},
 		},
 	})
 
@@ -80,8 +88,14 @@ func TestPodsToItems(t *testing.T) {
 	if items[0].Name != "api" || items[0].Status != "Pending" {
 		t.Fatalf("unexpected first item: %#v", items[0])
 	}
+	if items[0].Node != "node-a" || items[0].OwnerKind != "ReplicaSet" || items[0].OwnerName != "api-67984d84" {
+		t.Fatalf("expected pod metadata on first item, got %#v", items[0])
+	}
 	if items[1].Name != "worker" || items[1].Status != "Running" {
 		t.Fatalf("unexpected second item: %#v", items[1])
+	}
+	if items[1].Node != "node-b" {
+		t.Fatalf("expected node metadata on second item, got %#v", items[1])
 	}
 }
 
@@ -204,4 +218,8 @@ func TestResolveListNamespace(t *testing.T) {
 			t.Fatalf("input=%q expected (%q,%q) got (%q,%q)", tc.in, tc.wantAPI, tc.wantDisplay, apiNS, displayNS)
 		}
 	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }

@@ -939,6 +939,32 @@ func TestListLinesIncludeColumnHeaders(t *testing.T) {
 	}
 }
 
+func TestPodListColumnHeadersIncludeNodeAndOwner(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	lines := m.listLines()
+	if len(lines) < 2 {
+		t.Fatalf("expected at least header and one row, got %#v", lines)
+	}
+	if !strings.Contains(lines[0], "NODE") || !strings.Contains(lines[0], "OWNER") {
+		t.Fatalf("expected node/owner headers in first row, got %q", lines[0])
+	}
+}
+
 func TestListLinesShowNoItemsLoadingState(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -1425,6 +1451,192 @@ func TestNamespacesReloadUsesAllNamespaceForClusterScope(t *testing.T) {
 	}
 	if final.resourceList.Resource != "namespaces" {
 		t.Fatalf("expected namespaces payload after reload, got %q", final.resourceList.Resource)
+	}
+}
+
+func TestMouseClickNamespaceInPodRowSwitchesNamespace(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "payments", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: query.Namespace, Status: "Running"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	msg := tea.MouseMsg{
+		X:      28, // namespace column
+		Y:      6,  // first item row
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	}
+	updated, cmd := m.Update(msg)
+	next := updated.(model)
+	if !next.loading {
+		t.Fatalf("expected loading after namespace click")
+	}
+	if next.session.Namespace != "payments" {
+		t.Fatalf("expected namespace to switch via click, got %q", next.session.Namespace)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command after namespace click")
+	}
+
+	msgOut := cmd()
+	updated, _ = next.Update(msgOut)
+	final := updated.(model)
+	if seen.Namespace != "payments" {
+		t.Fatalf("expected list query namespace payments, got %q", seen.Namespace)
+	}
+	if final.resourceList.Namespace != "payments" {
+		t.Fatalf("expected refreshed namespace payments, got %q", final.resourceList.Namespace)
+	}
+}
+
+func TestMouseClickNodeInPodRowOpensNodesView(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	msg := tea.MouseMsg{
+		X:      56, // node column
+		Y:      6,  // first item row
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	}
+	updated, cmd := m.Update(msg)
+	next := updated.(model)
+	if !next.loading {
+		t.Fatalf("expected loading after node click")
+	}
+	if next.session.Resource != "nodes" {
+		t.Fatalf("expected resource to switch to nodes via click, got %q", next.session.Resource)
+	}
+	if next.session.Selection != "node-a" {
+		t.Fatalf("expected selection node-a via click, got %q", next.session.Selection)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command after node click")
+	}
+
+	msgOut := cmd()
+	updated, _ = next.Update(msgOut)
+	final := updated.(model)
+	if seen.Resource != "nodes" || seen.Namespace != "all" {
+		t.Fatalf("expected nodes/all query after click, got %#v", seen)
+	}
+	if final.resourceList.Resource != "nodes" {
+		t.Fatalf("expected nodes payload after click navigation, got %q", final.resourceList.Resource)
+	}
+}
+
+func TestMouseClickOwnerInPodRowOpensOwnerResource(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api-7fd6", Namespace: "payments", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-6c9d4f6d56"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: query.Namespace, Status: "Available"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	msg := tea.MouseMsg{
+		X:      75, // owner column
+		Y:      6,  // first item row
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	}
+	updated, cmd := m.Update(msg)
+	next := updated.(model)
+	if !next.loading {
+		t.Fatalf("expected loading after owner click")
+	}
+	if next.session.Resource != "deployments" {
+		t.Fatalf("expected owner click to open deployments, got %q", next.session.Resource)
+	}
+	if next.session.Selection != "api" {
+		t.Fatalf("expected owner-derived selection api, got %q", next.session.Selection)
+	}
+	if next.session.Namespace != "payments" {
+		t.Fatalf("expected owner click to carry item namespace payments, got %q", next.session.Namespace)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command after owner click")
+	}
+
+	msgOut := cmd()
+	updated, _ = next.Update(msgOut)
+	final := updated.(model)
+	if seen.Resource != "deployments" || seen.Namespace != "payments" {
+		t.Fatalf("expected deployments/payments query after owner click, got %#v", seen)
+	}
+	if final.resourceList.Resource != "deployments" {
+		t.Fatalf("expected deployments payload after owner click navigation, got %q", final.resourceList.Resource)
 	}
 }
 

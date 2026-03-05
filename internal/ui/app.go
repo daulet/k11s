@@ -376,7 +376,7 @@ type model struct {
 
 func Run(opts Options) (Result, error) {
 	m := newModel(opts)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	finalModel, err := p.Run()
 	if err != nil {
 		return Result{}, err
@@ -622,6 +622,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateSearchMode(msg)
 		}
 		return m.updateNormalMode(msg)
+	case tea.MouseMsg:
+		return m.updateMouseMode(msg)
 	}
 
 	return m, nil
@@ -693,6 +695,81 @@ func (m model) updateSearchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.commandMode || m.searchMode {
+		return m, nil
+	}
+	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+	if len(m.resourceList.Items) == 0 {
+		return m, nil
+	}
+
+	_, _, mainInnerHeight := m.normalizedDimensions()
+	const inputBoxTotalHeight = 4
+	mainBodyStartY := inputBoxTotalHeight + 1
+	lineIndex := msg.Y - mainBodyStartY
+	if lineIndex < 0 || lineIndex >= mainInnerHeight {
+		return m, nil
+	}
+
+	itemIndex, ok := m.itemIndexAtBodyLine(lineIndex)
+	if !ok {
+		return m, nil
+	}
+	m.setSelection(itemIndex)
+
+	contentX := msg.X - 1
+	clickedColumn, ok := m.clickedColumnForItem(itemIndex, contentX)
+	if !ok {
+		return m, nil
+	}
+
+	item := m.resourceList.Items[itemIndex]
+	switch clickedColumn {
+	case "namespace":
+		namespace := strings.TrimSpace(item.Namespace)
+		if namespace == "" || namespace == "-" || strings.EqualFold(namespace, "<cluster>") || strings.EqualFold(namespace, m.session.Namespace) {
+			return m, nil
+		}
+		m.session.Namespace = namespace
+		m.session.Selection = ""
+		m.clearDetail()
+		m.commandMessage = "namespace switched to " + namespace + " via click"
+		return m.startListReload()
+	case "node":
+		node := strings.TrimSpace(item.Node)
+		if node == "" {
+			return m, nil
+		}
+		m.session.Resource = "nodes"
+		m.session.Selection = node
+		m.clearDetail()
+		m.commandMessage = "opened node " + node + " via click"
+		return m.startListReload()
+	case "owner":
+		resource, ownerSelection, ok := ownerNavigation(item.OwnerKind, item.OwnerName)
+		if !ok {
+			m.commandMessage = fmt.Sprintf("owner %s is not navigable yet", ownerDisplay(item))
+			return m, nil
+		}
+		if resourceUsesNamespace(resource) {
+			namespace := strings.TrimSpace(item.Namespace)
+			if namespace != "" && namespace != "-" && !strings.EqualFold(namespace, "<cluster>") {
+				m.session.Namespace = namespace
+			}
+		}
+		m.session.Resource = resource
+		m.session.Selection = ownerSelection
+		m.clearDetail()
+		m.commandMessage = fmt.Sprintf("opened owner %s/%s via click", item.OwnerKind, ownerSelection)
+		return m.startListReload()
+	default:
+		return m, nil
+	}
 }
 
 func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1432,7 +1509,17 @@ func (m model) scheduleLogsPoll() tea.Cmd {
 }
 
 func (m model) View() string {
-	width := m.width
+	width, _, mainInnerHeight := m.normalizedDimensions()
+	inputBox := m.renderInputBox(width)
+	mainPane := m.renderMainPane(width, mainInnerHeight)
+
+	footer := m.renderFooter(width)
+
+	return strings.Join([]string{inputBox, mainPane, footer}, "\n")
+}
+
+func (m model) normalizedDimensions() (width int, height int, mainInnerHeight int) {
+	width = m.width
 	if width <= 0 {
 		width = 100
 	}
@@ -1440,22 +1527,16 @@ func (m model) View() string {
 		width = 72
 	}
 
-	height := m.height
+	height = m.height
 	if height <= 0 {
 		height = 26
 	}
 
-	inputBox := m.renderInputBox(width)
-
-	mainInnerHeight := height - 8
+	mainInnerHeight = height - 8
 	if mainInnerHeight < 8 {
 		mainInnerHeight = 8
 	}
-	mainPane := m.renderMainPane(width, mainInnerHeight)
-
-	footer := m.renderFooter(width)
-
-	return strings.Join([]string{inputBox, mainPane, footer}, "\n")
+	return width, height, mainInnerHeight
 }
 
 func (m model) renderInputBox(width int) string {
@@ -1529,10 +1610,11 @@ func (m model) listLines() []string {
 	if m.loading {
 		lines = append(lines, m.styles.EmptyLoading.Render("loading resources..."))
 	}
-	lines = append(lines, m.styles.ColumnHeader.Render(formatListRow("NAME", "NAMESPACE", "STATUS")))
+	columns := listColumnsForResource(m.resourceList.Resource)
+	lines = append(lines, m.styles.ColumnHeader.Render(renderListHeader(columns)))
 
 	for i, item := range m.resourceList.Items {
-		line := formatListRow(item.Name, item.Namespace, item.Status)
+		line := renderListItem(columns, item)
 		if i == m.selected {
 			line = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(line, "  "))
 		} else if strings.TrimSpace(m.searchQuery) != "" && itemMatchesSearch(item, strings.ToLower(strings.TrimSpace(m.searchQuery))) {
@@ -1557,8 +1639,169 @@ func (m model) renderEmptyItemsLine() string {
 	return style.Render(label)
 }
 
-func formatListRow(name string, namespace string, status string) string {
-	return fmt.Sprintf("  %-36s %-18s %s", name, namespace, status)
+type listColumn struct {
+	id    string
+	title string
+	width int
+}
+
+func listColumnsForResource(resource string) []listColumn {
+	switch strings.ToLower(strings.TrimSpace(resource)) {
+	case "pods":
+		return []listColumn{
+			{id: "name", title: "NAME", width: 24},
+			{id: "namespace", title: "NAMESPACE", width: 14},
+			{id: "status", title: "STATUS", width: 12},
+			{id: "node", title: "NODE", width: 18},
+			{id: "owner", title: "OWNER", width: 0},
+		}
+	default:
+		return []listColumn{
+			{id: "name", title: "NAME", width: 36},
+			{id: "namespace", title: "NAMESPACE", width: 18},
+			{id: "status", title: "STATUS", width: 0},
+		}
+	}
+}
+
+func renderListHeader(columns []listColumn) string {
+	values := make([]string, 0, len(columns))
+	for _, column := range columns {
+		values = append(values, column.title)
+	}
+	return renderListValues(columns, values)
+}
+
+func renderListItem(columns []listColumn, item protocol.ResourceItem) string {
+	values := make([]string, 0, len(columns))
+	for _, column := range columns {
+		values = append(values, listValueForColumn(column.id, item))
+	}
+	return renderListValues(columns, values)
+}
+
+func renderListValues(columns []listColumn, values []string) string {
+	var b strings.Builder
+	b.WriteString("  ")
+	for idx, column := range columns {
+		value := ""
+		if idx < len(values) {
+			value = values[idx]
+		}
+		if idx == len(columns)-1 || column.width <= 0 {
+			b.WriteString(value)
+			continue
+		}
+		b.WriteString(fixedWidthCell(value, column.width))
+		b.WriteByte(' ')
+	}
+	return b.String()
+}
+
+func listValueForColumn(columnID string, item protocol.ResourceItem) string {
+	switch columnID {
+	case "name":
+		return item.Name
+	case "namespace":
+		return item.Namespace
+	case "status":
+		return item.Status
+	case "node":
+		value := strings.TrimSpace(item.Node)
+		if value == "" {
+			return "-"
+		}
+		return value
+	case "owner":
+		return ownerDisplay(item)
+	default:
+		return ""
+	}
+}
+
+func ownerDisplay(item protocol.ResourceItem) string {
+	ownerKind := strings.TrimSpace(item.OwnerKind)
+	ownerName := strings.TrimSpace(item.OwnerName)
+	if ownerName == "" {
+		return "-"
+	}
+	if ownerKind == "" {
+		return ownerName
+	}
+	return ownerKind + "/" + ownerName
+}
+
+func fixedWidthCell(value string, width int) string {
+	if width <= 0 {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) > width {
+		if width == 1 {
+			return "…"
+		}
+		return string(runes[:width-1]) + "…"
+	}
+	if len(runes) == width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-len(runes))
+}
+
+func (m model) firstItemBodyLine() int {
+	line := 0
+	if strings.TrimSpace(m.resourceList.Freshness.Error) != "" {
+		line++
+	}
+	if m.loading {
+		line++
+	}
+	if len(m.resourceList.Items) > 0 {
+		line++ // header row
+	}
+	return line
+}
+
+func (m model) itemIndexAtBodyLine(line int) (int, bool) {
+	if len(m.resourceList.Items) == 0 {
+		return 0, false
+	}
+	start := m.firstItemBodyLine()
+	if line < start || line >= start+len(m.resourceList.Items) {
+		return 0, false
+	}
+	return line - start, true
+}
+
+func (m model) clickedColumnForItem(itemIndex int, contentX int) (string, bool) {
+	if itemIndex < 0 || itemIndex >= len(m.resourceList.Items) {
+		return "", false
+	}
+	if contentX < 0 {
+		return "", false
+	}
+	columns := listColumnsForResource(m.resourceList.Resource)
+	values := make([]string, 0, len(columns))
+	for _, column := range columns {
+		values = append(values, listValueForColumn(column.id, m.resourceList.Items[itemIndex]))
+	}
+
+	cursor := 2
+	for i, column := range columns {
+		valueWidth := len([]rune(values[i]))
+		start := cursor
+		end := start + valueWidth
+		if i != len(columns)-1 && column.width > 0 {
+			end = start + column.width
+			cursor = end + 1
+		} else {
+			cursor = end
+		}
+		if contentX >= start && contentX < end {
+			return column.id, true
+		}
+	}
+	return "", false
 }
 
 func (m model) mainPaneError() string {
@@ -2395,6 +2638,45 @@ func effectiveNamespace(resource string, namespace string) string {
 		return "default"
 	}
 	return namespace
+}
+
+func ownerNavigation(ownerKind string, ownerName string) (resource string, selection string, ok bool) {
+	kind := strings.ToLower(strings.TrimSpace(ownerKind))
+	name := strings.TrimSpace(ownerName)
+	if name == "" {
+		return "", "", false
+	}
+	switch kind {
+	case "deployment":
+		return "deployments", name, true
+	case "statefulset":
+		return "statefulsets", name, true
+	case "daemonset":
+		return "daemonsets", name, true
+	case "job":
+		return "jobs", name, true
+	case "cronjob":
+		return "cronjobs", name, true
+	case "replicaset":
+		if deploymentName, ok := deploymentNameFromReplicaSet(name); ok {
+			return "deployments", deploymentName, true
+		}
+		return "", "", false
+	default:
+		return "", "", false
+	}
+}
+
+func deploymentNameFromReplicaSet(replicaSetName string) (string, bool) {
+	replicaSetName = strings.TrimSpace(replicaSetName)
+	if replicaSetName == "" {
+		return "", false
+	}
+	idx := strings.LastIndex(replicaSetName, "-")
+	if idx <= 0 || idx == len(replicaSetName)-1 {
+		return "", false
+	}
+	return replicaSetName[:idx], true
 }
 
 func isKnownResource(value string) bool {

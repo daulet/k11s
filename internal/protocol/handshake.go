@@ -82,6 +82,9 @@ type ResourceItem struct {
 	Name      string `json:"name"`
 	Namespace string `json:"namespace"`
 	Status    string `json:"status"`
+	Node      string `json:"node,omitempty"`
+	OwnerKind string `json:"ownerKind,omitempty"`
+	OwnerName string `json:"ownerName,omitempty"`
 }
 
 type ResourceListPayload struct {

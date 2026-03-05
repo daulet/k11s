@@ -66,9 +66,15 @@ Perf measurement:
 
 TUI keybindings:
 - `j` / `k` or arrow keys: move selection
+- `ctrl+d` / `ctrl+u` (or PgDn/PgUp): jump selection by 10 rows
+- `/`: search items; `n` / `N` jumps between matches
 - `enter` (normal mode): load detail for selected row from daemon cache
 - `q`: quit (current selection is persisted into session)
 - `:`: open command line
+- Mouse left-click in pod rows:
+  - `NAMESPACE` switches namespace
+  - `NODE` opens `nodes` view
+  - `OWNER` opens owner resource when supported
 - In command mode autocomplete: `tab` expands/cycles suggestions, `enter`/`->` accepts current suggestion, `esc` clears suggestion.
 - In command mode without autocomplete: `enter` applies the typed command.
 
