@@ -81,6 +81,7 @@ Command line examples:
 
 Autocomplete notes:
 - `:ctx ` / `:context ` suggestions are loaded from kubeconfig (`KUBECONFIG` or `~/.kube/config`).
+- `:ns ` / `:namespace ` suggestions are loaded via daemon RPC and refreshed per selected kube context.
 
 CI checks:
 - `.github/workflows/ci.yml` runs format, vet, tests, startup smoke test, and advisory perf sanity.

@@ -53,14 +53,15 @@ type startupOptions struct {
 }
 
 type startupState struct {
-	Config             config.Config
-	Bootstrap          client.BootstrapResult
-	Session            protocol.SessionState
-	ContextSuggestions []string
-	ResourceList       protocol.ResourceListPayload
-	SimulateStale      bool
-	Recorder           *perf.Recorder
-	ProcessTime        time.Time
+	Config               config.Config
+	Bootstrap            client.BootstrapResult
+	Session              protocol.SessionState
+	ContextSuggestions   []string
+	NamespaceSuggestions []string
+	ResourceList         protocol.ResourceListPayload
+	SimulateStale        bool
+	Recorder             *perf.Recorder
+	ProcessTime          time.Time
 }
 
 func runStartup(processStart time.Time, args []string, includePerfOutput bool) error {
@@ -191,6 +192,16 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 		log.Printf("warning: unable to load kubeconfig contexts for autocomplete: %v", err)
 		contextSuggestions = nil
 	}
+	namespaceList, err := client.ListNamespaces(
+		context.Background(),
+		cfg,
+		buildinfo.Version,
+		sessionState.KubeContext,
+	)
+	if err != nil {
+		log.Printf("warning: unable to load namespaces for autocomplete: %v", err)
+		namespaceList = protocol.NamespaceListPayload{}
+	}
 
 	listLoadStart := time.Now()
 	resourceList, err := client.ListResources(
@@ -210,14 +221,15 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 	}
 
 	return startupState{
-		Config:             cfg,
-		Bootstrap:          result,
-		Session:            sessionState,
-		ContextSuggestions: contextSuggestions,
-		ResourceList:       resourceList,
-		SimulateStale:      opts.simulateStale,
-		Recorder:           recorder,
-		ProcessTime:        processStart,
+		Config:               cfg,
+		Bootstrap:            result,
+		Session:              sessionState,
+		ContextSuggestions:   contextSuggestions,
+		NamespaceSuggestions: namespaceList.Namespaces,
+		ResourceList:         resourceList,
+		SimulateStale:        opts.simulateStale,
+		Recorder:             recorder,
+		ProcessTime:          processStart,
 	}, nil
 }
 
@@ -270,13 +282,17 @@ func startupMode(result client.BootstrapResult) string {
 
 func runTUI(state startupState, startMode string) error {
 	result, err := ui.Run(ui.Options{
-		Session:            state.Session,
-		ResourceList:       state.ResourceList,
-		ContextSuggestions: state.ContextSuggestions,
-		UseColor:           enableColor(),
-		SimulateStale:      state.SimulateStale,
+		Session:              state.Session,
+		ResourceList:         state.ResourceList,
+		ContextSuggestions:   state.ContextSuggestions,
+		NamespaceSuggestions: state.NamespaceSuggestions,
+		UseColor:             enableColor(),
+		SimulateStale:        state.SimulateStale,
 		LoadResourceList: func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
 			return client.ListResources(ctx, state.Config, buildinfo.Version, query)
+		},
+		LoadNamespaces: func(ctx context.Context, kubeContext string) (protocol.NamespaceListPayload, error) {
+			return client.ListNamespaces(ctx, state.Config, buildinfo.Version, kubeContext)
 		},
 	})
 	if err != nil {

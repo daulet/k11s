@@ -92,6 +92,28 @@ func TestCommandSuggestionsForNamespace(t *testing.T) {
 	}
 }
 
+func TestNamespaceSuggestionsUseDaemonValues(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "pods",
+		},
+		NamespaceSuggestions: []string{"payments", "observability"},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	suggestions := m.commandSuggestions("ns o")
+	if len(suggestions) == 0 {
+		t.Fatalf("expected namespace suggestions")
+	}
+	if suggestions[0] != "observability" {
+		t.Fatalf("expected observability suggestion, got %q", suggestions[0])
+	}
+}
+
 func TestContextSuggestionsUseConfiguredContexts(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -170,5 +192,43 @@ func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 	}
 	if final.session.Selection != "svc-a" {
 		t.Fatalf("expected selection svc-a, got %q", final.session.Selection)
+	}
+}
+
+func TestLoadNamespacesUsesSessionContext(t *testing.T) {
+	var seenContext string
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "prod-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		LoadNamespaces: func(_ context.Context, kubeContext string) (protocol.NamespaceListPayload, error) {
+			seenContext = kubeContext
+			return protocol.NamespaceListPayload{
+				KubeContext: kubeContext,
+				Namespaces:  []string{"default"},
+				Freshness: protocol.FreshnessMeta{
+					State: protocol.FreshnessStateLive,
+				},
+			}, nil
+		},
+	})
+
+	cmd := m.loadNamespacesCmd(m.session.KubeContext)
+	if cmd == nil {
+		t.Fatalf("expected namespace load command")
+	}
+	msg := cmd()
+	loaded, ok := msg.(namespacesLoadedMsg)
+	if !ok {
+		t.Fatalf("expected namespacesLoadedMsg, got %T", msg)
+	}
+	if seenContext != "prod-cluster" {
+		t.Fatalf("expected context prod-cluster, got %q", seenContext)
+	}
+	if loaded.kubeContext != "prod-cluster" {
+		t.Fatalf("expected loaded context prod-cluster, got %q", loaded.kubeContext)
 	}
 }

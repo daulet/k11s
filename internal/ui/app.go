@@ -27,17 +27,23 @@ var defaultResources = []string{
 	"crs",
 }
 
-const defaultBackgroundRefreshInterval = 1200 * time.Millisecond
+const (
+	defaultBackgroundRefreshInterval = 1200 * time.Millisecond
+	defaultNamespaceRefreshInterval  = 5 * time.Second
+)
 
 type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error)
+type LoadNamespacesFunc func(ctx context.Context, kubeContext string) (protocol.NamespaceListPayload, error)
 
 type Options struct {
-	Session            protocol.SessionState
-	ResourceList       protocol.ResourceListPayload
-	ContextSuggestions []string
-	UseColor           bool
-	SimulateStale      bool
-	LoadResourceList   LoadResourceListFunc
+	Session              protocol.SessionState
+	ResourceList         protocol.ResourceListPayload
+	ContextSuggestions   []string
+	NamespaceSuggestions []string
+	UseColor             bool
+	SimulateStale        bool
+	LoadResourceList     LoadResourceListFunc
+	LoadNamespaces       LoadNamespacesFunc
 }
 
 type Result struct {
@@ -57,6 +63,17 @@ type listFailedMsg struct {
 }
 
 type pollTickMsg struct{}
+type namespacePollTickMsg struct{}
+
+type namespacesLoadedMsg struct {
+	kubeContext string
+	payload     protocol.NamespaceListPayload
+}
+
+type namespacesFailedMsg struct {
+	kubeContext string
+	err         error
+}
 
 type keyMap struct {
 	Up           key.Binding
@@ -148,24 +165,27 @@ func newStyles(useColor bool) styles {
 }
 
 type model struct {
-	session            protocol.SessionState
-	resourceList       protocol.ResourceListPayload
-	contextSuggestions []string
+	session              protocol.SessionState
+	resourceList         protocol.ResourceListPayload
+	contextSuggestions   []string
+	namespaceSuggestions []string
 
 	useColor         bool
 	simulateStale    bool
 	loadResourceList LoadResourceListFunc
+	loadNamespaces   LoadNamespacesFunc
 
 	input          textinput.Model
 	commandMode    bool
 	commandMessage string
 	suggestions    []string
 
-	selected   int
-	loading    bool
-	requestSeq int
-	activeSeq  int
-	pollEvery  time.Duration
+	selected           int
+	loading            bool
+	requestSeq         int
+	activeSeq          int
+	pollEvery          time.Duration
+	namespacePollEvery time.Duration
 
 	width  int
 	height int
@@ -203,24 +223,31 @@ func newModel(opts Options) model {
 	h.ShowAll = false
 
 	m := model{
-		session:            opts.Session,
-		resourceList:       opts.ResourceList,
-		contextSuggestions: append([]string(nil), opts.ContextSuggestions...),
-		useColor:           opts.UseColor,
-		simulateStale:      opts.SimulateStale,
-		loadResourceList:   opts.LoadResourceList,
-		input:              input,
-		keys:               keys,
-		help:               h,
-		styles:             newStyles(opts.UseColor),
-		pollEvery:          defaultBackgroundRefreshInterval,
+		session:              opts.Session,
+		resourceList:         opts.ResourceList,
+		contextSuggestions:   append([]string(nil), opts.ContextSuggestions...),
+		namespaceSuggestions: append([]string(nil), opts.NamespaceSuggestions...),
+		useColor:             opts.UseColor,
+		simulateStale:        opts.SimulateStale,
+		loadResourceList:     opts.LoadResourceList,
+		loadNamespaces:       opts.LoadNamespaces,
+		input:                input,
+		keys:                 keys,
+		help:                 h,
+		styles:               newStyles(opts.UseColor),
+		pollEvery:            defaultBackgroundRefreshInterval,
+		namespacePollEvery:   defaultNamespaceRefreshInterval,
 	}
 	m.selectFromSession()
 	return m
 }
 
 func (m model) Init() tea.Cmd {
-	return m.schedulePoll()
+	cmds := []tea.Cmd{m.schedulePoll(), m.scheduleNamespacePoll()}
+	if m.loadNamespaces != nil {
+		cmds = append(cmds, m.loadNamespacesCmd(m.session.KubeContext))
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -239,6 +266,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return updated, tickCmd
 		}
 		return updated, tea.Batch(tickCmd, refreshCmd)
+	case namespacePollTickMsg:
+		tickCmd := m.scheduleNamespacePoll()
+		if m.commandMode || m.loadNamespaces == nil {
+			return m, tickCmd
+		}
+		return m, tea.Batch(tickCmd, m.loadNamespacesCmd(m.session.KubeContext))
 	case listLoadedMsg:
 		if msg.seq != m.activeSeq {
 			return m, nil
@@ -262,6 +295,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		if msg.announce {
 			m.commandMessage = fmt.Sprintf("load failed: %v", msg.err)
+		}
+		return m, nil
+	case namespacesLoadedMsg:
+		if msg.kubeContext != strings.TrimSpace(m.session.KubeContext) {
+			return m, nil
+		}
+		m.namespaceSuggestions = append([]string(nil), msg.payload.Namespaces...)
+		return m, nil
+	case namespacesFailedMsg:
+		if msg.kubeContext != strings.TrimSpace(m.session.KubeContext) {
+			return m, nil
 		}
 		return m, nil
 	case tea.KeyMsg:
@@ -314,6 +358,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case key.Matches(msg, m.keys.Apply):
 		commandText := strings.TrimSpace(m.input.Value())
+		previousContext := m.session.KubeContext
 		m.commandMode = false
 		m.input.Blur()
 		m.input.SetValue("")
@@ -337,7 +382,15 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.session.Selection = ""
 		}
 		if reload {
-			return m.startListReload()
+			updatedModel, listCmd := m.startListReload()
+			next := updatedModel.(model)
+			if strings.TrimSpace(previousContext) != strings.TrimSpace(next.session.KubeContext) {
+				_, nsCmd := next.startNamespaceReload()
+				if nsCmd != nil {
+					return next, tea.Batch(listCmd, nsCmd)
+				}
+			}
+			return next, listCmd
 		}
 		return m, nil
 	default:
@@ -433,6 +486,27 @@ func (m model) loadListCmd(seq int, query protocol.ResourceListQuery, announce b
 	}
 }
 
+func (m model) startNamespaceReload() (tea.Model, tea.Cmd) {
+	return m, m.loadNamespacesCmd(m.session.KubeContext)
+}
+
+func (m model) loadNamespacesCmd(kubeContext string) tea.Cmd {
+	if m.loadNamespaces == nil {
+		return nil
+	}
+	kubeContext = strings.TrimSpace(kubeContext)
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		payload, err := m.loadNamespaces(ctx, kubeContext)
+		if err != nil {
+			return namespacesFailedMsg{kubeContext: kubeContext, err: err}
+		}
+		return namespacesLoadedMsg{kubeContext: kubeContext, payload: payload}
+	}
+}
+
 func (m model) schedulePoll() tea.Cmd {
 	interval := m.pollEvery
 	if interval <= 0 {
@@ -440,6 +514,16 @@ func (m model) schedulePoll() tea.Cmd {
 	}
 	return tea.Tick(interval, func(time.Time) tea.Msg {
 		return pollTickMsg{}
+	})
+}
+
+func (m model) scheduleNamespacePoll() tea.Cmd {
+	interval := m.namespacePollEvery
+	if interval <= 0 {
+		interval = defaultNamespaceRefreshInterval
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg {
+		return namespacePollTickMsg{}
 	})
 }
 
@@ -744,6 +828,9 @@ func (m model) namespaceCandidates() []string {
 
 	for _, value := range candidates {
 		seen[value] = struct{}{}
+	}
+	for _, value := range m.namespaceSuggestions {
+		appendUnique(value)
 	}
 	appendUnique(m.session.Namespace)
 	for _, item := range m.resourceList.Items {

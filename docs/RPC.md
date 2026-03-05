@@ -21,6 +21,7 @@ Transport recommendation:
 ### `ResourceService`
 
 - `ListResources(ListResourcesRequest) -> ListResourcesResponse`
+- `ListNamespaces(ListNamespacesRequest) -> ListNamespacesResponse`
 - `WatchResources(WatchResourcesRequest) -> stream ResourceEvent`
 - `GetResource(GetResourceRequest) -> GetResourceResponse`
 

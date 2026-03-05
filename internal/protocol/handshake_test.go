@@ -108,3 +108,36 @@ func TestBuildResourceListResponse(t *testing.T) {
 		t.Fatalf("unexpected freshness state: %q", resp.ResourceList.Freshness.State)
 	}
 }
+
+func TestBuildNamespaceListResponse(t *testing.T) {
+	payload := NamespaceListPayload{
+		KubeContext: "dev-cluster",
+		Namespaces:  []string{"default", "payments"},
+		Freshness: FreshnessMeta{
+			State:              FreshnessStateLive,
+			SnapshotTimeUnixMs: 200,
+			AgeMs:              0,
+			WatchHealthy:       true,
+			Source:             "cache",
+		},
+	}
+
+	resp := BuildNamespaceListResponse(
+		HandshakeRequest{RPCVersion: RPCVersion, Intent: IntentNamespaceList},
+		"dev",
+		123,
+		payload,
+	)
+	if !resp.Compatible {
+		t.Fatalf("expected compatible response")
+	}
+	if resp.NamespaceList == nil {
+		t.Fatalf("expected namespace list payload")
+	}
+	if resp.NamespaceList.KubeContext != "dev-cluster" {
+		t.Fatalf("unexpected namespace payload context: %q", resp.NamespaceList.KubeContext)
+	}
+	if len(resp.NamespaceList.Namespaces) != 2 {
+		t.Fatalf("expected two namespaces, got %d", len(resp.NamespaceList.Namespaces))
+	}
+}

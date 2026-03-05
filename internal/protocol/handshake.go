@@ -5,31 +5,34 @@ import "fmt"
 const RPCVersion = "v0alpha1"
 
 const (
-	IntentHandshake    = ""
-	IntentShutdown     = "shutdown"
-	IntentSessionGet   = "session_get"
-	IntentSessionSave  = "session_save"
-	IntentResourceList = "resource_list"
+	IntentHandshake     = ""
+	IntentShutdown      = "shutdown"
+	IntentSessionGet    = "session_get"
+	IntentSessionSave   = "session_save"
+	IntentResourceList  = "resource_list"
+	IntentNamespaceList = "namespace_list"
 )
 
 type HandshakeRequest struct {
-	ClientName    string             `json:"clientName"`
-	ClientVersion string             `json:"clientVersion"`
-	RPCVersion    string             `json:"rpcVersion"`
-	Intent        string             `json:"intent,omitempty"`
-	Session       *SessionState      `json:"session,omitempty"`
-	ListQuery     *ResourceListQuery `json:"listQuery,omitempty"`
+	ClientName     string              `json:"clientName"`
+	ClientVersion  string              `json:"clientVersion"`
+	RPCVersion     string              `json:"rpcVersion"`
+	Intent         string              `json:"intent,omitempty"`
+	Session        *SessionState       `json:"session,omitempty"`
+	ListQuery      *ResourceListQuery  `json:"listQuery,omitempty"`
+	NamespaceQuery *NamespaceListQuery `json:"namespaceQuery,omitempty"`
 }
 
 type HandshakeResponse struct {
-	Compatible    bool                 `json:"compatible"`
-	DaemonVersion string               `json:"daemonVersion"`
-	RPCVersion    string               `json:"rpcVersion"`
-	PID           int                  `json:"pid"`
-	ShuttingDown  bool                 `json:"shuttingDown,omitempty"`
-	Session       *SessionState        `json:"session,omitempty"`
-	ResourceList  *ResourceListPayload `json:"resourceList,omitempty"`
-	Message       string               `json:"message,omitempty"`
+	Compatible    bool                  `json:"compatible"`
+	DaemonVersion string                `json:"daemonVersion"`
+	RPCVersion    string                `json:"rpcVersion"`
+	PID           int                   `json:"pid"`
+	ShuttingDown  bool                  `json:"shuttingDown,omitempty"`
+	Session       *SessionState         `json:"session,omitempty"`
+	ResourceList  *ResourceListPayload  `json:"resourceList,omitempty"`
+	NamespaceList *NamespaceListPayload `json:"namespaceList,omitempty"`
+	Message       string                `json:"message,omitempty"`
 }
 
 type SessionState struct {
@@ -75,6 +78,16 @@ type ResourceListPayload struct {
 	Namespace string         `json:"namespace"`
 	Items     []ResourceItem `json:"items"`
 	Freshness FreshnessMeta  `json:"freshness"`
+}
+
+type NamespaceListQuery struct {
+	KubeContext string `json:"kubeContext,omitempty"`
+}
+
+type NamespaceListPayload struct {
+	KubeContext string        `json:"kubeContext,omitempty"`
+	Namespaces  []string      `json:"namespaces"`
+	Freshness   FreshnessMeta `json:"freshness"`
 }
 
 func BuildHandshakeResponse(req HandshakeRequest, daemonVersion string, pid int) HandshakeResponse {
@@ -145,6 +158,22 @@ func BuildResourceListResponse(
 
 	resp.ResourceList = &payload
 	resp.Message = "resource list ready"
+	return resp
+}
+
+func BuildNamespaceListResponse(
+	req HandshakeRequest,
+	daemonVersion string,
+	pid int,
+	payload NamespaceListPayload,
+) HandshakeResponse {
+	resp := BuildHandshakeResponse(req, daemonVersion, pid)
+	if !resp.Compatible {
+		return resp
+	}
+
+	resp.NamespaceList = &payload
+	resp.Message = "namespace list ready"
 	return resp
 }
 

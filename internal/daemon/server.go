@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	namespacecache "github.com/dzhanguzin/k11s/internal/cache/namespaces"
 	resourcecache "github.com/dzhanguzin/k11s/internal/cache/resources"
 	"github.com/dzhanguzin/k11s/internal/config"
 	"github.com/dzhanguzin/k11s/internal/kube"
@@ -47,6 +48,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	logger.Printf("listening on %s", cfg.SocketPath)
 	store := session.NewStore(cfg.SessionPath)
 	resourceCache := resourcecache.New(ctx, kube.NewResourceFetcher(), logger)
+	namespaceCache := namespacecache.New(ctx, kube.NewNamespaceFetcher(), logger)
 
 	var shutdownOnce sync.Once
 	shutdown := func() {
@@ -71,7 +73,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 			continue
 		}
 
-		go handleConn(conn, daemonVersion, shutdown, store, resourceCache, logger)
+		go handleConn(conn, daemonVersion, shutdown, store, resourceCache, namespaceCache, logger)
 	}
 }
 
@@ -81,6 +83,7 @@ func handleConn(
 	shutdown func(),
 	store *session.Store,
 	resourceCache *resourcecache.Cache,
+	namespaceCache *namespacecache.Cache,
 	logger *log.Logger,
 ) {
 	defer conn.Close()
@@ -173,6 +176,21 @@ func handleConn(
 			payload = buildPlaceholderResourceList(query)
 		}
 		resp := protocol.BuildResourceListResponse(req, daemonVersion, os.Getpid(), payload)
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
+	case protocol.IntentNamespaceList:
+		if req.NamespaceQuery == nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "missing namespace query payload",
+			})
+			return
+		}
+		payload := namespaceCache.Get(*req.NamespaceQuery)
+		resp := protocol.BuildNamespaceListResponse(req, daemonVersion, os.Getpid(), payload)
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
 	}
