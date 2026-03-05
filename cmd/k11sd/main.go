@@ -9,9 +9,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/dzhanguzin/k11s/internal/buildinfo"
-	"github.com/dzhanguzin/k11s/internal/config"
-	"github.com/dzhanguzin/k11s/internal/daemon"
+	"github.com/daulet/k11s/internal/buildinfo"
+	"github.com/daulet/k11s/internal/config"
+	"github.com/daulet/k11s/internal/daemon"
 )
 
 func main() {

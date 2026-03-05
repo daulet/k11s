@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dzhanguzin/k11s/internal/protocol"
+	"github.com/daulet/k11s/internal/protocol"
 )
 
 func TestCacheColdStartTransitionsToLive(t *testing.T) {

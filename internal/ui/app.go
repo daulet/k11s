@@ -12,7 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/dzhanguzin/k11s/internal/protocol"
+	"github.com/daulet/k11s/internal/protocol"
 )
 
 var defaultResources = []string{
@@ -381,10 +381,8 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Autocomplete):
 		m.triggerAutocomplete()
 		return m, nil
-	case key.Matches(msg, m.keys.Accept):
-		if m.autocomplete.active {
-			m.acceptAutocomplete()
-		}
+	case key.Matches(msg, m.keys.Accept) && m.autocomplete.active:
+		m.acceptAutocomplete()
 		return m, nil
 	case key.Matches(msg, m.keys.Apply):
 		commandText := strings.TrimSpace(m.input.Value())

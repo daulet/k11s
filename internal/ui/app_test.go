@@ -7,7 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/dzhanguzin/k11s/internal/protocol"
+	"github.com/daulet/k11s/internal/protocol"
 )
 
 func TestModelInitialSelectionFromSession(t *testing.T) {
@@ -502,5 +502,34 @@ func TestTabSingleContinuationMovesCursorToEnd(t *testing.T) {
 	}
 	if next.input.Position() != len(next.input.Value()) {
 		t.Fatalf("expected cursor at end, position=%d len=%d", next.input.Position(), len(next.input.Value()))
+	}
+}
+
+func TestRightArrowMovesCursorWhenAutocompleteInactive(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("ctx prod")
+	m.input.CursorEnd()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	withLeft := updated.(model)
+	if withLeft.input.Position() != len(withLeft.input.Value())-1 {
+		t.Fatalf("expected cursor to move left, position=%d len=%d", withLeft.input.Position(), len(withLeft.input.Value()))
+	}
+
+	updated, _ = withLeft.Update(tea.KeyMsg{Type: tea.KeyRight})
+	withRight := updated.(model)
+	if withRight.input.Position() != len(withRight.input.Value()) {
+		t.Fatalf("expected cursor to move right, position=%d len=%d", withRight.input.Position(), len(withRight.input.Value()))
+	}
+	if withRight.autocomplete.active {
+		t.Fatalf("expected autocomplete to remain inactive")
 	}
 }

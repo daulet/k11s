@@ -8,8 +8,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/dzhanguzin/k11s/internal/config"
-	"github.com/dzhanguzin/k11s/internal/protocol"
+	"github.com/daulet/k11s/internal/config"
+	"github.com/daulet/k11s/internal/protocol"
 )
 
 func GetSession(ctx context.Context, cfg config.Config, clientVersion string) (protocol.SessionState, error) {

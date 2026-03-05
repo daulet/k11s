@@ -12,12 +12,12 @@ import (
 	"sync"
 	"time"
 
-	namespacecache "github.com/dzhanguzin/k11s/internal/cache/namespaces"
-	resourcecache "github.com/dzhanguzin/k11s/internal/cache/resources"
-	"github.com/dzhanguzin/k11s/internal/config"
-	"github.com/dzhanguzin/k11s/internal/kube"
-	"github.com/dzhanguzin/k11s/internal/protocol"
-	"github.com/dzhanguzin/k11s/internal/session"
+	namespacecache "github.com/daulet/k11s/internal/cache/namespaces"
+	resourcecache "github.com/daulet/k11s/internal/cache/resources"
+	"github.com/daulet/k11s/internal/config"
+	"github.com/daulet/k11s/internal/kube"
+	"github.com/daulet/k11s/internal/protocol"
+	"github.com/daulet/k11s/internal/session"
 )
 
 func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {

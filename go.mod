@@ -1,4 +1,4 @@
-module github.com/dzhanguzin/k11s
+module github.com/daulet/k11s
 
 go 1.24.2
 

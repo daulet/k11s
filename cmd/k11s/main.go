@@ -11,13 +11,13 @@ import (
 	"os"
 	"time"
 
-	"github.com/dzhanguzin/k11s/internal/buildinfo"
-	"github.com/dzhanguzin/k11s/internal/client"
-	"github.com/dzhanguzin/k11s/internal/config"
-	"github.com/dzhanguzin/k11s/internal/kubeconfig"
-	"github.com/dzhanguzin/k11s/internal/perf"
-	"github.com/dzhanguzin/k11s/internal/protocol"
-	"github.com/dzhanguzin/k11s/internal/ui"
+	"github.com/daulet/k11s/internal/buildinfo"
+	"github.com/daulet/k11s/internal/client"
+	"github.com/daulet/k11s/internal/config"
+	"github.com/daulet/k11s/internal/kubeconfig"
+	"github.com/daulet/k11s/internal/perf"
+	"github.com/daulet/k11s/internal/protocol"
+	"github.com/daulet/k11s/internal/ui"
 )
 
 func main() {

@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/dzhanguzin/k11s/internal/config"
-	"github.com/dzhanguzin/k11s/internal/protocol"
+	"github.com/daulet/k11s/internal/config"
+	"github.com/daulet/k11s/internal/protocol"
 )
 
 func ListResources(
