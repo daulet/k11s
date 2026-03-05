@@ -67,6 +67,7 @@ Perf measurement:
 TUI keybindings:
 - `j` / `k` or arrow keys: move selection
 - `ctrl+d` / `ctrl+u` (or PgDn/PgUp): jump selection by 10 rows
+- `ctrl+o` / `ctrl+y` (or Alt+Left/Alt+Right): back / forward navigation history
 - `/`: search items; `n` / `N` jumps between matches
 - `enter` (normal mode): load detail for selected row from daemon cache
 - `q`: quit (current selection is persisted into session)

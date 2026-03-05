@@ -2310,3 +2310,175 @@ func TestRightArrowMovesCursorWhenAutocompleteInactive(t *testing.T) {
 		t.Fatalf("expected autocomplete to remain inactive")
 	}
 }
+
+func TestBackForwardShortcutsFromCommandNavigation(t *testing.T) {
+	var seen []protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = append(seen, query)
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: query.Resource + "-item", Namespace: query.Namespace, Status: "Ready"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("nodes")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterApply := updated.(model)
+	if afterApply.session.Resource != "nodes" {
+		t.Fatalf("expected nodes session after command apply, got %q", afterApply.session.Resource)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command after nodes command")
+	}
+	updated, _ = afterApply.Update(cmd())
+	afterNodes := updated.(model)
+
+	updated, backCmd := afterNodes.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	afterBack := updated.(model)
+	if afterBack.session.Resource != "pods" {
+		t.Fatalf("expected back to pods, got %q", afterBack.session.Resource)
+	}
+	if backCmd == nil {
+		t.Fatalf("expected list reload command after back")
+	}
+	updated, _ = afterBack.Update(backCmd())
+	afterBackLoaded := updated.(model)
+	if afterBackLoaded.resourceList.Resource != "pods" {
+		t.Fatalf("expected pods payload after back, got %q", afterBackLoaded.resourceList.Resource)
+	}
+
+	updated, forwardCmd := afterBackLoaded.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	afterForward := updated.(model)
+	if afterForward.session.Resource != "nodes" {
+		t.Fatalf("expected forward to nodes, got %q", afterForward.session.Resource)
+	}
+	if forwardCmd == nil {
+		t.Fatalf("expected list reload command after forward")
+	}
+	updated, _ = afterForward.Update(forwardCmd())
+	afterForwardLoaded := updated.(model)
+	if afterForwardLoaded.resourceList.Resource != "nodes" {
+		t.Fatalf("expected nodes payload after forward, got %q", afterForwardLoaded.resourceList.Resource)
+	}
+
+	if len(seen) < 3 {
+		t.Fatalf("expected at least 3 list reloads (nodes/back/forward), got %d", len(seen))
+	}
+}
+
+func TestBackShortcutWithoutHistoryShowsMessage(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected no reload command without history")
+	}
+	if !strings.Contains(strings.ToLower(next.commandMessage), "no back history") {
+		t.Fatalf("expected no back history message, got %q", next.commandMessage)
+	}
+}
+
+func TestBackShortcutAfterMouseNodeJump(t *testing.T) {
+	var seen []protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = append(seen, query)
+			items := []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a"},
+			}
+			if query.Resource == "nodes" {
+				items = []protocol.ResourceItem{
+					{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+				}
+			}
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     items,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	clickNode := tea.MouseMsg{
+		X:      56,
+		Y:      6,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	}
+	updated, cmd := m.Update(clickNode)
+	afterClick := updated.(model)
+	if afterClick.session.Resource != "nodes" {
+		t.Fatalf("expected nodes after click, got %q", afterClick.session.Resource)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command after node click")
+	}
+	updated, _ = afterClick.Update(cmd())
+	afterNodeLoaded := updated.(model)
+
+	updated, backCmd := afterNodeLoaded.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	afterBack := updated.(model)
+	if afterBack.session.Resource != "pods" {
+		t.Fatalf("expected back to pods after node jump, got %q", afterBack.session.Resource)
+	}
+	if backCmd == nil {
+		t.Fatalf("expected reload command after back from node jump")
+	}
+	updated, _ = afterBack.Update(backCmd())
+	final := updated.(model)
+	if final.resourceList.Resource != "pods" {
+		t.Fatalf("expected pods payload after back, got %q", final.resourceList.Resource)
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected list reloads for click and back, got %d", len(seen))
+	}
+}

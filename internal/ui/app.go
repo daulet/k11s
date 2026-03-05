@@ -37,6 +37,7 @@ const (
 	defaultCRDRefreshInterval        = 5 * time.Second
 	defaultLogsFollowInterval        = 1500 * time.Millisecond
 	defaultRowFlashDuration          = 2 * time.Second
+	maxNavigationHistoryEntries      = 128
 )
 
 type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error)
@@ -148,6 +149,8 @@ type keyMap struct {
 	Down         key.Binding
 	JumpUp       key.Binding
 	JumpDown     key.Binding
+	Back         key.Binding
+	Forward      key.Binding
 	Detail       key.Binding
 	Command      key.Binding
 	Search       key.Binding
@@ -177,6 +180,14 @@ func defaultKeyMap() keyMap {
 		JumpDown: key.NewBinding(
 			key.WithKeys("pgdown", "ctrl+d"),
 			key.WithHelp("pgdn/ctrl+d", "jump down"),
+		),
+		Back: key.NewBinding(
+			key.WithKeys("ctrl+o", "alt+left"),
+			key.WithHelp("C-o", "back"),
+		),
+		Forward: key.NewBinding(
+			key.WithKeys("ctrl+y", "alt+right"),
+			key.WithHelp("C-y", "forward"),
 		),
 		Detail: key.NewBinding(
 			key.WithKeys("enter"),
@@ -225,6 +236,8 @@ func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{
 		k.Up,
 		k.JumpDown,
+		k.Back,
+		k.Forward,
 		k.Detail,
 		k.Command,
 		k.Search,
@@ -243,6 +256,8 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		k.Down,
 		k.JumpUp,
 		k.JumpDown,
+		k.Back,
+		k.Forward,
 		k.Detail,
 		k.Command,
 		k.Search,
@@ -347,6 +362,8 @@ type model struct {
 	suggestions    []string
 	autocomplete   autocompleteState
 	crdLoadErr     string
+	historyBack    []protocol.SessionState
+	historyForward []protocol.SessionState
 
 	selected           int
 	loading            bool
@@ -653,6 +670,22 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Command):
 		m.enterCommandMode()
 		return m, nil
+	case key.Matches(msg, m.keys.Back):
+		target, ok := m.popBackHistoryTarget()
+		if !ok {
+			m.commandMessage = "no back history"
+			return m, nil
+		}
+		m.commandMessage = "navigated back"
+		return m.navigateToSession(target)
+	case key.Matches(msg, m.keys.Forward):
+		target, ok := m.popForwardHistoryTarget()
+		if !ok {
+			m.commandMessage = "no forward history"
+			return m, nil
+		}
+		m.commandMessage = "navigated forward"
+		return m.navigateToSession(target)
 	case key.Matches(msg, m.keys.Search):
 		m.enterSearchMode()
 		return m, nil
@@ -746,6 +779,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	}
 
 	item := m.resourceList.Items[itemIndex]
+	previousSession := m.session
 	switch clickedColumn {
 	case "namespace":
 		namespace := strings.TrimSpace(item.Namespace)
@@ -754,6 +788,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		m.session.Namespace = namespace
 		m.session.Selection = ""
+		m.pushNavigationHistory(previousSession)
 		m.clearDetail()
 		m.clearFlashingItems()
 		m.commandMessage = "namespace switched to " + namespace + " via click"
@@ -765,6 +800,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		m.session.Resource = "nodes"
 		m.session.Selection = node
+		m.pushNavigationHistory(previousSession)
 		m.clearDetail()
 		m.clearFlashingItems()
 		m.commandMessage = "opened node " + node + " via click"
@@ -783,6 +819,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		m.session.Resource = resource
 		m.session.Selection = ownerSelection
+		m.pushNavigationHistory(previousSession)
 		m.clearDetail()
 		m.clearFlashingItems()
 		m.commandMessage = fmt.Sprintf("opened owner %s/%s via click", item.OwnerKind, ownerSelection)
@@ -849,6 +886,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 		previousContext := m.session.KubeContext
+		previousSession := m.session
 
 		updated, message, reload, err := m.applyCommand(commandText)
 		if err != nil {
@@ -861,25 +899,13 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		m.commandMessage = message
 		if updated {
+			m.pushNavigationHistory(previousSession)
 			m.session.Selection = ""
 			m.clearDetail()
 			m.clearFlashingItems()
 		}
 		if reload {
-			updatedModel, listCmd := m.startListReload()
-			next := updatedModel.(model)
-			if strings.TrimSpace(previousContext) != strings.TrimSpace(next.session.KubeContext) {
-				cmds := []tea.Cmd{listCmd}
-				_, nsCmd := next.startNamespaceReload()
-				if nsCmd != nil {
-					cmds = append(cmds, nsCmd)
-				}
-				_, crdCmd := next.startCRDReload()
-				if crdCmd != nil {
-					cmds = append(cmds, crdCmd)
-				}
-				return next, tea.Batch(cmds...)
-			}
+			next, listCmd := m.startListReloadWithContext(previousContext)
 			return next, listCmd
 		}
 		return m, nil
@@ -1018,6 +1044,63 @@ func (m *model) setSelection(index int) {
 	m.selected = index
 	m.session.Selection = m.currentSelection()
 	m.clearDetail()
+}
+
+func (m *model) pushNavigationHistory(previous protocol.SessionState) {
+	if sessionStateEqualsForHistory(previous, m.session) {
+		return
+	}
+	if len(m.historyBack) == 0 || !sessionStateEqualsForHistory(m.historyBack[len(m.historyBack)-1], previous) {
+		m.historyBack = append(m.historyBack, previous)
+		if len(m.historyBack) > maxNavigationHistoryEntries {
+			m.historyBack = m.historyBack[len(m.historyBack)-maxNavigationHistoryEntries:]
+		}
+	}
+	m.historyForward = nil
+}
+
+func (m *model) popBackHistoryTarget() (protocol.SessionState, bool) {
+	if len(m.historyBack) == 0 {
+		return protocol.SessionState{}, false
+	}
+	last := len(m.historyBack) - 1
+	target := m.historyBack[last]
+	m.historyBack = m.historyBack[:last]
+
+	current := m.session
+	if len(m.historyForward) == 0 || !sessionStateEqualsForHistory(m.historyForward[len(m.historyForward)-1], current) {
+		m.historyForward = append(m.historyForward, current)
+		if len(m.historyForward) > maxNavigationHistoryEntries {
+			m.historyForward = m.historyForward[len(m.historyForward)-maxNavigationHistoryEntries:]
+		}
+	}
+	return target, true
+}
+
+func (m *model) popForwardHistoryTarget() (protocol.SessionState, bool) {
+	if len(m.historyForward) == 0 {
+		return protocol.SessionState{}, false
+	}
+	last := len(m.historyForward) - 1
+	target := m.historyForward[last]
+	m.historyForward = m.historyForward[:last]
+
+	current := m.session
+	if len(m.historyBack) == 0 || !sessionStateEqualsForHistory(m.historyBack[len(m.historyBack)-1], current) {
+		m.historyBack = append(m.historyBack, current)
+		if len(m.historyBack) > maxNavigationHistoryEntries {
+			m.historyBack = m.historyBack[len(m.historyBack)-maxNavigationHistoryEntries:]
+		}
+	}
+	return target, true
+}
+
+func sessionStateEqualsForHistory(left protocol.SessionState, right protocol.SessionState) bool {
+	return strings.TrimSpace(left.KubeContext) == strings.TrimSpace(right.KubeContext) &&
+		strings.TrimSpace(left.Namespace) == strings.TrimSpace(right.Namespace) &&
+		strings.TrimSpace(left.Resource) == strings.TrimSpace(right.Resource) &&
+		strings.TrimSpace(left.Filter) == strings.TrimSpace(right.Filter) &&
+		strings.TrimSpace(left.Selection) == strings.TrimSpace(right.Selection)
 }
 
 func (m *model) updateFlashingItems(previous []protocol.ResourceItem, current []protocol.ResourceItem) {
@@ -1347,6 +1430,33 @@ func (m model) logsQueryFromCommand(input string) (protocol.LogsQuery, bool, err
 
 func (m model) startListReload() (tea.Model, tea.Cmd) {
 	return m.startListReloadWithAnnouncement(true)
+}
+
+func (m model) startListReloadWithContext(previousContext string) (model, tea.Cmd) {
+	updatedModel, listCmd := m.startListReload()
+	next := updatedModel.(model)
+	if strings.TrimSpace(previousContext) != strings.TrimSpace(next.session.KubeContext) {
+		cmds := []tea.Cmd{listCmd}
+		_, nsCmd := next.startNamespaceReload()
+		if nsCmd != nil {
+			cmds = append(cmds, nsCmd)
+		}
+		_, crdCmd := next.startCRDReload()
+		if crdCmd != nil {
+			cmds = append(cmds, crdCmd)
+		}
+		return next, tea.Batch(cmds...)
+	}
+	return next, listCmd
+}
+
+func (m model) navigateToSession(target protocol.SessionState) (tea.Model, tea.Cmd) {
+	previousContext := m.session.KubeContext
+	m.session = target
+	m.clearDetail()
+	m.clearFlashingItems()
+	next, cmd := m.startListReloadWithContext(previousContext)
+	return next, cmd
 }
 
 func (m model) startListReloadWithAnnouncement(announce bool) (tea.Model, tea.Cmd) {
