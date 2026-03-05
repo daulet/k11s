@@ -116,10 +116,13 @@ func TestContextSuggestionsUseConfiguredContexts(t *testing.T) {
 }
 
 func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
 	m := newModel(Options{
 		Session: protocol.SessionState{
-			Namespace: "default",
-			Resource:  "pods",
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
 		},
 		ResourceList: protocol.ResourceListPayload{
 			Resource:  "pods",
@@ -129,6 +132,7 @@ func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 			},
 		},
 		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
 			return protocol.ResourceListPayload{
 				Resource:  query.Resource,
 				Namespace: query.Namespace,
@@ -158,6 +162,9 @@ func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 	msg := cmd()
 	updatedModel, _ = next.Update(msg)
 	final := updatedModel.(model)
+	if seen.KubeContext != "dev-cluster" {
+		t.Fatalf("expected kube context in list query, got %q", seen.KubeContext)
+	}
 	if final.resourceList.Resource != "services" {
 		t.Fatalf("expected reloaded resource services, got %q", final.resourceList.Resource)
 	}

@@ -8,10 +8,13 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	resourcecache "github.com/dzhanguzin/k11s/internal/cache/resources"
 	"github.com/dzhanguzin/k11s/internal/config"
+	"github.com/dzhanguzin/k11s/internal/kube"
 	"github.com/dzhanguzin/k11s/internal/protocol"
 	"github.com/dzhanguzin/k11s/internal/session"
 )
@@ -43,6 +46,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	logger := log.New(os.Stderr, "k11sd: ", log.LstdFlags)
 	logger.Printf("listening on %s", cfg.SocketPath)
 	store := session.NewStore(cfg.SessionPath)
+	resourceCache := resourcecache.New(ctx, kube.NewResourceFetcher(), logger)
 
 	var shutdownOnce sync.Once
 	shutdown := func() {
@@ -67,11 +71,18 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 			continue
 		}
 
-		go handleConn(conn, daemonVersion, shutdown, store, logger)
+		go handleConn(conn, daemonVersion, shutdown, store, resourceCache, logger)
 	}
 }
 
-func handleConn(conn net.Conn, daemonVersion string, shutdown func(), store *session.Store, logger *log.Logger) {
+func handleConn(
+	conn net.Conn,
+	daemonVersion string,
+	shutdown func(),
+	store *session.Store,
+	resourceCache *resourcecache.Cache,
+	logger *log.Logger,
+) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
@@ -149,7 +160,18 @@ func handleConn(conn net.Conn, daemonVersion string, shutdown func(), store *ses
 			return
 		}
 
-		payload := buildPlaceholderResourceList(*req.ListQuery)
+		query := *req.ListQuery
+		resource := strings.ToLower(strings.TrimSpace(query.Resource))
+		if resource == "" {
+			resource = "pods"
+		}
+
+		var payload protocol.ResourceListPayload
+		if kube.IsCoreResource(resource) {
+			payload = resourceCache.Get(query)
+		} else {
+			payload = buildPlaceholderResourceList(query)
+		}
 		resp := protocol.BuildResourceListResponse(req, daemonVersion, os.Getpid(), payload)
 		_ = json.NewEncoder(conn).Encode(resp)
 		return

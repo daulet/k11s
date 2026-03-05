@@ -58,6 +58,7 @@ type FreshnessMeta struct {
 }
 
 type ResourceListQuery struct {
+	KubeContext   string `json:"kubeContext,omitempty"`
 	Resource      string `json:"resource"`
 	Namespace     string `json:"namespace"`
 	SimulateStale bool   `json:"simulateStale,omitempty"`

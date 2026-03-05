@@ -198,6 +198,7 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 		cfg,
 		buildinfo.Version,
 		protocol.ResourceListQuery{
+			KubeContext:   sessionState.KubeContext,
 			Resource:      sessionState.Resource,
 			Namespace:     sessionState.Namespace,
 			SimulateStale: opts.simulateStale,

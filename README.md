@@ -32,9 +32,10 @@ Primary goals:
 - Daemon handshake enforces RPC version compatibility.
 - If daemon version differs from client version, `k11s` requests graceful daemon shutdown and starts a matching daemon.
 - Session state is persisted by daemon and restored on launch.
-- Placeholder resource list responses include freshness metadata.
+- Daemon serves `pods`, `services`, and `deployments` from an async cache refreshed via `kubectl` in the background.
+- Other resources currently use placeholder responses with freshness metadata.
 - Status bar renders freshness badge, age, snapshot time, source, and watch health.
-- `k11s` runs an interactive Bubble Tea TUI by default.
+- `k11s` runs an interactive Bubble Tea TUI by default, with periodic background list refresh.
 
 ## Quickstart
 

@@ -27,6 +27,8 @@ var defaultResources = []string{
 	"crs",
 }
 
+const defaultBackgroundRefreshInterval = 1200 * time.Millisecond
+
 type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error)
 
 type Options struct {
@@ -43,14 +45,18 @@ type Result struct {
 }
 
 type listLoadedMsg struct {
-	seq     int
-	payload protocol.ResourceListPayload
+	seq      int
+	payload  protocol.ResourceListPayload
+	announce bool
 }
 
 type listFailedMsg struct {
-	seq int
-	err error
+	seq      int
+	err      error
+	announce bool
 }
+
+type pollTickMsg struct{}
 
 type keyMap struct {
 	Up           key.Binding
@@ -159,6 +165,7 @@ type model struct {
 	loading    bool
 	requestSeq int
 	activeSeq  int
+	pollEvery  time.Duration
 
 	width  int
 	height int
@@ -206,13 +213,14 @@ func newModel(opts Options) model {
 		keys:               keys,
 		help:               h,
 		styles:             newStyles(opts.UseColor),
+		pollEvery:          defaultBackgroundRefreshInterval,
 	}
 	m.selectFromSession()
 	return m
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return m.schedulePoll()
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -221,6 +229,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
+	case pollTickMsg:
+		tickCmd := m.schedulePoll()
+		if m.commandMode || m.loading || m.loadResourceList == nil {
+			return m, tickCmd
+		}
+		updated, refreshCmd := m.startBackgroundReload()
+		if refreshCmd == nil {
+			return updated, tickCmd
+		}
+		return updated, tea.Batch(tickCmd, refreshCmd)
 	case listLoadedMsg:
 		if msg.seq != m.activeSeq {
 			return m, nil
@@ -228,19 +246,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.resourceList = msg.payload
 		m.selectFromSession()
-		m.commandMessage = fmt.Sprintf(
-			"loaded %d %s in namespace %s",
-			len(m.resourceList.Items),
-			m.resourceList.Resource,
-			m.resourceList.Namespace,
-		)
+		if msg.announce {
+			m.commandMessage = fmt.Sprintf(
+				"loaded %d %s in namespace %s",
+				len(m.resourceList.Items),
+				m.resourceList.Resource,
+				m.resourceList.Namespace,
+			)
+		}
 		return m, nil
 	case listFailedMsg:
 		if msg.seq != m.activeSeq {
 			return m, nil
 		}
 		m.loading = false
-		m.commandMessage = fmt.Sprintf("load failed: %v", msg.err)
+		if msg.announce {
+			m.commandMessage = fmt.Sprintf("load failed: %v", msg.err)
+		}
 		return m, nil
 	case tea.KeyMsg:
 		if m.commandMode {
@@ -367,17 +389,35 @@ func (m model) startListReload() (tea.Model, tea.Cmd) {
 	m.loading = true
 
 	query := protocol.ResourceListQuery{
+		KubeContext:   m.session.KubeContext,
 		Resource:      m.session.Resource,
 		Namespace:     m.session.Namespace,
 		SimulateStale: m.simulateStale,
 	}
-	return m, m.loadListCmd(m.activeSeq, query)
+	return m, m.loadListCmd(m.activeSeq, query, true)
 }
 
-func (m model) loadListCmd(seq int, query protocol.ResourceListQuery) tea.Cmd {
+func (m model) startBackgroundReload() (tea.Model, tea.Cmd) {
+	m.requestSeq++
+	m.activeSeq = m.requestSeq
+
+	query := protocol.ResourceListQuery{
+		KubeContext:   m.session.KubeContext,
+		Resource:      m.session.Resource,
+		Namespace:     m.session.Namespace,
+		SimulateStale: m.simulateStale,
+	}
+	return m, m.loadListCmd(m.activeSeq, query, false)
+}
+
+func (m model) loadListCmd(seq int, query protocol.ResourceListQuery, announce bool) tea.Cmd {
 	if m.loadResourceList == nil {
 		return func() tea.Msg {
-			return listFailedMsg{seq: seq, err: fmt.Errorf("resource loader is not configured")}
+			return listFailedMsg{
+				seq:      seq,
+				err:      fmt.Errorf("resource loader is not configured"),
+				announce: announce,
+			}
 		}
 	}
 
@@ -387,10 +427,20 @@ func (m model) loadListCmd(seq int, query protocol.ResourceListQuery) tea.Cmd {
 
 		payload, err := m.loadResourceList(ctx, query)
 		if err != nil {
-			return listFailedMsg{seq: seq, err: err}
+			return listFailedMsg{seq: seq, err: err, announce: announce}
 		}
-		return listLoadedMsg{seq: seq, payload: payload}
+		return listLoadedMsg{seq: seq, payload: payload, announce: announce}
 	}
+}
+
+func (m model) schedulePoll() tea.Cmd {
+	interval := m.pollEvery
+	if interval <= 0 {
+		interval = defaultBackgroundRefreshInterval
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg {
+		return pollTickMsg{}
+	})
 }
 
 func (m model) View() string {
