@@ -27,3 +27,14 @@ func TestFriendlyKubeAccessErrorPreservesNonAuthErrors(t *testing.T) {
 		t.Fatalf("expected non-auth errors unchanged, got %q", msg)
 	}
 }
+
+func TestFriendlyKubeAccessErrorSuggestsTailscaleLogin(t *testing.T) {
+	err := errors.New(`Unauthorized: getting credentials via tailscale auth helper failed`)
+	msg := FriendlyKubeAccessError(err, "lab")
+	if !strings.Contains(strings.ToLower(msg), "authentication expired") {
+		t.Fatalf("expected auth-expiry guidance, got %q", msg)
+	}
+	if !strings.Contains(msg, "tailscale login") {
+		t.Fatalf("expected tailscale relogin hint, got %q", msg)
+	}
+}

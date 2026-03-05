@@ -56,6 +56,8 @@ func reloginHint(lower string) string {
 	switch {
 	case strings.Contains(lower, "tsh"):
 		return "tsh login"
+	case strings.Contains(lower, "tailscale") || strings.Contains(lower, "tailnet") || strings.Contains(lower, "tsnet"):
+		return "tailscale login"
 	case strings.Contains(lower, "aws") && strings.Contains(lower, "sso"):
 		return "aws sso login"
 	case strings.Contains(lower, "gcloud"):
