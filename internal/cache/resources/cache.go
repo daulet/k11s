@@ -15,10 +15,20 @@ const (
 	defaultRefreshInterval = 3 * time.Second
 	defaultStaleAfter      = 12 * time.Second
 	defaultFetchTimeout    = 1500 * time.Millisecond
+	defaultWatchRetryDelay = 2 * time.Second
 )
 
 type Fetcher interface {
 	List(ctx context.Context, query protocol.ResourceListQuery) ([]protocol.ResourceItem, error)
+}
+
+type Watcher interface {
+	Watch(
+		ctx context.Context,
+		query protocol.ResourceListQuery,
+		onUpdate func(items []protocol.ResourceItem),
+		onError func(error),
+	) error
 }
 
 type Cache struct {
@@ -27,11 +37,13 @@ type Cache struct {
 	mu              sync.Mutex
 	entries         map[cacheKey]*cacheEntry
 	fetcher         Fetcher
+	watcher         Watcher
 	logger          *log.Logger
 	now             func() time.Time
 	refreshInterval time.Duration
 	staleAfter      time.Duration
 	fetchTimeout    time.Duration
+	watchRetryDelay time.Duration
 }
 
 type cacheKey struct {
@@ -45,6 +57,7 @@ type cacheEntry struct {
 	lastSync   time.Time
 	refreshing bool
 	lastErr    string
+	watching   bool
 }
 
 func New(ctx context.Context, fetcher Fetcher, logger *log.Logger) *Cache {
@@ -55,15 +68,22 @@ func New(ctx context.Context, fetcher Fetcher, logger *log.Logger) *Cache {
 		fetcher = noopFetcher{}
 	}
 
+	var watcher Watcher
+	if typedWatcher, ok := fetcher.(Watcher); ok {
+		watcher = typedWatcher
+	}
+
 	return &Cache{
 		ctx:             ctx,
 		entries:         map[cacheKey]*cacheEntry{},
 		fetcher:         fetcher,
+		watcher:         watcher,
 		logger:          logger,
 		now:             time.Now,
 		refreshInterval: defaultRefreshInterval,
 		staleAfter:      defaultStaleAfter,
 		fetchTimeout:    defaultFetchTimeout,
+		watchRetryDelay: defaultWatchRetryDelay,
 	}
 }
 
@@ -83,7 +103,11 @@ func (c *Cache) Get(query protocol.ResourceListQuery) protocol.ResourceListPaylo
 		c.entries[key] = entry
 	}
 
-	if c.shouldRefresh(entry, now) {
+	if c.watcher != nil && !entry.watching {
+		entry.watching = true
+		entry.refreshing = true
+		go c.watch(key, query)
+	} else if c.shouldRefresh(entry, now) {
 		entry.refreshing = true
 		go c.refresh(key, query)
 	}
@@ -95,6 +119,9 @@ func (c *Cache) Get(query protocol.ResourceListQuery) protocol.ResourceListPaylo
 }
 
 func (c *Cache) shouldRefresh(entry *cacheEntry, now time.Time) bool {
+	if entry.watching {
+		return false
+	}
 	if entry.refreshing {
 		return false
 	}
@@ -139,6 +166,78 @@ func (c *Cache) refresh(key cacheKey, query protocol.ResourceListQuery) {
 	c.mu.Unlock()
 }
 
+func (c *Cache) watch(key cacheKey, query protocol.ResourceListQuery) {
+	if c.watcher == nil {
+		return
+	}
+
+	onUpdate := func(items []protocol.ResourceItem) {
+		c.mu.Lock()
+		entry, ok := c.entries[key]
+		if !ok {
+			c.mu.Unlock()
+			return
+		}
+		entry.items = append([]protocol.ResourceItem(nil), items...)
+		entry.lastErr = ""
+		entry.lastSync = c.now()
+		entry.refreshing = false
+		c.mu.Unlock()
+	}
+
+	onError := func(err error) {
+		if err == nil {
+			return
+		}
+		c.mu.Lock()
+		entry, ok := c.entries[key]
+		if !ok {
+			c.mu.Unlock()
+			return
+		}
+		entry.lastErr = err.Error()
+		entry.refreshing = true
+		c.mu.Unlock()
+
+		if c.logger != nil {
+			c.logger.Printf(
+				"resource watch error (ctx=%s ns=%s resource=%s): %v",
+				query.KubeContext,
+				query.Namespace,
+				query.Resource,
+				err,
+			)
+		}
+	}
+
+	for {
+		err := c.watcher.Watch(c.ctx, query, onUpdate, onError)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			onError(err)
+		}
+
+		if c.ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			c.mu.Lock()
+			if entry, ok := c.entries[key]; ok {
+				entry.refreshing = false
+			}
+			c.mu.Unlock()
+			return
+		}
+
+		select {
+		case <-c.ctx.Done():
+			c.mu.Lock()
+			if entry, ok := c.entries[key]; ok {
+				entry.refreshing = false
+			}
+			c.mu.Unlock()
+			return
+		case <-time.After(c.watchRetryDelay):
+		}
+	}
+}
+
 func (c *Cache) buildPayload(
 	query protocol.ResourceListQuery,
 	entry *cacheEntry,
@@ -148,8 +247,11 @@ func (c *Cache) buildPayload(
 		State:              protocol.FreshnessStateCatchingUp,
 		SnapshotTimeUnixMs: 0,
 		AgeMs:              0,
-		WatchHealthy:       entry.lastErr == "",
+		WatchHealthy:       entry.lastErr == "" && !entry.lastSync.IsZero(),
 		Source:             "cache-cold",
+	}
+	if entry.watching {
+		meta.Source = "watch-cold"
 	}
 
 	if !entry.lastSync.IsZero() {
@@ -159,23 +261,38 @@ func (c *Cache) buildPayload(
 		meta.WatchHealthy = entry.lastErr == ""
 		meta.State = protocol.FreshnessStateLive
 		meta.Source = "cache"
+		if entry.watching {
+			meta.Source = "watch-cache"
+		}
 
 		if entry.refreshing {
 			meta.State = protocol.FreshnessStateCatchingUp
 			meta.Source = "cache-refreshing"
+			if entry.watching {
+				meta.Source = "watch-recovering"
+			}
 		}
 		if age >= c.staleAfter || entry.lastErr != "" {
 			meta.State = protocol.FreshnessStateStale
 			meta.Source = "cache-stale"
+			if entry.watching {
+				meta.Source = "watch-stale"
+			}
 			if entry.refreshing {
 				meta.State = protocol.FreshnessStateCatchingUp
 				meta.Source = "cache-recovering"
+				if entry.watching {
+					meta.Source = "watch-recovering"
+				}
 			}
 		}
 	} else if entry.lastErr != "" {
 		meta.State = protocol.FreshnessStateStale
 		meta.Source = "cache-cold-error"
 		meta.WatchHealthy = false
+		if entry.watching {
+			meta.Source = "watch-cold-error"
+		}
 	}
 
 	if query.SimulateStale {

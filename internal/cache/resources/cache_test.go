@@ -124,6 +124,42 @@ func TestCacheKeysIncludeKubeContext(t *testing.T) {
 	}
 }
 
+func TestCacheUsesWatcherWhenAvailable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fetcher := newChannelWatchFetcher()
+	cache := New(ctx, fetcher, nil)
+	query := protocol.ResourceListQuery{Resource: "pods", Namespace: "default"}
+
+	initial := cache.Get(query)
+	if initial.Freshness.State != protocol.FreshnessStateCatchingUp {
+		t.Fatalf("expected cold state CATCHING_UP, got %s", initial.Freshness.State)
+	}
+
+	fetcher.push([]protocol.ResourceItem{
+		{Name: "api-watch-0", Namespace: "default", Status: "Running"},
+	})
+
+	payload := waitForCondition(t, 350*time.Millisecond, func() (protocol.ResourceListPayload, bool) {
+		next := cache.Get(query)
+		return next, next.Freshness.State == protocol.FreshnessStateLive && len(next.Items) == 1
+	})
+
+	if payload.Items[0].Name != "api-watch-0" {
+		t.Fatalf("expected watch item api-watch-0, got %#v", payload.Items)
+	}
+	if payload.Freshness.Source != "watch-cache" {
+		t.Fatalf("expected watch source, got %q", payload.Freshness.Source)
+	}
+	if fetcher.watchCallCount() == 0 {
+		t.Fatalf("expected watcher to be called")
+	}
+	if fetcher.listCallCount() != 0 {
+		t.Fatalf("expected poll list path not to be used, listCalls=%d", fetcher.listCallCount())
+	}
+}
+
 func waitForCondition(
 	t *testing.T,
 	timeout time.Duration,
@@ -180,4 +216,60 @@ func (f *contextAwareFetcher) List(ctx context.Context, query protocol.ResourceL
 	return []protocol.ResourceItem{
 		{Name: name, Namespace: query.Namespace, Status: "Running"},
 	}, nil
+}
+
+type channelWatchFetcher struct {
+	mu        sync.Mutex
+	updates   chan []protocol.ResourceItem
+	watchRuns int
+	listRuns  int
+}
+
+func newChannelWatchFetcher() *channelWatchFetcher {
+	return &channelWatchFetcher{
+		updates: make(chan []protocol.ResourceItem, 8),
+	}
+}
+
+func (f *channelWatchFetcher) push(items []protocol.ResourceItem) {
+	f.updates <- append([]protocol.ResourceItem(nil), items...)
+}
+
+func (f *channelWatchFetcher) watchCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.watchRuns
+}
+
+func (f *channelWatchFetcher) listCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listRuns
+}
+
+func (f *channelWatchFetcher) List(context.Context, protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
+	f.mu.Lock()
+	f.listRuns++
+	f.mu.Unlock()
+	return nil, errors.New("list should not be used when watcher is available")
+}
+
+func (f *channelWatchFetcher) Watch(
+	ctx context.Context,
+	_ protocol.ResourceListQuery,
+	onUpdate func(items []protocol.ResourceItem),
+	_ func(error),
+) error {
+	f.mu.Lock()
+	f.watchRuns++
+	f.mu.Unlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case update := <-f.updates:
+			onUpdate(update)
+		}
+	}
 }

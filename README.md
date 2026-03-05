@@ -32,7 +32,7 @@ Primary goals:
 - Daemon handshake enforces RPC version compatibility.
 - If daemon version differs from client version, `k11s` requests graceful daemon shutdown and starts a matching daemon.
 - Session state is persisted by daemon and restored on launch.
-- Daemon serves `pods`, `services`, and `deployments` from an async cache refreshed via `client-go` in the background.
+- Daemon serves `pods`, `services`, and `deployments` from a watch-backed cache with relist recovery.
 - Namespace autocomplete is loaded via daemon RPC and refreshed per selected kube context.
 - Other resources currently use placeholder responses with freshness metadata.
 - Status bar renders freshness badge, age, snapshot time, source, and watch health.

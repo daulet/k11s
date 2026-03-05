@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/daulet/k11s/internal/protocol"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 )
 
 type ResourceFetcher struct {
@@ -67,6 +69,181 @@ func (f *ResourceFetcher) List(ctx context.Context, query protocol.ResourceListQ
 	}
 
 	return nil, fmt.Errorf("unsupported resource %q", resource)
+}
+
+func (f *ResourceFetcher) Watch(
+	ctx context.Context,
+	query protocol.ResourceListQuery,
+	onUpdate func(items []protocol.ResourceItem),
+	onError func(error),
+) error {
+	resource := strings.ToLower(strings.TrimSpace(query.Resource))
+	if !IsCoreResource(resource) {
+		return fmt.Errorf("resource %q is not in phase-1 core set", resource)
+	}
+	if onUpdate == nil {
+		onUpdate = func([]protocol.ResourceItem) {}
+	}
+	if onError == nil {
+		onError = func(error) {}
+	}
+
+	apiNamespace, displayNamespace := resolveListNamespace(query.Namespace)
+
+	client, err := f.clients.ClientForContext(query.KubeContext)
+	if err != nil {
+		return err
+	}
+
+	switch resource {
+	case "pods":
+		return runListWatchLoop(
+			ctx,
+			func() ([]protocol.ResourceItem, string, error) {
+				pods, err := client.CoreV1().Pods(apiNamespace).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					return nil, "", fmt.Errorf("list pods for namespace %q: %w", displayNamespace, err)
+				}
+				return podsToItems(pods.Items), pods.ResourceVersion, nil
+			},
+			func(resourceVersion string) (watch.Interface, error) {
+				return client.CoreV1().Pods(apiNamespace).Watch(ctx, metav1.ListOptions{
+					ResourceVersion:     resourceVersion,
+					AllowWatchBookmarks: true,
+				})
+			},
+			onUpdate,
+			onError,
+		)
+	case "services":
+		return runListWatchLoop(
+			ctx,
+			func() ([]protocol.ResourceItem, string, error) {
+				services, err := client.CoreV1().Services(apiNamespace).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					return nil, "", fmt.Errorf("list services for namespace %q: %w", displayNamespace, err)
+				}
+				return servicesToItems(services.Items), services.ResourceVersion, nil
+			},
+			func(resourceVersion string) (watch.Interface, error) {
+				return client.CoreV1().Services(apiNamespace).Watch(ctx, metav1.ListOptions{
+					ResourceVersion:     resourceVersion,
+					AllowWatchBookmarks: true,
+				})
+			},
+			onUpdate,
+			onError,
+		)
+	case "deployments":
+		return runListWatchLoop(
+			ctx,
+			func() ([]protocol.ResourceItem, string, error) {
+				deployments, err := client.AppsV1().Deployments(apiNamespace).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					return nil, "", fmt.Errorf("list deployments for namespace %q: %w", displayNamespace, err)
+				}
+				return deploymentsToItems(deployments.Items), deployments.ResourceVersion, nil
+			},
+			func(resourceVersion string) (watch.Interface, error) {
+				return client.AppsV1().Deployments(apiNamespace).Watch(ctx, metav1.ListOptions{
+					ResourceVersion:     resourceVersion,
+					AllowWatchBookmarks: true,
+				})
+			},
+			onUpdate,
+			onError,
+		)
+	default:
+		return fmt.Errorf("unsupported resource %q", resource)
+	}
+}
+
+func runListWatchLoop(
+	ctx context.Context,
+	listFn func() ([]protocol.ResourceItem, string, error),
+	watchFn func(resourceVersion string) (watch.Interface, error),
+	onUpdate func([]protocol.ResourceItem),
+	onError func(error),
+) error {
+	items, resourceVersion, err := listFn()
+	if err != nil {
+		return err
+	}
+	onUpdate(items)
+
+	retryDelay := 500 * time.Millisecond
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		stream, err := watchFn(resourceVersion)
+		if err != nil {
+			onError(err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(retryDelay):
+			}
+			continue
+		}
+
+		relist := false
+		for !relist {
+			select {
+			case <-ctx.Done():
+				stream.Stop()
+				return nil
+			case event, ok := <-stream.ResultChan():
+				if !ok {
+					relist = true
+					continue
+				}
+
+				switch event.Type {
+				case watch.Bookmark:
+					if object, ok := event.Object.(metav1.Object); ok {
+						if rv := object.GetResourceVersion(); rv != "" {
+							resourceVersion = rv
+						}
+					}
+					continue
+				case watch.Error:
+					onError(fmt.Errorf("watch stream returned error event"))
+					relist = true
+					continue
+				default:
+					if object, ok := event.Object.(metav1.Object); ok {
+						if rv := object.GetResourceVersion(); rv != "" {
+							resourceVersion = rv
+						}
+					}
+					nextItems, nextResourceVersion, err := listFn()
+					if err != nil {
+						onError(err)
+						relist = true
+						continue
+					}
+					resourceVersion = nextResourceVersion
+					onUpdate(nextItems)
+				}
+			}
+		}
+
+		stream.Stop()
+		nextItems, nextResourceVersion, err := listFn()
+		if err != nil {
+			onError(err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(retryDelay):
+			}
+			continue
+		}
+		resourceVersion = nextResourceVersion
+		onUpdate(nextItems)
+	}
 }
 
 func podsToItems(pods []corev1.Pod) []protocol.ResourceItem {
