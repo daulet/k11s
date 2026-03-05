@@ -385,6 +385,10 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.acceptAutocomplete()
 		return m, nil
 	case key.Matches(msg, m.keys.Apply):
+		if m.autocomplete.active {
+			m.acceptAutocomplete()
+			return m, nil
+		}
 		commandText := strings.TrimSpace(m.input.Value())
 		previousContext := m.session.KubeContext
 		m.commandMode = false

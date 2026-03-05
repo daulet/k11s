@@ -67,7 +67,8 @@ TUI keybindings:
 - `j` / `k` or arrow keys: move selection
 - `q`: quit (current selection is persisted into session)
 - `:`: open command line
-- In command mode autocomplete: `tab` expands/cycles suggestions, `->` accepts current suggestion, `esc` clears suggestion.
+- In command mode autocomplete: `tab` expands/cycles suggestions, `enter`/`->` accepts current suggestion, `esc` clears suggestion.
+- In command mode without autocomplete: `enter` applies the typed command.
 
 TUI layout:
 - Top untitled input field (command line, `:` to activate)

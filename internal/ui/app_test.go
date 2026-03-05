@@ -349,7 +349,7 @@ func TestEscClearsAutocompleteWithoutClosingCommandMode(t *testing.T) {
 	}
 }
 
-func TestEnterAppliesTypedValueWhenAutocompleteIsActive(t *testing.T) {
+func TestEnterAcceptsAutocompleteBeforeApplyingCommand(t *testing.T) {
 	var seen protocol.ResourceListQuery
 
 	m := newModel(Options{
@@ -388,19 +388,33 @@ func TestEnterAppliesTypedValueWhenAutocompleteIsActive(t *testing.T) {
 		t.Fatalf("expected autocomplete active after tab")
 	}
 	updated, cmd := withAutocomplete.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	afterApply := updated.(model)
+	afterAccept := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected no reload command when enter only accepts autocomplete")
+	}
+	if !afterAccept.commandMode {
+		t.Fatalf("expected command mode to stay open after accepting autocomplete")
+	}
+	if got := afterAccept.input.Value(); got != "ctx mc1" {
+		t.Fatalf("expected enter to accept selected suggestion ctx mc1, got %q", got)
+	}
+	if afterAccept.autocomplete.active {
+		t.Fatalf("expected autocomplete to clear after accept")
+	}
 
+	updated, cmd = afterAccept.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterApply := updated.(model)
 	if afterApply.commandMode {
 		t.Fatalf("expected command mode closed after apply")
 	}
 	if cmd == nil {
-		t.Fatalf("expected reload command from enter apply")
+		t.Fatalf("expected reload command from second enter apply")
 	}
 	msg := cmd()
 	updated, _ = afterApply.Update(msg)
 	afterApply = updated.(model)
-	if seen.KubeContext != "mc" {
-		t.Fatalf("expected enter to apply typed context mc, got %q", seen.KubeContext)
+	if seen.KubeContext != "mc1" {
+		t.Fatalf("expected command to apply accepted context mc1, got %q", seen.KubeContext)
 	}
 }
 
