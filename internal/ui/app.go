@@ -145,22 +145,25 @@ type autocompleteState struct {
 }
 
 type keyMap struct {
-	Up           key.Binding
-	Down         key.Binding
-	JumpUp       key.Binding
-	JumpDown     key.Binding
-	Back         key.Binding
-	Forward      key.Binding
-	Detail       key.Binding
-	Command      key.Binding
-	Search       key.Binding
-	SearchNext   key.Binding
-	SearchPrev   key.Binding
-	Autocomplete key.Binding
-	ReverseTab   key.Binding
-	Accept       key.Binding
-	Apply        key.Binding
-	Quit         key.Binding
+	Up            key.Binding
+	Down          key.Binding
+	JumpUp        key.Binding
+	JumpDown      key.Binding
+	OpenNamespace key.Binding
+	OpenNode      key.Binding
+	OpenOwner     key.Binding
+	Back          key.Binding
+	Forward       key.Binding
+	Detail        key.Binding
+	Command       key.Binding
+	Search        key.Binding
+	SearchNext    key.Binding
+	SearchPrev    key.Binding
+	Autocomplete  key.Binding
+	ReverseTab    key.Binding
+	Accept        key.Binding
+	Apply         key.Binding
+	Quit          key.Binding
 }
 
 func defaultKeyMap() keyMap {
@@ -180,6 +183,18 @@ func defaultKeyMap() keyMap {
 		JumpDown: key.NewBinding(
 			key.WithKeys("pgdown", "ctrl+d"),
 			key.WithHelp("pgdn/ctrl+d", "jump down"),
+		),
+		OpenNamespace: key.NewBinding(
+			key.WithKeys("s"),
+			key.WithHelp("s", "namespace"),
+		),
+		OpenNode: key.NewBinding(
+			key.WithKeys("v"),
+			key.WithHelp("v", "node"),
+		),
+		OpenOwner: key.NewBinding(
+			key.WithKeys("o"),
+			key.WithHelp("o", "owner"),
 		),
 		Back: key.NewBinding(
 			key.WithKeys("ctrl+o", "alt+left"),
@@ -236,6 +251,9 @@ func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{
 		k.Up,
 		k.JumpDown,
+		k.OpenNamespace,
+		k.OpenNode,
+		k.OpenOwner,
 		k.Back,
 		k.Forward,
 		k.Detail,
@@ -256,6 +274,9 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		k.Down,
 		k.JumpUp,
 		k.JumpDown,
+		k.OpenNamespace,
+		k.OpenNode,
+		k.OpenOwner,
 		k.Back,
 		k.Forward,
 		k.Detail,
@@ -713,6 +734,12 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.startDetailReload(true)
+	case key.Matches(msg, m.keys.OpenNamespace):
+		return m.navigateSelectedColumn("namespace", "shortcut")
+	case key.Matches(msg, m.keys.OpenNode):
+		return m.navigateSelectedColumn("node", "shortcut")
+	case key.Matches(msg, m.keys.OpenOwner):
+		return m.navigateSelectedColumn("owner", "shortcut")
 	case key.Matches(msg, m.keys.JumpUp):
 		m.jumpSelection(-10)
 	case key.Matches(msg, m.keys.JumpDown):
@@ -779,11 +806,29 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	}
 
 	item := m.resourceList.Items[itemIndex]
+	return m.navigateItemColumn(item, clickedColumn, "click")
+}
+
+func (m model) navigateSelectedColumn(column string, via string) (tea.Model, tea.Cmd) {
+	item, ok := m.currentItem()
+	if !ok {
+		m.commandMessage = "no selected item"
+		return m, nil
+	}
+	return m.navigateItemColumn(item, column, via)
+}
+
+func (m model) navigateItemColumn(item protocol.ResourceItem, column string, via string) (tea.Model, tea.Cmd) {
 	previousSession := m.session
-	switch clickedColumn {
+	switch column {
 	case "namespace":
 		namespace := strings.TrimSpace(item.Namespace)
-		if namespace == "" || namespace == "-" || strings.EqualFold(namespace, "<cluster>") || strings.EqualFold(namespace, m.session.Namespace) {
+		if namespace == "" || namespace == "-" || strings.EqualFold(namespace, "<cluster>") {
+			m.commandMessage = "namespace is not clickable on selected row"
+			return m, nil
+		}
+		if strings.EqualFold(namespace, m.session.Namespace) {
+			m.commandMessage = "already in namespace " + namespace
 			return m, nil
 		}
 		m.session.Namespace = namespace
@@ -791,11 +836,12 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.pushNavigationHistory(previousSession)
 		m.clearDetail()
 		m.clearFlashingItems()
-		m.commandMessage = "namespace switched to " + namespace + " via click"
+		m.commandMessage = "namespace switched to " + namespace + " via " + via
 		return m.startListReload()
 	case "node":
 		node := strings.TrimSpace(item.Node)
-		if node == "" {
+		if node == "" || node == "-" {
+			m.commandMessage = "node is not clickable on selected row"
 			return m, nil
 		}
 		m.session.Resource = "nodes"
@@ -803,7 +849,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.pushNavigationHistory(previousSession)
 		m.clearDetail()
 		m.clearFlashingItems()
-		m.commandMessage = "opened node " + node + " via click"
+		m.commandMessage = "opened node " + node + " via " + via
 		return m.startListReload()
 	case "owner":
 		resource, ownerSelection, ok := ownerNavigation(item.OwnerKind, item.OwnerName)
@@ -822,7 +868,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.pushNavigationHistory(previousSession)
 		m.clearDetail()
 		m.clearFlashingItems()
-		m.commandMessage = fmt.Sprintf("opened owner %s/%s via click", item.OwnerKind, ownerSelection)
+		m.commandMessage = fmt.Sprintf("opened owner %s/%s via %s", item.OwnerKind, ownerSelection, via)
 		return m.startListReload()
 	default:
 		return m, nil
@@ -1763,7 +1809,7 @@ func (m model) renderInputBox(width int) string {
 }
 
 func (m model) renderMainPane(width int, innerHeight int) string {
-	title := m.styles.Title.Render(fmt.Sprintf("%s > %s > %s", displayContext(m.session), displayNamespace(m.session), displayResource(m.session)))
+	title := m.styles.Title.Render(m.mainPaneTitle())
 	if len(m.resourceList.Items) == 0 {
 		innerWidth := width - 2
 		if innerWidth < 1 {
@@ -1779,6 +1825,43 @@ func (m model) renderMainPane(width int, innerHeight int) string {
 		return drawBox(width, title, lines, innerHeight)
 	}
 	return drawBox(width, title, m.listLines(), innerHeight)
+}
+
+func (m model) mainPaneTitle() string {
+	contextText := displayContext(m.session)
+	resourceText := displayResource(m.session)
+	if !m.mainPaneUsesNamespace() {
+		return fmt.Sprintf("%s > %s", contextText, resourceText)
+	}
+	return fmt.Sprintf("%s > %s > %s", contextText, displayNamespace(m.session), resourceText)
+}
+
+func (m model) mainPaneUsesNamespace() bool {
+	resource := strings.ToLower(strings.TrimSpace(m.session.Resource))
+	switch resource {
+	case "nodes", "namespaces", "crds":
+		return false
+	case "crs":
+		return m.crsViewUsesNamespace()
+	default:
+		return true
+	}
+}
+
+func (m model) crsViewUsesNamespace() bool {
+	if !strings.EqualFold(strings.TrimSpace(m.resourceList.Resource), "crs") {
+		return true
+	}
+	if len(m.resourceList.Items) == 0 {
+		return true
+	}
+	for _, item := range m.resourceList.Items {
+		namespace := strings.TrimSpace(item.Namespace)
+		if namespace != "" && namespace != "-" && !strings.EqualFold(namespace, "<cluster>") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m model) listLines() []string {
@@ -2121,8 +2204,88 @@ func splitLongWord(value string, width int) []string {
 
 func (m model) renderFooter(width int) string {
 	left := buildStatusAgeBlocks(m.resourceList.Freshness, m.styles)
-	right := m.styles.Legend.Render(m.help.ShortHelpView(m.keys.ShortHelp()))
+	right := m.styles.Legend.Render(strings.Join(m.legendHints(), "  "))
 	return alignLeftRight(left, right, width)
+}
+
+func (m model) legendHints() []string {
+	if m.commandMode {
+		if m.autocomplete.active {
+			return []string{
+				"tab next",
+				"S-tab prev",
+				"↑/↓ cycle",
+				"→ accept",
+				"enter run",
+				"esc clear",
+				"q quit",
+			}
+		}
+		return []string{
+			"tab complete",
+			"enter run",
+			"esc close",
+			"q quit",
+		}
+	}
+
+	if m.searchMode {
+		return []string{
+			"enter apply",
+			"esc cancel",
+			"q quit",
+		}
+	}
+
+	hints := make([]string, 0, 10)
+	if m.canNavigateSelectedNamespace() {
+		hints = append(hints, "s namespace")
+	}
+	if m.canNavigateSelectedNode() {
+		hints = append(hints, "v node")
+	}
+	if m.canNavigateSelectedOwner() {
+		hints = append(hints, "o owner")
+	}
+	hints = append(hints,
+		"enter detail",
+		": cmd",
+		"/ search",
+		"C-o back",
+		"C-y forward",
+		"q quit",
+	)
+	return hints
+}
+
+func (m model) canNavigateSelectedNamespace() bool {
+	item, ok := m.currentItem()
+	if !ok {
+		return false
+	}
+	namespace := strings.TrimSpace(item.Namespace)
+	if namespace == "" || namespace == "-" || strings.EqualFold(namespace, "<cluster>") {
+		return false
+	}
+	return !strings.EqualFold(namespace, m.session.Namespace)
+}
+
+func (m model) canNavigateSelectedNode() bool {
+	item, ok := m.currentItem()
+	if !ok {
+		return false
+	}
+	node := strings.TrimSpace(item.Node)
+	return node != "" && node != "-"
+}
+
+func (m model) canNavigateSelectedOwner() bool {
+	item, ok := m.currentItem()
+	if !ok {
+		return false
+	}
+	_, _, ok = ownerNavigation(item.OwnerKind, item.OwnerName)
+	return ok
 }
 
 func buildStatusAgeBlocks(meta protocol.FreshnessMeta, s styles) string {
@@ -2717,7 +2880,6 @@ func (m model) crdCandidates() []string {
 		seen[value] = struct{}{}
 		values = append(values, value)
 	}
-
 	appendUnique(m.session.Filter)
 	for _, value := range m.crdSuggestions {
 		appendUnique(value)

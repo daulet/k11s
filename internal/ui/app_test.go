@@ -1337,7 +1337,7 @@ func TestRenderMainPaneTitleUsesClusterScopeForNodes(t *testing.T) {
 	})
 
 	mainPane := m.renderMainPane(80, 8)
-	if !strings.Contains(mainPane, "dev-cluster > <cluster> > nodes") {
+	if !strings.Contains(mainPane, "dev-cluster > nodes") {
 		t.Fatalf("expected cluster-scoped title for nodes, got %q", mainPane)
 	}
 }
@@ -1356,8 +1356,73 @@ func TestRenderMainPaneTitleUsesClusterScopeForNamespaces(t *testing.T) {
 	})
 
 	mainPane := m.renderMainPane(80, 8)
-	if !strings.Contains(mainPane, "dev-cluster > <cluster> > namespaces") {
+	if !strings.Contains(mainPane, "dev-cluster > namespaces") {
 		t.Fatalf("expected cluster-scoped title for namespaces, got %q", mainPane)
+	}
+}
+
+func TestRenderMainPaneTitleUsesNamespaceForPods(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "payments",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "payments",
+		},
+	})
+
+	mainPane := m.renderMainPane(80, 8)
+	if !strings.Contains(mainPane, "dev-cluster > payments > pods") {
+		t.Fatalf("expected namespaced title for pods, got %q", mainPane)
+	}
+}
+
+func TestRenderMainPaneTitleUsesClusterScopeForClusterScopedCRs(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "payments",
+			Resource:    "crs",
+			Filter:      "widgets.example.com",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "crs",
+			Namespace: "payments",
+			Items: []protocol.ResourceItem{
+				{Name: "cluster-widget", Namespace: "-", Status: "Ready"},
+			},
+		},
+	})
+
+	mainPane := m.renderMainPane(80, 8)
+	if !strings.Contains(mainPane, "dev-cluster > crs(widgets.example.com)") {
+		t.Fatalf("expected cluster-scoped title for crs, got %q", mainPane)
+	}
+}
+
+func TestRenderMainPaneTitleUsesNamespaceForNamespacedCRs(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "payments",
+			Resource:    "crs",
+			Filter:      "widgets.example.com",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "crs",
+			Namespace: "payments",
+			Items: []protocol.ResourceItem{
+				{Name: "ns-widget", Namespace: "payments", Status: "Ready"},
+			},
+		},
+	})
+
+	mainPane := m.renderMainPane(80, 8)
+	if !strings.Contains(mainPane, "dev-cluster > payments > crs(widgets.example.com)") {
+		t.Fatalf("expected namespaced title for crs, got %q", mainPane)
 	}
 }
 
@@ -1716,6 +1781,202 @@ func TestMouseClickOwnerInPodRowOpensOwnerResource(t *testing.T) {
 	}
 	if final.resourceList.Resource != "deployments" {
 		t.Fatalf("expected deployments payload after owner click navigation, got %q", final.resourceList.Resource)
+	}
+}
+
+func TestShortcutNamespaceInPodRowSwitchesNamespace(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "payments", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: query.Namespace, Status: "Running"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	next := updated.(model)
+	if !next.loading {
+		t.Fatalf("expected loading after namespace shortcut")
+	}
+	if next.session.Namespace != "payments" {
+		t.Fatalf("expected namespace to switch via shortcut, got %q", next.session.Namespace)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command after namespace shortcut")
+	}
+
+	msgOut := cmd()
+	updated, _ = next.Update(msgOut)
+	final := updated.(model)
+	if seen.Namespace != "payments" {
+		t.Fatalf("expected list query namespace payments, got %q", seen.Namespace)
+	}
+	if final.resourceList.Namespace != "payments" {
+		t.Fatalf("expected refreshed namespace payments, got %q", final.resourceList.Namespace)
+	}
+}
+
+func TestShortcutNodeInPodRowOpensNodesView(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	next := updated.(model)
+	if !next.loading {
+		t.Fatalf("expected loading after node shortcut")
+	}
+	if next.session.Resource != "nodes" {
+		t.Fatalf("expected resource to switch to nodes via shortcut, got %q", next.session.Resource)
+	}
+	if next.session.Selection != "node-a" {
+		t.Fatalf("expected selection node-a via shortcut, got %q", next.session.Selection)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command after node shortcut")
+	}
+
+	msgOut := cmd()
+	updated, _ = next.Update(msgOut)
+	final := updated.(model)
+	if seen.Resource != "nodes" || seen.Namespace != "all" {
+		t.Fatalf("expected nodes/all query after shortcut, got %#v", seen)
+	}
+	if final.resourceList.Resource != "nodes" {
+		t.Fatalf("expected nodes payload after shortcut navigation, got %q", final.resourceList.Resource)
+	}
+}
+
+func TestShortcutOwnerInPodRowOpensOwnerResource(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api-7fd6", Namespace: "payments", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-6c9d4f6d56"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: query.Namespace, Status: "Available"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	next := updated.(model)
+	if !next.loading {
+		t.Fatalf("expected loading after owner shortcut")
+	}
+	if next.session.Resource != "deployments" {
+		t.Fatalf("expected owner shortcut to open deployments, got %q", next.session.Resource)
+	}
+	if next.session.Selection != "api" {
+		t.Fatalf("expected owner-derived selection api, got %q", next.session.Selection)
+	}
+	if next.session.Namespace != "payments" {
+		t.Fatalf("expected owner shortcut to carry item namespace payments, got %q", next.session.Namespace)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command after owner shortcut")
+	}
+
+	msgOut := cmd()
+	updated, _ = next.Update(msgOut)
+	final := updated.(model)
+	if seen.Resource != "deployments" || seen.Namespace != "payments" {
+		t.Fatalf("expected deployments/payments query after owner shortcut, got %#v", seen)
+	}
+	if final.resourceList.Resource != "deployments" {
+		t.Fatalf("expected deployments payload after owner shortcut navigation, got %q", final.resourceList.Resource)
+	}
+}
+
+func TestFooterLegendShowsContextualHintsWithoutMoveJump(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "payments", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	footer := m.renderFooter(180)
+	if strings.Contains(footer, "move") || strings.Contains(footer, "jump") {
+		t.Fatalf("expected footer legend to omit trivial navigation hints, got %q", footer)
+	}
+	for _, expected := range []string{"s namespace", "v node", "o owner", ": cmd", "enter detail"} {
+		if !strings.Contains(footer, expected) {
+			t.Fatalf("expected footer legend to contain %q, got %q", expected, footer)
+		}
 	}
 }
 

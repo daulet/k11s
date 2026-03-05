@@ -72,6 +72,10 @@ TUI keybindings:
 - `enter` (normal mode): load detail for selected row from daemon cache
 - `q`: quit (current selection is persisted into session)
 - `:`: open command line
+- Contextual row shortcuts (shown in footer when available):
+  - `s`: open selected row namespace
+  - `v`: open selected row node
+  - `o`: open selected row owner resource
 - Mouse left-click in pod rows:
   - `NAMESPACE` switches namespace
   - `NODE` opens `nodes` view
@@ -85,7 +89,7 @@ TUI layout:
 - Middle large bordered pane titled with `context > namespace > resource`
 - Bottom single row:
   - Left: status box + age box
-  - Right: keyboard legend
+  - Right: contextual keyboard legend for current mode/row
 - For cluster-scoped resources (`nodes`, `namespaces`, `crds`), the middle segment renders as `<cluster>`.
 
 Command line examples:
