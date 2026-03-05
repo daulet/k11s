@@ -38,10 +38,7 @@ func (f *ResourceFetcher) List(ctx context.Context, query protocol.ResourceListQ
 		return nil, fmt.Errorf("resource %q is not in phase-1 core set", resource)
 	}
 
-	namespace := strings.TrimSpace(query.Namespace)
-	if namespace == "" {
-		namespace = "default"
-	}
+	apiNamespace, displayNamespace := resolveListNamespace(query.Namespace)
 
 	client, err := f.clients.ClientForContext(query.KubeContext)
 	if err != nil {
@@ -50,21 +47,21 @@ func (f *ResourceFetcher) List(ctx context.Context, query protocol.ResourceListQ
 
 	switch resource {
 	case "pods":
-		pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		pods, err := client.CoreV1().Pods(apiNamespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("list pods for namespace %q: %w", namespace, err)
+			return nil, fmt.Errorf("list pods for namespace %q: %w", displayNamespace, err)
 		}
 		return podsToItems(pods.Items), nil
 	case "services":
-		services, err := client.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
+		services, err := client.CoreV1().Services(apiNamespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("list services for namespace %q: %w", namespace, err)
+			return nil, fmt.Errorf("list services for namespace %q: %w", displayNamespace, err)
 		}
 		return servicesToItems(services.Items), nil
 	case "deployments":
-		deployments, err := client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+		deployments, err := client.AppsV1().Deployments(apiNamespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("list deployments for namespace %q: %w", namespace, err)
+			return nil, fmt.Errorf("list deployments for namespace %q: %w", displayNamespace, err)
 		}
 		return deploymentsToItems(deployments.Items), nil
 	}
@@ -136,4 +133,15 @@ func sortResourceItems(items []protocol.ResourceItem) {
 		}
 		return items[i].Namespace < items[j].Namespace
 	})
+}
+
+func resolveListNamespace(namespace string) (apiNamespace string, displayNamespace string) {
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		return "default", "default"
+	}
+	if strings.EqualFold(namespace, "all") {
+		return metav1.NamespaceAll, "all"
+	}
+	return namespace, namespace
 }

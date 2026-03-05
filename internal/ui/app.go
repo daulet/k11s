@@ -75,11 +75,18 @@ type namespacesFailedMsg struct {
 	err         error
 }
 
+type autocompleteState struct {
+	active  bool
+	options []string
+	index   int
+}
+
 type keyMap struct {
 	Up           key.Binding
 	Down         key.Binding
 	Command      key.Binding
 	Autocomplete key.Binding
+	Accept       key.Binding
 	Apply        key.Binding
 	Quit         key.Binding
 }
@@ -102,6 +109,10 @@ func defaultKeyMap() keyMap {
 			key.WithKeys("tab"),
 			key.WithHelp("tab", "complete"),
 		),
+		Accept: key.NewBinding(
+			key.WithKeys("right"),
+			key.WithHelp("->", "accept"),
+		),
 		Apply: key.NewBinding(
 			key.WithKeys("enter"),
 			key.WithHelp("enter", "apply"),
@@ -114,53 +125,56 @@ func defaultKeyMap() keyMap {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Command, k.Autocomplete, k.Apply, k.Quit}
+	return []key.Binding{k.Up, k.Command, k.Autocomplete, k.Accept, k.Apply, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{{k.Up, k.Down, k.Command, k.Autocomplete, k.Apply, k.Quit}}
+	return [][]key.Binding{{k.Up, k.Down, k.Command, k.Autocomplete, k.Accept, k.Apply, k.Quit}}
 }
 
 type styles struct {
-	CommandHint   lipgloss.Style
-	CommandMsg    lipgloss.Style
-	Title         lipgloss.Style
-	SelectedRow   lipgloss.Style
-	Legend        lipgloss.Style
-	StatusLive    lipgloss.Style
-	StatusCatch   lipgloss.Style
-	StatusStale   lipgloss.Style
-	StatusUnknown lipgloss.Style
-	Age           lipgloss.Style
+	CommandHint    lipgloss.Style
+	CommandMsg     lipgloss.Style
+	CommandSuggest lipgloss.Style
+	Title          lipgloss.Style
+	SelectedRow    lipgloss.Style
+	Legend         lipgloss.Style
+	StatusLive     lipgloss.Style
+	StatusCatch    lipgloss.Style
+	StatusStale    lipgloss.Style
+	StatusUnknown  lipgloss.Style
+	Age            lipgloss.Style
 }
 
 func newStyles(useColor bool) styles {
 	if !useColor {
 		return styles{
-			CommandHint:   lipgloss.NewStyle().Faint(true),
-			CommandMsg:    lipgloss.NewStyle(),
-			Title:         lipgloss.NewStyle().Bold(true),
-			SelectedRow:   lipgloss.NewStyle().Bold(true),
-			Legend:        lipgloss.NewStyle().Faint(true),
-			StatusLive:    lipgloss.NewStyle().Bold(true),
-			StatusCatch:   lipgloss.NewStyle().Bold(true),
-			StatusStale:   lipgloss.NewStyle().Bold(true),
-			StatusUnknown: lipgloss.NewStyle().Bold(true),
-			Age:           lipgloss.NewStyle().Bold(true),
+			CommandHint:    lipgloss.NewStyle().Faint(true),
+			CommandMsg:     lipgloss.NewStyle(),
+			CommandSuggest: lipgloss.NewStyle().Bold(true),
+			Title:          lipgloss.NewStyle().Bold(true),
+			SelectedRow:    lipgloss.NewStyle().Bold(true),
+			Legend:         lipgloss.NewStyle().Faint(true),
+			StatusLive:     lipgloss.NewStyle().Bold(true),
+			StatusCatch:    lipgloss.NewStyle().Bold(true),
+			StatusStale:    lipgloss.NewStyle().Bold(true),
+			StatusUnknown:  lipgloss.NewStyle().Bold(true),
+			Age:            lipgloss.NewStyle().Bold(true),
 		}
 	}
 
 	return styles{
-		CommandHint:   lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
-		CommandMsg:    lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
-		Title:         lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true),
-		SelectedRow:   lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Bold(true),
-		Legend:        lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
-		StatusLive:    lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("42")).Bold(true).Padding(0, 1),
-		StatusCatch:   lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("214")).Bold(true).Padding(0, 1),
-		StatusStale:   lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("160")).Bold(true).Padding(0, 1),
-		StatusUnknown: lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("245")).Bold(true).Padding(0, 1),
-		Age:           lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("63")).Bold(true).Padding(0, 1),
+		CommandHint:    lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
+		CommandMsg:     lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
+		CommandSuggest: lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true),
+		Title:          lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true),
+		SelectedRow:    lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Bold(true),
+		Legend:         lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
+		StatusLive:     lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("42")).Bold(true).Padding(0, 1),
+		StatusCatch:    lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("214")).Bold(true).Padding(0, 1),
+		StatusStale:    lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("160")).Bold(true).Padding(0, 1),
+		StatusUnknown:  lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("245")).Bold(true).Padding(0, 1),
+		Age:            lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("63")).Bold(true).Padding(0, 1),
 	}
 }
 
@@ -179,6 +193,7 @@ type model struct {
 	commandMode    bool
 	commandMessage string
 	suggestions    []string
+	autocomplete   autocompleteState
 
 	selected           int
 	loading            bool
@@ -217,6 +232,10 @@ func newModel(opts Options) model {
 	input.Placeholder = "ns default | ctx prod-cluster | services"
 	input.CharLimit = 256
 	input.Blur()
+	if opts.UseColor {
+		input.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		input.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Bold(true)
+	}
 
 	keys := defaultKeyMap()
 	h := help.New()
@@ -327,6 +346,7 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.SetValue("")
 		m.input.Focus()
 		m.suggestions = m.commandSuggestions("")
+		m.clearAutocomplete()
 		return m, nil
 	case key.Matches(msg, m.keys.Up):
 		if m.selected > 0 {
@@ -346,15 +366,25 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case msg.String() == "esc":
+		if m.autocomplete.active {
+			m.clearAutocomplete()
+			return m, nil
+		}
 		m.commandMode = false
 		m.input.Blur()
 		m.input.SetValue("")
 		m.suggestions = nil
+		m.clearAutocomplete()
 		return m, nil
 	case msg.String() == "ctrl+c":
 		return m, tea.Quit
 	case key.Matches(msg, m.keys.Autocomplete):
-		m.applyAutocomplete()
+		m.triggerAutocomplete()
+		return m, nil
+	case key.Matches(msg, m.keys.Accept):
+		if m.autocomplete.active {
+			m.acceptAutocomplete()
+		}
 		return m, nil
 	case key.Matches(msg, m.keys.Apply):
 		commandText := strings.TrimSpace(m.input.Value())
@@ -363,6 +393,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.Blur()
 		m.input.SetValue("")
 		m.suggestions = nil
+		m.clearAutocomplete()
 		if commandText == "" {
 			return m, nil
 		}
@@ -397,6 +428,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		m.suggestions = m.commandSuggestions(m.input.Value())
+		m.clearAutocomplete()
 		return m, cmd
 	}
 }
@@ -412,7 +444,11 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 		if len(fields) < 2 {
 			return false, "", false, fmt.Errorf("namespace value required: try `:ns default`")
 		}
-		m.session.Namespace = fields[1]
+		namespace := fields[1]
+		if strings.EqualFold(namespace, "all") {
+			namespace = "all"
+		}
+		m.session.Namespace = namespace
 		return true, fmt.Sprintf("namespace switched to %s", m.session.Namespace), true, nil
 	case "ctx", "context":
 		if len(fields) < 2 {
@@ -555,13 +591,15 @@ func (m model) View() string {
 }
 
 func (m model) renderInputBox(width int) string {
-	line := m.input.View()
+	line := m.renderCommandLine()
 	if !m.commandMode {
 		line = m.styles.CommandHint.Render(": press : to open command line")
 	}
 
 	secondary := ""
-	if m.commandMode && len(m.suggestions) > 0 {
+	if m.commandMode && m.autocomplete.active {
+		secondary = m.renderAutocompleteStatus()
+	} else if m.commandMode && len(m.suggestions) > 0 {
 		secondary = m.styles.CommandHint.Render("autocomplete: " + strings.Join(limitSuggestions(m.suggestions, 5), "  "))
 	} else if m.commandMessage != "" {
 		secondary = m.styles.CommandMsg.Render(m.commandMessage)
@@ -768,52 +806,169 @@ func (m model) commandSuggestions(input string) []string {
 	}
 }
 
-func (m *model) applyAutocomplete() {
-	candidates := m.commandSuggestions(m.input.Value())
-	if len(candidates) == 0 {
+func (m *model) triggerAutocomplete() {
+	currentValue := m.input.Value()
+	options := m.autocompleteOptions(currentValue)
+	if len(options) == 0 {
+		m.clearAutocomplete()
 		return
 	}
 
-	choice := candidates[0]
-	value := m.input.Value()
+	lcp := longestCommonPrefix(options)
+	prefixChanged := false
+	if lcp != "" && len(lcp) > len(currentValue) {
+		m.input.SetValue(lcp)
+		m.input.CursorEnd()
+		currentValue = lcp
+		options = m.autocompleteOptions(currentValue)
+		prefixChanged = true
+	}
+	if len(options) == 0 {
+		m.clearAutocomplete()
+		return
+	}
+
+	if prefixChanged || !equalStringSlices(m.autocomplete.options, options) || !m.autocomplete.active {
+		m.autocomplete = autocompleteState{
+			active:  true,
+			options: options,
+			index:   0,
+		}
+		return
+	}
+
+	m.autocomplete.index = (m.autocomplete.index + 1) % len(m.autocomplete.options)
+}
+
+func (m *model) acceptAutocomplete() {
+	if !m.autocomplete.active || len(m.autocomplete.options) == 0 {
+		return
+	}
+	if m.autocomplete.index < 0 || m.autocomplete.index >= len(m.autocomplete.options) {
+		m.autocomplete.index = 0
+	}
+
+	m.input.SetValue(m.autocomplete.options[m.autocomplete.index])
+	m.input.CursorEnd()
+	m.suggestions = m.commandSuggestions(m.input.Value())
+	m.clearAutocomplete()
+}
+
+func (m *model) clearAutocomplete() {
+	m.autocomplete = autocompleteState{}
+}
+
+func (m model) renderCommandLine() string {
+	line := m.input.View()
+	if !m.commandMode || !m.autocomplete.active || len(m.autocomplete.options) == 0 {
+		return line
+	}
+
+	option := m.autocomplete.options[m.autocomplete.index]
+	tail := autocompleteTail(m.input.Value(), option)
+	if tail == "" {
+		return line
+	}
+	return line + m.styles.CommandSuggest.Render(tail)
+}
+
+func (m model) renderAutocompleteStatus() string {
+	if !m.autocomplete.active || len(m.autocomplete.options) == 0 {
+		return ""
+	}
+
+	current := m.autocomplete.options[m.autocomplete.index]
+	next := current
+	if len(m.autocomplete.options) > 1 {
+		next = m.autocomplete.options[(m.autocomplete.index+1)%len(m.autocomplete.options)]
+	}
+
+	currentTail := autocompleteTail(m.input.Value(), current)
+	if currentTail == "" {
+		currentTail = "<exact>"
+	}
+	nextTail := autocompleteTail(m.input.Value(), next)
+	if nextTail == "" {
+		nextTail = "<exact>"
+	}
+
+	if len(m.autocomplete.options) == 1 {
+		return m.styles.CommandHint.Render(
+			fmt.Sprintf("suggestion: %s   (-> accept, esc clear)", currentTail),
+		)
+	}
+
+	return m.styles.CommandHint.Render(
+		fmt.Sprintf(
+			"suggestion %d/%d: %s   next: %s   (tab cycle, -> accept, esc clear)",
+			m.autocomplete.index+1,
+			len(m.autocomplete.options),
+			currentTail,
+			nextTail,
+		),
+	)
+}
+
+func (m model) autocompleteOptions(input string) []string {
+	candidates := m.commandSuggestions(input)
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	value := input
 	trimmed := strings.TrimLeft(value, " ")
 	if strings.TrimSpace(trimmed) == "" {
-		m.input.SetValue(choice)
-		m.suggestions = m.commandSuggestions(m.input.Value())
-		return
+		return append([]string(nil), candidates...)
 	}
 
 	fields := strings.Fields(trimmed)
 	hasTrailingSpace := strings.HasSuffix(trimmed, " ")
 	if len(fields) == 0 {
-		return
+		return nil
 	}
 
+	options := make([]string, 0, len(candidates))
 	if len(fields) == 1 && !hasTrailingSpace {
-		newValue := choice
-		if choice == "ns" || choice == "namespace" || choice == "ctx" || choice == "context" || choice == "resource" {
-			newValue += " "
+		token := strings.ToLower(fields[0])
+		if prefersArgumentCompletion(token, candidates) {
+			valueCandidates := m.commandSuggestions(token + " ")
+			argumentOptions := make([]string, 0, len(valueCandidates))
+			for _, choice := range valueCandidates {
+				argumentOptions = append(argumentOptions, token+" "+choice)
+			}
+			return dedupeStrings(argumentOptions)
 		}
-		m.input.SetValue(newValue)
-		m.suggestions = m.commandSuggestions(m.input.Value())
-		return
+		for _, choice := range candidates {
+			newValue := choice
+			if choice == "ns" || choice == "namespace" || choice == "ctx" || choice == "context" || choice == "resource" {
+				newValue += " "
+			}
+			options = append(options, newValue)
+		}
+		return dedupeStrings(options)
 	}
 
 	if hasTrailingSpace {
-		m.input.SetValue(value + choice)
-	} else {
-		last := fields[len(fields)-1]
-		idx := strings.LastIndex(value, last)
-		if idx >= 0 {
-			m.input.SetValue(value[:idx] + choice)
+		for _, choice := range candidates {
+			options = append(options, value+choice)
 		}
+		return dedupeStrings(options)
 	}
-	m.suggestions = m.commandSuggestions(m.input.Value())
+
+	last := fields[len(fields)-1]
+	idx := strings.LastIndex(value, last)
+	if idx < 0 {
+		return nil
+	}
+	for _, choice := range candidates {
+		options = append(options, value[:idx]+choice)
+	}
+	return dedupeStrings(options)
 }
 
 func (m model) namespaceCandidates() []string {
 	seen := map[string]struct{}{}
-	candidates := []string{"default", "kube-system", "kube-public"}
+	candidates := []string{"all", "default", "kube-system", "kube-public"}
 
 	appendUnique := func(value string) {
 		if value == "" {
@@ -916,4 +1071,67 @@ func limitSuggestions(values []string, limit int) []string {
 		return values
 	}
 	return values[:limit]
+}
+
+func longestCommonPrefix(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	prefix := values[0]
+	for _, value := range values[1:] {
+		for !strings.HasPrefix(value, prefix) {
+			if len(prefix) == 0 {
+				return ""
+			}
+			prefix = prefix[:len(prefix)-1]
+		}
+	}
+	return prefix
+}
+
+func autocompleteTail(input string, option string) string {
+	if strings.HasPrefix(option, input) {
+		return option[len(input):]
+	}
+	return option
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func equalStringSlices(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func prefersArgumentCompletion(token string, commandCandidates []string) bool {
+	if token != "ns" && token != "namespace" && token != "ctx" && token != "context" && token != "resource" {
+		return false
+	}
+	if len(commandCandidates) < 2 {
+		return false
+	}
+	for _, candidate := range commandCandidates {
+		if strings.EqualFold(candidate, token) {
+			return true
+		}
+	}
+	return false
 }

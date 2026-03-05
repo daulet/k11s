@@ -95,3 +95,23 @@ func TestServicesToItems(t *testing.T) {
 		t.Fatalf("unexpected second item: %#v", items[1])
 	}
 }
+
+func TestResolveListNamespace(t *testing.T) {
+	tests := []struct {
+		in          string
+		wantAPI     string
+		wantDisplay string
+	}{
+		{in: "", wantAPI: "default", wantDisplay: "default"},
+		{in: "payments", wantAPI: "payments", wantDisplay: "payments"},
+		{in: "all", wantAPI: metav1.NamespaceAll, wantDisplay: "all"},
+		{in: "ALL", wantAPI: metav1.NamespaceAll, wantDisplay: "all"},
+	}
+
+	for _, tc := range tests {
+		apiNS, displayNS := resolveListNamespace(tc.in)
+		if apiNS != tc.wantAPI || displayNS != tc.wantDisplay {
+			t.Fatalf("input=%q expected (%q,%q) got (%q,%q)", tc.in, tc.wantAPI, tc.wantDisplay, apiNS, displayNS)
+		}
+	}
+}

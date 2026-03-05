@@ -67,6 +67,7 @@ TUI keybindings:
 - `j` / `k` or arrow keys: move selection
 - `q`: quit (current selection is persisted into session)
 - `:`: open command line
+- In command mode autocomplete: `tab` expands/cycles suggestions, `->` accepts current suggestion, `esc` clears suggestion.
 
 TUI layout:
 - Top untitled input field (command line, `:` to activate)
@@ -77,6 +78,7 @@ TUI layout:
 
 Command line examples:
 - `:ns payments` or `:namespace payments`
+- `:ns all` (all namespaces view)
 - `:ctx dev-cluster` or `:context dev-cluster`
 - `:pods`, `:services`, `:deployments` (switch resource view)
 
