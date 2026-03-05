@@ -768,6 +768,37 @@ func (m model) actionQueryFromCommand(input string) (protocol.ActionQuery, bool,
 			Name:          name,
 			Replicas:      &replicas,
 		}, true, nil
+	case "restart":
+		name, itemNamespace, err := m.actionTargetFromFields(fields[1:])
+		if err != nil {
+			return protocol.ActionQuery{}, true, err
+		}
+		return protocol.ActionQuery{
+			Action:        protocol.ActionRolloutRestart,
+			KubeContext:   m.session.KubeContext,
+			Resource:      m.session.Resource,
+			Namespace:     m.session.Namespace,
+			Filter:        m.session.Filter,
+			ItemNamespace: itemNamespace,
+			Name:          name,
+		}, true, nil
+	case "rollout":
+		if len(fields) < 2 || !strings.EqualFold(strings.TrimSpace(fields[1]), "restart") {
+			return protocol.ActionQuery{}, true, fmt.Errorf("rollout requires subcommand: try `:rollout restart`")
+		}
+		name, itemNamespace, err := m.actionTargetFromFields(fields[2:])
+		if err != nil {
+			return protocol.ActionQuery{}, true, err
+		}
+		return protocol.ActionQuery{
+			Action:        protocol.ActionRolloutRestart,
+			KubeContext:   m.session.KubeContext,
+			Resource:      m.session.Resource,
+			Namespace:     m.session.Namespace,
+			Filter:        m.session.Filter,
+			ItemNamespace: itemNamespace,
+			Name:          name,
+		}, true, nil
 	default:
 		return protocol.ActionQuery{}, false, nil
 	}
@@ -1503,6 +1534,19 @@ func (m model) commandSuggestions(input string) []string {
 			return nil
 		}
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
+	case "restart":
+		return prefixMatches(m.deleteCandidates(), valuePrefix)
+	case "rollout":
+		if len(fields) == 1 {
+			return prefixMatches([]string{"restart"}, valuePrefix)
+		}
+		if len(fields) == 2 && !hasTrailingSpace {
+			return prefixMatches([]string{"restart"}, valuePrefix)
+		}
+		if !strings.EqualFold(fields[1], "restart") {
+			return prefixMatches([]string{"restart"}, valuePrefix)
+		}
+		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "resource":
 		return prefixMatches(resourceSuggestions(), valuePrefix)
 	default:
@@ -1804,6 +1848,8 @@ func baseSuggestions() []string {
 		"delete",
 		"del",
 		"rm",
+		"restart",
+		"rollout",
 		"scale",
 		"ns",
 		"namespace",
@@ -1980,7 +2026,7 @@ func prefersArgumentCompletion(token string, commandCandidates []string) bool {
 
 func commandSupportsArgument(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
-	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm", "scale":
+	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm", "scale", "restart", "rollout":
 		return true
 	default:
 		return false

@@ -261,7 +261,7 @@ func executeAction(
 			Message: "action is required",
 		}
 	}
-	if query.Action != protocol.ActionDelete && query.Action != protocol.ActionScale {
+	if query.Action != protocol.ActionDelete && query.Action != protocol.ActionScale && query.Action != protocol.ActionRolloutRestart {
 		return protocol.ActionResult{
 			Success: false,
 			Code:    protocol.ActionCodeUnsupported,
@@ -313,6 +313,8 @@ func executeAction(
 		err = actionExecutor.Delete(ctx, query)
 	case protocol.ActionScale:
 		err = actionExecutor.Scale(ctx, query)
+	case protocol.ActionRolloutRestart:
+		err = actionExecutor.RolloutRestart(ctx, query)
 	default:
 		err = fmt.Errorf("%w: %s", kube.ErrUnsupportedActionResource, query.Action)
 	}
@@ -331,6 +333,8 @@ func executeAction(
 			replicas = *query.Replicas
 		}
 		successMessage = fmt.Sprintf("scaled %s %s to %d", query.Resource, target, replicas)
+	} else if query.Action == protocol.ActionRolloutRestart {
+		successMessage = fmt.Sprintf("rollout restart triggered for %s %s", query.Resource, target)
 	}
 	return protocol.ActionResult{
 		Success: true,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -123,6 +124,77 @@ func (e *ActionExecutor) Scale(ctx context.Context, query protocol.ActionQuery) 
 		}
 		scale.Spec.Replicas = *query.Replicas
 		_, err = client.AppsV1().StatefulSets(ns).UpdateScale(ctx, name, scale, metav1.UpdateOptions{})
+		return err
+	default:
+		return fmt.Errorf("%w: %s", ErrUnsupportedActionResource, resource)
+	}
+}
+
+func (e *ActionExecutor) RolloutRestart(ctx context.Context, query protocol.ActionQuery) error {
+	resource := strings.ToLower(strings.TrimSpace(query.Resource))
+	name := strings.TrimSpace(query.Name)
+	if name == "" {
+		return fmt.Errorf("%w: item name is required", ErrActionValidation)
+	}
+	restartedAt := time.Now().UTC().Format(time.RFC3339Nano)
+
+	switch resource {
+	case "deployments":
+		client, err := e.clients.ClientForContext(query.KubeContext)
+		if err != nil {
+			return err
+		}
+		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
+		if err != nil {
+			return err
+		}
+		item, err := client.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if item.Spec.Template.Annotations == nil {
+			item.Spec.Template.Annotations = map[string]string{}
+		}
+		item.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = restartedAt
+		_, err = client.AppsV1().Deployments(ns).Update(ctx, item, metav1.UpdateOptions{})
+		return err
+	case "statefulsets":
+		client, err := e.clients.ClientForContext(query.KubeContext)
+		if err != nil {
+			return err
+		}
+		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
+		if err != nil {
+			return err
+		}
+		item, err := client.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if item.Spec.Template.Annotations == nil {
+			item.Spec.Template.Annotations = map[string]string{}
+		}
+		item.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = restartedAt
+		_, err = client.AppsV1().StatefulSets(ns).Update(ctx, item, metav1.UpdateOptions{})
+		return err
+	case "daemonsets":
+		client, err := e.clients.ClientForContext(query.KubeContext)
+		if err != nil {
+			return err
+		}
+		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
+		if err != nil {
+			return err
+		}
+		item, err := client.AppsV1().DaemonSets(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if item.Spec.Template.Annotations == nil {
+			item.Spec.Template.Annotations = map[string]string{}
+		}
+		item.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = restartedAt
+		_, err = client.AppsV1().DaemonSets(ns).Update(ctx, item, metav1.UpdateOptions{})
 		return err
 	default:
 		return fmt.Errorf("%w: %s", ErrUnsupportedActionResource, resource)

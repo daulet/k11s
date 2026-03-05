@@ -132,6 +132,7 @@ const (
 
 const ActionDelete = "delete"
 const ActionScale = "scale"
+const ActionRolloutRestart = "rollout_restart"
 
 type ActionQuery struct {
 	Action        string `json:"action"`

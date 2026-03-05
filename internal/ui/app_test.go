@@ -330,6 +330,67 @@ func TestScaleCommandRequiresReplicas(t *testing.T) {
 	}
 }
 
+func TestRestartCommandRunsAction(t *testing.T) {
+	var actionSeen protocol.ActionQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "3/3"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadAction: func(_ context.Context, query protocol.ActionQuery) (protocol.ActionResult, error) {
+			actionSeen = query
+			return protocol.ActionResult{
+				Success: true,
+				Code:    protocol.ActionCodeOK,
+				Message: "rollout restart triggered for deployments default/api",
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: query.Namespace, Status: "3/3"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("rollout restart")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterApply := updated.(model)
+	if !afterApply.actionLoading {
+		t.Fatalf("expected restart action to start loading")
+	}
+	if cmd == nil {
+		t.Fatalf("expected action command for restart")
+	}
+
+	msg := cmd()
+	updated, _ = afterApply.Update(msg)
+	afterAction := updated.(model)
+	if afterAction.commandMessage != "rollout restart triggered for deployments default/api" {
+		t.Fatalf("unexpected restart command feedback: %q", afterAction.commandMessage)
+	}
+	if actionSeen.Action != protocol.ActionRolloutRestart || actionSeen.Name != "api" {
+		t.Fatalf("unexpected restart action query: %#v", actionSeen)
+	}
+}
+
 func TestApplyCommandCRsUsesSelectedCRDWhenInCRDView(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
