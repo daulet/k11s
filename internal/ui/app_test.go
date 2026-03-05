@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -912,6 +913,32 @@ func TestListLinesShowErrorWhenListFails(t *testing.T) {
 	}
 }
 
+func TestListLinesIncludeColumnHeaders(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	lines := m.listLines()
+	if len(lines) < 2 {
+		t.Fatalf("expected at least header and one row, got %#v", lines)
+	}
+	if !strings.Contains(lines[0], "NAME") || !strings.Contains(lines[0], "NAMESPACE") || !strings.Contains(lines[0], "STATUS") {
+		t.Fatalf("expected column headers in first row, got %q", lines[0])
+	}
+}
+
 func TestListLinesShowNoItemsLoadingState(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -1079,6 +1106,115 @@ func TestRenderMainPaneCentersNoItemsState(t *testing.T) {
 	}
 	if foundAt <= 2 {
 		t.Fatalf("expected centered no-items label, got line index %d in %q", foundAt, mainPane)
+	}
+}
+
+func TestSlashSearchAppliesSelection(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+				{Name: "worker", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	searching := updated.(model)
+	if !searching.searchMode {
+		t.Fatalf("expected search mode after /")
+	}
+	searching.input.SetValue("work")
+	updated, _ = searching.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	final := updated.(model)
+	if final.searchMode {
+		t.Fatalf("expected search mode closed after enter")
+	}
+	if final.searchQuery != "work" {
+		t.Fatalf("expected persisted search query work, got %q", final.searchQuery)
+	}
+	if final.currentSelection() != "worker" {
+		t.Fatalf("expected selection to move to worker, got %q", final.currentSelection())
+	}
+}
+
+func TestSearchNextPrevBindings(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api-1",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api-1", Namespace: "default", Status: "Running"},
+				{Name: "worker", Namespace: "default", Status: "Running"},
+				{Name: "api-2", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.searchQuery = "api"
+	m.selectFromSession()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	next := updated.(model)
+	if next.currentSelection() != "api-2" {
+		t.Fatalf("expected n to move to next match api-2, got %q", next.currentSelection())
+	}
+
+	updated, _ = next.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	prev := updated.(model)
+	if prev.currentSelection() != "api-1" {
+		t.Fatalf("expected N to move to previous match api-1, got %q", prev.currentSelection())
+	}
+}
+
+func TestJumpBindingsMoveByTen(t *testing.T) {
+	items := make([]protocol.ResourceItem, 0, 25)
+	for i := 0; i < 25; i++ {
+		items = append(items, protocol.ResourceItem{
+			Name:      "pod-" + strconv.Itoa(i),
+			Namespace: "default",
+			Status:    "Running",
+		})
+	}
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items:     items,
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	down := updated.(model)
+	if down.selected != 10 {
+		t.Fatalf("expected ctrl+d jump to index 10, got %d", down.selected)
+	}
+
+	updated, _ = down.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	up := updated.(model)
+	if up.selected != 0 {
+		t.Fatalf("expected ctrl+u jump back to index 0, got %d", up.selected)
 	}
 }
 

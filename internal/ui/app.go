@@ -145,8 +145,13 @@ type autocompleteState struct {
 type keyMap struct {
 	Up           key.Binding
 	Down         key.Binding
+	JumpUp       key.Binding
+	JumpDown     key.Binding
 	Detail       key.Binding
 	Command      key.Binding
+	Search       key.Binding
+	SearchNext   key.Binding
+	SearchPrev   key.Binding
 	Autocomplete key.Binding
 	ReverseTab   key.Binding
 	Accept       key.Binding
@@ -164,6 +169,14 @@ func defaultKeyMap() keyMap {
 			key.WithKeys("down", "j"),
 			key.WithHelp("", ""),
 		),
+		JumpUp: key.NewBinding(
+			key.WithKeys("pgup", "ctrl+u"),
+			key.WithHelp("pgup/ctrl+u", "jump up"),
+		),
+		JumpDown: key.NewBinding(
+			key.WithKeys("pgdown", "ctrl+d"),
+			key.WithHelp("pgdn/ctrl+d", "jump down"),
+		),
 		Detail: key.NewBinding(
 			key.WithKeys("enter"),
 			key.WithHelp("enter", "detail"),
@@ -171,6 +184,18 @@ func defaultKeyMap() keyMap {
 		Command: key.NewBinding(
 			key.WithKeys(":"),
 			key.WithHelp(":", "cmd"),
+		),
+		Search: key.NewBinding(
+			key.WithKeys("/"),
+			key.WithHelp("/", "search"),
+		),
+		SearchNext: key.NewBinding(
+			key.WithKeys("n"),
+			key.WithHelp("n/N", "next/prev match"),
+		),
+		SearchPrev: key.NewBinding(
+			key.WithKeys("N"),
+			key.WithHelp("", ""),
 		),
 		Autocomplete: key.NewBinding(
 			key.WithKeys("tab"),
@@ -196,11 +221,38 @@ func defaultKeyMap() keyMap {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Detail, k.Command, k.Autocomplete, k.ReverseTab, k.Accept, k.Apply, k.Quit}
+	return []key.Binding{
+		k.Up,
+		k.JumpDown,
+		k.Detail,
+		k.Command,
+		k.Search,
+		k.SearchNext,
+		k.Autocomplete,
+		k.ReverseTab,
+		k.Accept,
+		k.Apply,
+		k.Quit,
+	}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{{k.Up, k.Down, k.Detail, k.Command, k.Autocomplete, k.ReverseTab, k.Accept, k.Apply, k.Quit}}
+	return [][]key.Binding{{
+		k.Up,
+		k.Down,
+		k.JumpUp,
+		k.JumpDown,
+		k.Detail,
+		k.Command,
+		k.Search,
+		k.SearchNext,
+		k.SearchPrev,
+		k.Autocomplete,
+		k.ReverseTab,
+		k.Accept,
+		k.Apply,
+		k.Quit,
+	}}
 }
 
 type styles struct {
@@ -208,6 +260,8 @@ type styles struct {
 	CommandMsg     lipgloss.Style
 	CommandSuggest lipgloss.Style
 	Title          lipgloss.Style
+	ColumnHeader   lipgloss.Style
+	SearchMatch    lipgloss.Style
 	SelectedRow    lipgloss.Style
 	Legend         lipgloss.Style
 	MainError      lipgloss.Style
@@ -228,6 +282,8 @@ func newStyles(useColor bool) styles {
 			CommandMsg:     lipgloss.NewStyle(),
 			CommandSuggest: lipgloss.NewStyle().Bold(true),
 			Title:          lipgloss.NewStyle().Bold(true),
+			ColumnHeader:   lipgloss.NewStyle().Bold(true),
+			SearchMatch:    lipgloss.NewStyle().Bold(true),
 			SelectedRow:    lipgloss.NewStyle().Bold(true),
 			Legend:         lipgloss.NewStyle().Faint(true),
 			MainError:      lipgloss.NewStyle().Bold(true),
@@ -247,6 +303,8 @@ func newStyles(useColor bool) styles {
 		CommandMsg:     lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
 		CommandSuggest: lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true),
 		Title:          lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true),
+		ColumnHeader:   lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Bold(true),
+		SearchMatch:    lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true),
 		SelectedRow:    lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Bold(true),
 		Legend:         lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
 		MainError:      lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true),
@@ -279,6 +337,8 @@ type model struct {
 
 	input          textinput.Model
 	commandMode    bool
+	searchMode     bool
+	searchQuery    string
 	commandMessage string
 	suggestions    []string
 	autocomplete   autocompleteState
@@ -558,6 +618,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.commandMode {
 			return m.updateCommandMode(msg)
 		}
+		if m.searchMode {
+			return m.updateSearchMode(msg)
+		}
 		return m.updateNormalMode(msg)
 	}
 
@@ -568,34 +631,68 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
+	case key.Matches(msg, m.keys.Command):
+		m.enterCommandMode()
+		return m, nil
+	case key.Matches(msg, m.keys.Search):
+		m.enterSearchMode()
+		return m, nil
+	case key.Matches(msg, m.keys.SearchNext):
+		if !m.jumpToSearchMatch(1) {
+			if strings.TrimSpace(m.searchQuery) == "" {
+				m.commandMessage = "search is empty (press / to search)"
+			} else {
+				m.commandMessage = fmt.Sprintf("no matches for %q", m.searchQuery)
+			}
+		}
+		return m, nil
+	case key.Matches(msg, m.keys.SearchPrev):
+		if !m.jumpToSearchMatch(-1) {
+			if strings.TrimSpace(m.searchQuery) == "" {
+				m.commandMessage = "search is empty (press / to search)"
+			} else {
+				m.commandMessage = fmt.Sprintf("no matches for %q", m.searchQuery)
+			}
+		}
+		return m, nil
 	case key.Matches(msg, m.keys.Detail):
 		if len(m.resourceList.Items) == 0 {
 			m.commandMessage = "no selected item for detail"
 			return m, nil
 		}
 		return m.startDetailReload(true)
-	case key.Matches(msg, m.keys.Command):
-		m.commandMode = true
-		m.input.SetValue("")
-		m.input.Focus()
-		m.suggestions = m.commandSuggestions("")
-		m.clearAutocomplete()
-		return m, nil
+	case key.Matches(msg, m.keys.JumpUp):
+		m.jumpSelection(-10)
+	case key.Matches(msg, m.keys.JumpDown):
+		m.jumpSelection(10)
 	case key.Matches(msg, m.keys.Up):
-		if m.selected > 0 {
-			m.selected--
-			m.session.Selection = m.currentSelection()
-			m.clearDetail()
-		}
+		m.jumpSelection(-1)
 	case key.Matches(msg, m.keys.Down):
-		if m.selected < len(m.resourceList.Items)-1 {
-			m.selected++
-			m.session.Selection = m.currentSelection()
-			m.clearDetail()
-		}
+		m.jumpSelection(1)
 	}
 
 	return m, nil
+}
+
+func (m model) updateSearchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.exitSearchMode()
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+
+	if msg.Type == tea.KeyEnter {
+		query := strings.TrimSpace(m.input.Value())
+		m.exitSearchMode()
+		m.applySearchQuery(query)
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
 }
 
 func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -605,11 +702,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.clearAutocomplete()
 			return m, nil
 		}
-		m.commandMode = false
-		m.input.Blur()
-		m.input.SetValue("")
-		m.suggestions = nil
-		m.clearAutocomplete()
+		m.exitCommandMode()
 		return m, nil
 	case msg.String() == "ctrl+c":
 		return m, tea.Quit
@@ -633,18 +726,13 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.acceptAutocomplete()
 		}
 		commandText := strings.TrimSpace(m.input.Value())
-		m.commandMode = false
-		m.input.Blur()
-		m.input.SetValue("")
-		m.suggestions = nil
-		m.clearAutocomplete()
+		m.exitCommandMode()
 		if commandText == "" {
 			return m, nil
 		}
 		if logsQuery, isLogs, logsErr := m.logsQueryFromCommand(commandText); isLogs {
 			if logsErr != nil {
-				m.commandMode = true
-				m.input.Focus()
+				m.enterCommandMode()
 				m.input.SetValue(commandText)
 				m.commandMessage = logsErr.Error()
 				m.suggestions = m.commandSuggestions(m.input.Value())
@@ -654,8 +742,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if actionQuery, isAction, actionErr := m.actionQueryFromCommand(commandText); isAction {
 			if actionErr != nil {
-				m.commandMode = true
-				m.input.Focus()
+				m.enterCommandMode()
 				m.input.SetValue(commandText)
 				m.commandMessage = actionErr.Error()
 				m.suggestions = m.commandSuggestions(m.input.Value())
@@ -668,8 +755,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		updated, message, reload, err := m.applyCommand(commandText)
 		if err != nil {
-			m.commandMode = true
-			m.input.Focus()
+			m.enterCommandMode()
 			m.input.SetValue(commandText)
 			m.commandMessage = err.Error()
 			m.suggestions = m.commandSuggestions(m.input.Value())
@@ -706,6 +792,134 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clearAutocomplete()
 		return m, cmd
 	}
+}
+
+func (m *model) configureCommandInput() {
+	m.input.Prompt = ": "
+	m.input.Placeholder = "ns default | ctx prod-cluster | services"
+}
+
+func (m *model) configureSearchInput() {
+	m.input.Prompt = "/ "
+	m.input.Placeholder = "search name/namespace/status"
+}
+
+func (m *model) enterCommandMode() {
+	m.searchMode = false
+	m.commandMode = true
+	m.configureCommandInput()
+	m.input.SetValue("")
+	m.input.Focus()
+	m.suggestions = m.commandSuggestions("")
+	m.clearAutocomplete()
+}
+
+func (m *model) exitCommandMode() {
+	m.commandMode = false
+	m.input.Blur()
+	m.input.SetValue("")
+	m.suggestions = nil
+	m.clearAutocomplete()
+	m.configureCommandInput()
+}
+
+func (m *model) enterSearchMode() {
+	m.commandMode = false
+	m.searchMode = true
+	m.configureSearchInput()
+	m.input.SetValue("")
+	m.input.Focus()
+	m.suggestions = nil
+	m.clearAutocomplete()
+}
+
+func (m *model) exitSearchMode() {
+	m.searchMode = false
+	m.input.Blur()
+	m.input.SetValue("")
+	m.configureCommandInput()
+}
+
+func (m *model) applySearchQuery(query string) {
+	m.searchQuery = strings.TrimSpace(query)
+	if m.searchQuery == "" {
+		m.commandMessage = "search cleared"
+		return
+	}
+
+	matches := m.searchMatchIndices()
+	if len(matches) == 0 {
+		m.commandMessage = fmt.Sprintf("no matches for %q", m.searchQuery)
+		return
+	}
+	m.setSelection(matches[0])
+	m.commandMessage = fmt.Sprintf("search: %d matches for %q", len(matches), m.searchQuery)
+}
+
+func (m *model) searchMatchIndices() []int {
+	query := strings.ToLower(strings.TrimSpace(m.searchQuery))
+	if query == "" {
+		return nil
+	}
+	matches := make([]int, 0, len(m.resourceList.Items))
+	for idx, item := range m.resourceList.Items {
+		if itemMatchesSearch(item, query) {
+			matches = append(matches, idx)
+		}
+	}
+	return matches
+}
+
+func (m *model) jumpToSearchMatch(direction int) bool {
+	matches := m.searchMatchIndices()
+	if len(matches) == 0 {
+		return false
+	}
+	if direction >= 0 {
+		for _, idx := range matches {
+			if idx > m.selected {
+				m.setSelection(idx)
+				return true
+			}
+		}
+		m.setSelection(matches[0])
+		return true
+	}
+	for i := len(matches) - 1; i >= 0; i-- {
+		if matches[i] < m.selected {
+			m.setSelection(matches[i])
+			return true
+		}
+	}
+	m.setSelection(matches[len(matches)-1])
+	return true
+}
+
+func (m *model) jumpSelection(delta int) {
+	if len(m.resourceList.Items) == 0 || delta == 0 {
+		return
+	}
+	next := m.selected + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(m.resourceList.Items) {
+		next = len(m.resourceList.Items) - 1
+	}
+	m.setSelection(next)
+}
+
+func (m *model) setSelection(index int) {
+	if index < 0 || index >= len(m.resourceList.Items) {
+		return
+	}
+	if m.selected == index {
+		m.session.Selection = m.currentSelection()
+		return
+	}
+	m.selected = index
+	m.session.Selection = m.currentSelection()
+	m.clearDetail()
 }
 
 func (m *model) applyCommand(input string) (updated bool, message string, reload bool, err error) {
@@ -1246,12 +1460,21 @@ func (m model) View() string {
 
 func (m model) renderInputBox(width int) string {
 	line := m.renderCommandLine()
-	if !m.commandMode {
+	if m.searchMode {
+		line = m.input.View()
+	} else if !m.commandMode {
 		line = m.styles.CommandHint.Render(": press : to open command line")
 	}
 
 	secondary := ""
-	if m.commandMode && m.autocomplete.active {
+	if m.searchMode {
+		if m.searchQuery != "" {
+			matchCount := len(m.searchMatchIndices())
+			secondary = m.styles.CommandHint.Render(fmt.Sprintf("search [%s]: %d matches (enter apply, esc cancel, n/N next/prev)", m.searchQuery, matchCount))
+		} else {
+			secondary = m.styles.CommandHint.Render("search: type query and press enter (n/N jump matches)")
+		}
+	} else if m.commandMode && m.autocomplete.active {
 		secondary = m.renderAutocompleteStatus()
 	} else if m.commandMode && len(m.suggestions) > 0 {
 		secondary = m.styles.CommandHint.Render("autocomplete: " + strings.Join(limitSuggestions(m.suggestions, 5), "  "))
@@ -1288,7 +1511,7 @@ func (m model) renderMainPane(width int, innerHeight int) string {
 }
 
 func (m model) listLines() []string {
-	lines := make([]string, 0, len(m.resourceList.Items)+2)
+	lines := make([]string, 0, len(m.resourceList.Items)+4)
 	if listErr := strings.TrimSpace(m.resourceList.Freshness.Error); listErr != "" {
 		prefix := "list warning: "
 		if len(m.resourceList.Items) == 0 {
@@ -1306,11 +1529,14 @@ func (m model) listLines() []string {
 	if m.loading {
 		lines = append(lines, m.styles.EmptyLoading.Render("loading resources..."))
 	}
+	lines = append(lines, m.styles.ColumnHeader.Render(formatListRow("NAME", "NAMESPACE", "STATUS")))
 
 	for i, item := range m.resourceList.Items {
-		line := fmt.Sprintf("  %-36s %-18s %s", item.Name, item.Namespace, item.Status)
+		line := formatListRow(item.Name, item.Namespace, item.Status)
 		if i == m.selected {
 			line = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(line, "  "))
+		} else if strings.TrimSpace(m.searchQuery) != "" && itemMatchesSearch(item, strings.ToLower(strings.TrimSpace(m.searchQuery))) {
+			line = m.styles.SearchMatch.Render(line)
 		}
 		lines = append(lines, line)
 	}
@@ -1329,6 +1555,10 @@ func (m model) listLines() []string {
 func (m model) renderEmptyItemsLine() string {
 	label, style := m.emptyPaneState()
 	return style.Render(label)
+}
+
+func formatListRow(name string, namespace string, status string) string {
+	return fmt.Sprintf("  %-36s %-18s %s", name, namespace, status)
 }
 
 func (m model) mainPaneError() string {
@@ -2223,6 +2453,16 @@ func prefixMatches(values []string, prefix string) []string {
 		}
 	}
 	return matches
+}
+
+func itemMatchesSearch(item protocol.ResourceItem, query string) bool {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(item.Name), query) ||
+		strings.Contains(strings.ToLower(item.Namespace), query) ||
+		strings.Contains(strings.ToLower(item.Status), query)
 }
 
 func limitSuggestions(values []string, limit int) []string {
