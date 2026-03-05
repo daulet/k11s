@@ -75,6 +75,7 @@ TUI keybindings:
   - `NAMESPACE` switches namespace
   - `NODE` opens `nodes` view
   - `OWNER` opens owner resource when supported
+- Rows that change between refreshes temporarily flash to highlight updates.
 - In command mode autocomplete: `tab` expands/cycles suggestions, `enter`/`->` accepts current suggestion, `esc` clears suggestion.
 - In command mode without autocomplete: `enter` applies the typed command.
 

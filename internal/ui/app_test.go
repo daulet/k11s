@@ -1135,6 +1135,85 @@ func TestRenderMainPaneCentersNoItemsState(t *testing.T) {
 	}
 }
 
+func TestListLoadedFlashesChangedItems(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Pending"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.now = func() time.Time { return now }
+	m.flashDuration = 2 * time.Second
+
+	updated, _ := m.Update(listLoadedMsg{
+		seq: m.activeSeq,
+		payload: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	next := updated.(model)
+	if !next.isItemFlashing(next.resourceList.Items[0]) {
+		t.Fatalf("expected changed item to be flashing")
+	}
+}
+
+func TestFlashingExpires(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Pending"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.now = func() time.Time { return now }
+	m.flashDuration = 1 * time.Second
+
+	updated, _ := m.Update(listLoadedMsg{
+		seq: m.activeSeq,
+		payload: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	next := updated.(model)
+	if !next.isItemFlashing(next.resourceList.Items[0]) {
+		t.Fatalf("expected flashing immediately after change")
+	}
+
+	next.now = func() time.Time { return now.Add(2 * time.Second) }
+	if next.isItemFlashing(next.resourceList.Items[0]) {
+		t.Fatalf("expected flashing to expire")
+	}
+}
+
 func TestSlashSearchAppliesSelection(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{

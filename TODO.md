@@ -9,7 +9,7 @@
 - [x] improve list views: column headers, search (with "/" vim style and related keybindings), jump multiple nodes bindings
 - [x] Add node listing and other namespace less resources. Navigation should correctly reflect that it is not namespace based 
 - [x] things in the list need to be clickable, eg pod list should have a node in one of columns, clicking which should open node. clicking namespace. clicking owner resource should do the same
-- [ ] since things are constatnly refreshing they should flash temporarily (highlighted) if they changed. eg if pod status changed - flash it
+- [x] since things are constatnly refreshing they should flash temporarily (highlighted) if they changed. eg if pod status changed - flash it
 - [ ] Pod view: hitting enter in pod view should open pod view, escape to go back.
       1. It should have tabbed view: tabs for overview, each container, logs, events, and its yaml definition
       2. Overview should include Owner, labels, annotations, Phase, Conditions, IP, service account, node, node selector, tolerations, age

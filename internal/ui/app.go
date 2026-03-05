@@ -36,6 +36,7 @@ const (
 	defaultNamespaceRefreshInterval  = 5 * time.Second
 	defaultCRDRefreshInterval        = 5 * time.Second
 	defaultLogsFollowInterval        = 1500 * time.Millisecond
+	defaultRowFlashDuration          = 2 * time.Second
 )
 
 type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error)
@@ -263,6 +264,7 @@ type styles struct {
 	ColumnHeader   lipgloss.Style
 	SearchMatch    lipgloss.Style
 	SelectedRow    lipgloss.Style
+	ChangedRow     lipgloss.Style
 	Legend         lipgloss.Style
 	MainError      lipgloss.Style
 	EmptyLive      lipgloss.Style
@@ -285,6 +287,7 @@ func newStyles(useColor bool) styles {
 			ColumnHeader:   lipgloss.NewStyle().Bold(true),
 			SearchMatch:    lipgloss.NewStyle().Bold(true),
 			SelectedRow:    lipgloss.NewStyle().Bold(true),
+			ChangedRow:     lipgloss.NewStyle().Bold(true),
 			Legend:         lipgloss.NewStyle().Faint(true),
 			MainError:      lipgloss.NewStyle().Bold(true),
 			EmptyLive:      lipgloss.NewStyle().Bold(true),
@@ -306,6 +309,7 @@ func newStyles(useColor bool) styles {
 		ColumnHeader:   lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Bold(true),
 		SearchMatch:    lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true),
 		SelectedRow:    lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Bold(true),
+		ChangedRow:     lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("190")).Bold(true),
 		Legend:         lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
 		MainError:      lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true),
 		EmptyLive:      lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true),
@@ -362,6 +366,9 @@ type model struct {
 	logsFollow         bool
 	logsFollowQuery    protocol.LogsQuery
 	logsPollEvery      time.Duration
+	flashingItems      map[string]time.Time
+	flashDuration      time.Duration
+	now                func() time.Time
 	pollEvery          time.Duration
 	namespacePollEvery time.Duration
 	crdPollEvery       time.Duration
@@ -423,6 +430,9 @@ func newModel(opts Options) model {
 		keys:                 keys,
 		help:                 h,
 		styles:               newStyles(opts.UseColor),
+		flashingItems:        map[string]time.Time{},
+		flashDuration:        defaultRowFlashDuration,
+		now:                  time.Now,
 		pollEvery:            defaultBackgroundRefreshInterval,
 		namespacePollEvery:   defaultNamespaceRefreshInterval,
 		crdPollEvery:         defaultCRDRefreshInterval,
@@ -487,7 +497,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loading = false
+		previousPayload := m.resourceList
 		m.resourceList = msg.payload
+		if strings.EqualFold(strings.TrimSpace(previousPayload.Resource), strings.TrimSpace(msg.payload.Resource)) &&
+			strings.EqualFold(strings.TrimSpace(previousPayload.Namespace), strings.TrimSpace(msg.payload.Namespace)) {
+			m.updateFlashingItems(previousPayload.Items, msg.payload.Items)
+		} else {
+			m.clearFlashingItems()
+		}
 		m.selectFromSession()
 		m.syncDetailSelection()
 		m.syncLogsSelection()
@@ -738,6 +755,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.session.Namespace = namespace
 		m.session.Selection = ""
 		m.clearDetail()
+		m.clearFlashingItems()
 		m.commandMessage = "namespace switched to " + namespace + " via click"
 		return m.startListReload()
 	case "node":
@@ -748,6 +766,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.session.Resource = "nodes"
 		m.session.Selection = node
 		m.clearDetail()
+		m.clearFlashingItems()
 		m.commandMessage = "opened node " + node + " via click"
 		return m.startListReload()
 	case "owner":
@@ -765,6 +784,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.session.Resource = resource
 		m.session.Selection = ownerSelection
 		m.clearDetail()
+		m.clearFlashingItems()
 		m.commandMessage = fmt.Sprintf("opened owner %s/%s via click", item.OwnerKind, ownerSelection)
 		return m.startListReload()
 	default:
@@ -843,6 +863,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if updated {
 			m.session.Selection = ""
 			m.clearDetail()
+			m.clearFlashingItems()
 		}
 		if reload {
 			updatedModel, listCmd := m.startListReload()
@@ -997,6 +1018,65 @@ func (m *model) setSelection(index int) {
 	m.selected = index
 	m.session.Selection = m.currentSelection()
 	m.clearDetail()
+}
+
+func (m *model) updateFlashingItems(previous []protocol.ResourceItem, current []protocol.ResourceItem) {
+	if m.flashDuration <= 0 || m.now == nil {
+		return
+	}
+	now := m.now()
+	if m.flashingItems == nil {
+		m.flashingItems = map[string]time.Time{}
+	}
+	for key, until := range m.flashingItems {
+		if !now.Before(until) {
+			delete(m.flashingItems, key)
+		}
+	}
+
+	if len(previous) == 0 {
+		return
+	}
+	previousByKey := make(map[string]protocol.ResourceItem, len(previous))
+	for _, item := range previous {
+		previousByKey[resourceItemKey(item)] = item
+	}
+
+	for _, item := range current {
+		key := resourceItemKey(item)
+		previousItem, ok := previousByKey[key]
+		if !ok || !resourceItemSame(previousItem, item) {
+			m.flashingItems[key] = now.Add(m.flashDuration)
+		}
+	}
+}
+
+func (m *model) clearFlashingItems() {
+	m.flashingItems = map[string]time.Time{}
+}
+
+func (m model) isItemFlashing(item protocol.ResourceItem) bool {
+	if m.now == nil || len(m.flashingItems) == 0 {
+		return false
+	}
+	until, ok := m.flashingItems[resourceItemKey(item)]
+	if !ok {
+		return false
+	}
+	return m.now().Before(until)
+}
+
+func resourceItemKey(item protocol.ResourceItem) string {
+	return strings.TrimSpace(item.Namespace) + "/" + strings.TrimSpace(item.Name)
+}
+
+func resourceItemSame(left protocol.ResourceItem, right protocol.ResourceItem) bool {
+	return left.Name == right.Name &&
+		left.Namespace == right.Namespace &&
+		left.Status == right.Status &&
+		left.Node == right.Node &&
+		left.OwnerKind == right.OwnerKind &&
+		left.OwnerName == right.OwnerName
 }
 
 func (m *model) applyCommand(input string) (updated bool, message string, reload bool, err error) {
@@ -1617,6 +1697,8 @@ func (m model) listLines() []string {
 		line := renderListItem(columns, item)
 		if i == m.selected {
 			line = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(line, "  "))
+		} else if m.isItemFlashing(item) {
+			line = m.styles.ChangedRow.Render(line)
 		} else if strings.TrimSpace(m.searchQuery) != "" && itemMatchesSearch(item, strings.ToLower(strings.TrimSpace(m.searchQuery))) {
 			line = m.styles.SearchMatch.Render(line)
 		}
