@@ -58,6 +58,7 @@ type startupState struct {
 	Session              protocol.SessionState
 	ContextSuggestions   []string
 	NamespaceSuggestions []string
+	CRDSuggestions       []string
 	ResourceList         protocol.ResourceListPayload
 	SimulateStale        bool
 	Recorder             *perf.Recorder
@@ -202,6 +203,16 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 		log.Printf("warning: unable to load namespaces for autocomplete: %v", err)
 		namespaceList = protocol.NamespaceListPayload{}
 	}
+	crdSuggestions, err := client.ListCRDNames(
+		context.Background(),
+		cfg,
+		buildinfo.Version,
+		sessionState.KubeContext,
+	)
+	if err != nil {
+		log.Printf("warning: unable to load crds for autocomplete: %v", err)
+		crdSuggestions = nil
+	}
 
 	listLoadStart := time.Now()
 	resourceList, err := client.ListResources(
@@ -227,6 +238,7 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 		Session:              sessionState,
 		ContextSuggestions:   contextSuggestions,
 		NamespaceSuggestions: namespaceList.Namespaces,
+		CRDSuggestions:       crdSuggestions,
 		ResourceList:         resourceList,
 		SimulateStale:        opts.simulateStale,
 		Recorder:             recorder,
@@ -287,6 +299,7 @@ func runTUI(state startupState, startMode string) error {
 		ResourceList:         state.ResourceList,
 		ContextSuggestions:   state.ContextSuggestions,
 		NamespaceSuggestions: state.NamespaceSuggestions,
+		CRDSuggestions:       state.CRDSuggestions,
 		UseColor:             enableColor(),
 		SimulateStale:        state.SimulateStale,
 		LoadResourceList: func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
@@ -297,6 +310,9 @@ func runTUI(state startupState, startMode string) error {
 		},
 		LoadNamespaces: func(ctx context.Context, kubeContext string) (protocol.NamespaceListPayload, error) {
 			return client.ListNamespaces(ctx, state.Config, buildinfo.Version, kubeContext)
+		},
+		LoadCRDs: func(ctx context.Context, kubeContext string) ([]string, error) {
+			return client.ListCRDNames(ctx, state.Config, buildinfo.Version, kubeContext)
 		},
 	})
 	if err != nil {
@@ -345,7 +361,7 @@ func formatStatusBar(meta protocol.FreshnessMeta, useColor bool) string {
 		}
 	}
 
-	return fmt.Sprintf(
+	text := fmt.Sprintf(
 		"%s age=%s as_of=%s source=%s watch=%s",
 		badge,
 		formatAge(meta.AgeMs),
@@ -353,6 +369,10 @@ func formatStatusBar(meta protocol.FreshnessMeta, useColor bool) string {
 		meta.Source,
 		formatWatchHealth(meta.WatchHealthy),
 	)
+	if meta.Error != "" {
+		return text + " err=" + meta.Error
+	}
+	return text
 }
 
 func formatAge(ageMs int64) string {

@@ -128,6 +128,7 @@ func (c *Cache) buildPayload(kubeContext string, ent *entry, now time.Time) prot
 		AgeMs:              0,
 		WatchHealthy:       ent.lastErr == "",
 		Source:             "cache-cold",
+		Error:              ent.lastErr,
 	}
 
 	if !ent.lastSync.IsZero() {

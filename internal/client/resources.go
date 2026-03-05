@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/daulet/k11s/internal/config"
 	"github.com/daulet/k11s/internal/protocol"
@@ -56,4 +57,35 @@ func GetResourceDetail(
 	}
 
 	return *resp.ResourceDetail, nil
+}
+
+func ListCRDNames(
+	ctx context.Context,
+	cfg config.Config,
+	clientVersion string,
+	kubeContext string,
+) ([]string, error) {
+	payload, err := ListResources(
+		ctx,
+		cfg,
+		clientVersion,
+		protocol.ResourceListQuery{
+			KubeContext: kubeContext,
+			Resource:    "crds",
+			Namespace:   "all",
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(payload.Items))
+	for _, item := range payload.Items {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names, nil
 }

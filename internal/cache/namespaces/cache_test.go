@@ -3,6 +3,7 @@ package namespaces
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -62,6 +63,9 @@ func TestNamespaceCachePreservesDataWhenRefreshFails(t *testing.T) {
 	}
 	if len(payload.Namespaces) != 2 {
 		t.Fatalf("expected cached namespaces to remain, got %d", len(payload.Namespaces))
+	}
+	if !strings.Contains(payload.Freshness.Error, "permission denied") {
+		t.Fatalf("expected freshness error to include refresh failure, got %q", payload.Freshness.Error)
 	}
 }
 

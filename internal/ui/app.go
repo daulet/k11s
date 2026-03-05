@@ -30,22 +30,26 @@ var defaultResources = []string{
 const (
 	defaultBackgroundRefreshInterval = 1200 * time.Millisecond
 	defaultNamespaceRefreshInterval  = 5 * time.Second
+	defaultCRDRefreshInterval        = 5 * time.Second
 )
 
 type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error)
 type LoadResourceDetailFunc func(ctx context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error)
 type LoadNamespacesFunc func(ctx context.Context, kubeContext string) (protocol.NamespaceListPayload, error)
+type LoadCRDsFunc func(ctx context.Context, kubeContext string) ([]string, error)
 
 type Options struct {
 	Session              protocol.SessionState
 	ResourceList         protocol.ResourceListPayload
 	ContextSuggestions   []string
 	NamespaceSuggestions []string
+	CRDSuggestions       []string
 	UseColor             bool
 	SimulateStale        bool
 	LoadResourceList     LoadResourceListFunc
 	LoadResourceDetail   LoadResourceDetailFunc
 	LoadNamespaces       LoadNamespacesFunc
+	LoadCRDs             LoadCRDsFunc
 }
 
 type Result struct {
@@ -78,6 +82,7 @@ type detailFailedMsg struct {
 
 type pollTickMsg struct{}
 type namespacePollTickMsg struct{}
+type crdPollTickMsg struct{}
 
 type namespacesLoadedMsg struct {
 	kubeContext string
@@ -85,6 +90,16 @@ type namespacesLoadedMsg struct {
 }
 
 type namespacesFailedMsg struct {
+	kubeContext string
+	err         error
+}
+
+type crdsLoadedMsg struct {
+	kubeContext string
+	names       []string
+}
+
+type crdsFailedMsg struct {
 	kubeContext string
 	err         error
 }
@@ -158,6 +173,10 @@ type styles struct {
 	Title          lipgloss.Style
 	SelectedRow    lipgloss.Style
 	Legend         lipgloss.Style
+	MainError      lipgloss.Style
+	EmptyLive      lipgloss.Style
+	EmptyCached    lipgloss.Style
+	EmptyLoading   lipgloss.Style
 	StatusLive     lipgloss.Style
 	StatusCatch    lipgloss.Style
 	StatusStale    lipgloss.Style
@@ -174,6 +193,10 @@ func newStyles(useColor bool) styles {
 			Title:          lipgloss.NewStyle().Bold(true),
 			SelectedRow:    lipgloss.NewStyle().Bold(true),
 			Legend:         lipgloss.NewStyle().Faint(true),
+			MainError:      lipgloss.NewStyle().Bold(true),
+			EmptyLive:      lipgloss.NewStyle().Bold(true),
+			EmptyCached:    lipgloss.NewStyle().Faint(true),
+			EmptyLoading:   lipgloss.NewStyle().Faint(true),
 			StatusLive:     lipgloss.NewStyle().Bold(true),
 			StatusCatch:    lipgloss.NewStyle().Bold(true),
 			StatusStale:    lipgloss.NewStyle().Bold(true),
@@ -189,6 +212,10 @@ func newStyles(useColor bool) styles {
 		Title:          lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true),
 		SelectedRow:    lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Bold(true),
 		Legend:         lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
+		MainError:      lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true),
+		EmptyLive:      lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true),
+		EmptyCached:    lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true),
+		EmptyLoading:   lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true),
 		StatusLive:     lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("42")).Bold(true).Padding(0, 1),
 		StatusCatch:    lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("214")).Bold(true).Padding(0, 1),
 		StatusStale:    lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("160")).Bold(true).Padding(0, 1),
@@ -202,18 +229,21 @@ type model struct {
 	resourceList         protocol.ResourceListPayload
 	contextSuggestions   []string
 	namespaceSuggestions []string
+	crdSuggestions       []string
 
 	useColor           bool
 	simulateStale      bool
 	loadResourceList   LoadResourceListFunc
 	loadResourceDetail LoadResourceDetailFunc
 	loadNamespaces     LoadNamespacesFunc
+	loadCRDs           LoadCRDsFunc
 
 	input          textinput.Model
 	commandMode    bool
 	commandMessage string
 	suggestions    []string
 	autocomplete   autocompleteState
+	crdLoadErr     string
 
 	selected           int
 	loading            bool
@@ -225,6 +255,7 @@ type model struct {
 	detailActiveSeq    int
 	pollEvery          time.Duration
 	namespacePollEvery time.Duration
+	crdPollEvery       time.Duration
 
 	width  int
 	height int
@@ -270,26 +301,32 @@ func newModel(opts Options) model {
 		resourceList:         opts.ResourceList,
 		contextSuggestions:   append([]string(nil), opts.ContextSuggestions...),
 		namespaceSuggestions: append([]string(nil), opts.NamespaceSuggestions...),
+		crdSuggestions:       append([]string(nil), opts.CRDSuggestions...),
 		useColor:             opts.UseColor,
 		simulateStale:        opts.SimulateStale,
 		loadResourceList:     opts.LoadResourceList,
 		loadResourceDetail:   opts.LoadResourceDetail,
 		loadNamespaces:       opts.LoadNamespaces,
+		loadCRDs:             opts.LoadCRDs,
 		input:                input,
 		keys:                 keys,
 		help:                 h,
 		styles:               newStyles(opts.UseColor),
 		pollEvery:            defaultBackgroundRefreshInterval,
 		namespacePollEvery:   defaultNamespaceRefreshInterval,
+		crdPollEvery:         defaultCRDRefreshInterval,
 	}
 	m.selectFromSession()
 	return m
 }
 
 func (m model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.schedulePoll(), m.scheduleNamespacePoll()}
+	cmds := []tea.Cmd{m.schedulePoll(), m.scheduleNamespacePoll(), m.scheduleCRDPoll()}
 	if m.loadNamespaces != nil {
 		cmds = append(cmds, m.loadNamespacesCmd(m.session.KubeContext))
+	}
+	if m.loadCRDs != nil {
+		cmds = append(cmds, m.loadCRDsCmd(m.session.KubeContext))
 	}
 	return tea.Batch(cmds...)
 }
@@ -316,6 +353,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tickCmd
 		}
 		return m, tea.Batch(tickCmd, m.loadNamespacesCmd(m.session.KubeContext))
+	case crdPollTickMsg:
+		tickCmd := m.scheduleCRDPoll()
+		if m.commandMode || m.loadCRDs == nil {
+			return m, tickCmd
+		}
+		return m, tea.Batch(tickCmd, m.loadCRDsCmd(m.session.KubeContext))
 	case listLoadedMsg:
 		if msg.seq != m.activeSeq {
 			return m, nil
@@ -324,7 +367,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resourceList = msg.payload
 		m.selectFromSession()
 		m.syncDetailSelection()
-		if msg.announce {
+		if errText := strings.TrimSpace(msg.payload.Freshness.Error); errText != "" {
+			m.commandMessage = "list error: " + errText
+		} else if msg.announce {
 			m.commandMessage = fmt.Sprintf(
 				"loaded %d %s in namespace %s",
 				len(m.resourceList.Items),
@@ -370,6 +415,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case namespacesFailedMsg:
 		if msg.kubeContext != strings.TrimSpace(m.session.KubeContext) {
 			return m, nil
+		}
+		return m, nil
+	case crdsLoadedMsg:
+		if msg.kubeContext != strings.TrimSpace(m.session.KubeContext) {
+			return m, nil
+		}
+		m.crdSuggestions = append([]string(nil), msg.names...)
+		m.crdLoadErr = ""
+		return m, nil
+	case crdsFailedMsg:
+		if msg.kubeContext != strings.TrimSpace(m.session.KubeContext) {
+			return m, nil
+		}
+		m.crdLoadErr = strings.TrimSpace(msg.err.Error())
+		if m.crdLoadErr != "" {
+			m.commandMessage = "crd autocomplete error: " + m.crdLoadErr
 		}
 		return m, nil
 	case tea.KeyMsg:
@@ -440,7 +501,6 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Apply):
 		if m.autocomplete.active {
 			m.acceptAutocomplete()
-			return m, nil
 		}
 		commandText := strings.TrimSpace(m.input.Value())
 		previousContext := m.session.KubeContext
@@ -472,10 +532,16 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			updatedModel, listCmd := m.startListReload()
 			next := updatedModel.(model)
 			if strings.TrimSpace(previousContext) != strings.TrimSpace(next.session.KubeContext) {
+				cmds := []tea.Cmd{listCmd}
 				_, nsCmd := next.startNamespaceReload()
 				if nsCmd != nil {
-					return next, tea.Batch(listCmd, nsCmd)
+					cmds = append(cmds, nsCmd)
 				}
+				_, crdCmd := next.startCRDReload()
+				if crdCmd != nil {
+					cmds = append(cmds, crdCmd)
+				}
+				return next, tea.Batch(cmds...)
 			}
 			return next, listCmd
 		}
@@ -495,7 +561,8 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 		return false, "", false, nil
 	}
 
-	switch fields[0] {
+	command := strings.ToLower(fields[0])
+	switch command {
 	case "ns", "namespace":
 		if len(fields) < 2 {
 			return false, "", false, fmt.Errorf("namespace value required: try `:ns default`")
@@ -542,8 +609,8 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 		if len(fields) < 2 {
 			return false, "", false, fmt.Errorf("resource value required: try `:resource pods`")
 		}
-		resource := strings.ToLower(fields[1])
-		if !isKnownResource(resource) {
+		resource, ok := canonicalResourceName(fields[1])
+		if !ok {
 			return false, "", false, fmt.Errorf("unknown resource %q", fields[1])
 		}
 		if resource == "crs" {
@@ -561,8 +628,8 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 		}
 		return true, fmt.Sprintf("resource switched to %s", m.session.Resource), true, nil
 	default:
-		resource := strings.ToLower(fields[0])
-		if isKnownResource(resource) {
+		resource, ok := canonicalResourceName(command)
+		if ok {
 			if resource == "crs" {
 				if len(fields) >= 2 {
 					m.session.Filter = fields[1]
@@ -673,6 +740,10 @@ func (m model) startNamespaceReload() (tea.Model, tea.Cmd) {
 	return m, m.loadNamespacesCmd(m.session.KubeContext)
 }
 
+func (m model) startCRDReload() (tea.Model, tea.Cmd) {
+	return m, m.loadCRDsCmd(m.session.KubeContext)
+}
+
 func (m model) loadNamespacesCmd(kubeContext string) tea.Cmd {
 	if m.loadNamespaces == nil {
 		return nil
@@ -687,6 +758,26 @@ func (m model) loadNamespacesCmd(kubeContext string) tea.Cmd {
 			return namespacesFailedMsg{kubeContext: kubeContext, err: err}
 		}
 		return namespacesLoadedMsg{kubeContext: kubeContext, payload: payload}
+	}
+}
+
+func (m model) loadCRDsCmd(kubeContext string) tea.Cmd {
+	if m.loadCRDs == nil {
+		return nil
+	}
+	kubeContext = strings.TrimSpace(kubeContext)
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		names, err := m.loadCRDs(ctx, kubeContext)
+		if err != nil {
+			return crdsFailedMsg{kubeContext: kubeContext, err: err}
+		}
+		return crdsLoadedMsg{
+			kubeContext: kubeContext,
+			names:       append([]string(nil), names...),
+		}
 	}
 }
 
@@ -707,6 +798,16 @@ func (m model) scheduleNamespacePoll() tea.Cmd {
 	}
 	return tea.Tick(interval, func(time.Time) tea.Msg {
 		return namespacePollTickMsg{}
+	})
+}
+
+func (m model) scheduleCRDPoll() tea.Cmd {
+	interval := m.crdPollEvery
+	if interval <= 0 {
+		interval = defaultCRDRefreshInterval
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg {
+		return crdPollTickMsg{}
 	})
 }
 
@@ -763,18 +864,41 @@ func (m model) renderInputBox(width int) string {
 
 func (m model) renderMainPane(width int, innerHeight int) string {
 	title := m.styles.Title.Render(fmt.Sprintf("%s > %s > %s", displayContext(m.session), m.session.Namespace, displayResource(m.session)))
+	if len(m.resourceList.Items) == 0 {
+		innerWidth := width - 2
+		if innerWidth < 1 {
+			innerWidth = 1
+		}
+		var lines []string
+		if errText := m.mainPaneError(); errText != "" {
+			lines = m.centeredStyledLines("error: "+errText, innerWidth, innerHeight, m.styles.MainError)
+		} else {
+			label, style := m.emptyPaneState()
+			lines = m.centeredStyledLines(label, innerWidth, innerHeight, style)
+		}
+		return drawBox(width, title, lines, innerHeight)
+	}
 	return drawBox(width, title, m.listLines(), innerHeight)
 }
 
 func (m model) listLines() []string {
 	lines := make([]string, 0, len(m.resourceList.Items)+2)
-	if m.loading {
-		lines = append(lines, "loading resources...")
+	if listErr := strings.TrimSpace(m.resourceList.Freshness.Error); listErr != "" {
+		prefix := "list warning: "
+		if len(m.resourceList.Items) == 0 {
+			prefix = "list error: "
+		}
+		lines = append(lines, prefix+listErr)
 	}
 
-	if len(m.resourceList.Items) == 0 && !m.loading {
-		lines = append(lines, "no items")
+	if len(m.resourceList.Items) == 0 {
+		if m.mainPaneError() == "" {
+			lines = append(lines, m.renderEmptyItemsLine())
+		}
 		return lines
+	}
+	if m.loading {
+		lines = append(lines, m.styles.EmptyLoading.Render("loading resources..."))
 	}
 
 	for i, item := range m.resourceList.Items {
@@ -790,6 +914,134 @@ func (m model) listLines() []string {
 		lines = append(lines, detailLines...)
 	}
 	return lines
+}
+
+func (m model) renderEmptyItemsLine() string {
+	label, style := m.emptyPaneState()
+	return style.Render(label)
+}
+
+func (m model) mainPaneError() string {
+	if errText := strings.TrimSpace(m.resourceList.Freshness.Error); errText != "" {
+		return errText
+	}
+	if (strings.EqualFold(m.session.Resource, "crs") || strings.EqualFold(m.session.Resource, "crds")) && strings.TrimSpace(m.crdLoadErr) != "" {
+		return strings.TrimSpace(m.crdLoadErr)
+	}
+	return ""
+}
+
+func (m model) centeredStyledLines(message string, innerWidth int, innerHeight int, style lipgloss.Style) []string {
+	wrapWidth := innerWidth - 4
+	if wrapWidth < 8 {
+		wrapWidth = innerWidth
+	}
+	wrapped := wrapText(message, wrapWidth)
+	lines := make([]string, 0, innerHeight)
+	topPadding := 0
+	if innerHeight > len(wrapped) {
+		topPadding = (innerHeight - len(wrapped)) / 2
+	}
+	for i := 0; i < topPadding; i++ {
+		lines = append(lines, "")
+	}
+	for _, line := range wrapped {
+		lines = append(lines, style.Render(centerHorizontally(line, innerWidth)))
+	}
+	return lines
+}
+
+func (m model) emptyPaneState() (string, lipgloss.Style) {
+	meta := m.resourceList.Freshness
+	if meta.SnapshotTimeUnixMs <= 0 {
+		return "no items (loading)", m.styles.EmptyLoading
+	}
+	if meta.State == protocol.FreshnessStateLive {
+		return "no items", m.styles.EmptyLive
+	}
+	return "no items (cached)", m.styles.EmptyCached
+}
+
+func centerHorizontally(value string, width int) string {
+	if width <= 0 {
+		return value
+	}
+	lineWidth := lipgloss.Width(value)
+	if lineWidth >= width {
+		return fitToWidth(value, width)
+	}
+	leftPad := (width - lineWidth) / 2
+	return strings.Repeat(" ", leftPad) + value
+}
+
+func wrapText(value string, width int) []string {
+	text := strings.TrimSpace(value)
+	if text == "" {
+		return []string{""}
+	}
+	if width <= 1 {
+		return []string{text}
+	}
+
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{text}
+	}
+
+	lines := make([]string, 0, len(words))
+	current := ""
+	flush := func() {
+		if strings.TrimSpace(current) != "" {
+			lines = append(lines, strings.TrimSpace(current))
+			current = ""
+		}
+	}
+
+	appendWord := func(word string) {
+		if current == "" {
+			current = word
+			return
+		}
+		candidate := current + " " + word
+		if lipgloss.Width(candidate) <= width {
+			current = candidate
+			return
+		}
+		flush()
+		current = word
+	}
+
+	for _, word := range words {
+		if lipgloss.Width(word) <= width {
+			appendWord(word)
+			continue
+		}
+		flush()
+		for _, part := range splitLongWord(word, width) {
+			appendWord(part)
+		}
+	}
+	flush()
+	return lines
+}
+
+func splitLongWord(value string, width int) []string {
+	if width <= 0 {
+		return []string{value}
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return []string{value}
+	}
+	parts := make([]string, 0, (len(runes)/width)+1)
+	for start := 0; start < len(runes); start += width {
+		end := start + width
+		if end > len(runes) {
+			end = len(runes)
+		}
+		parts = append(parts, string(runes[start:end]))
+	}
+	return parts
 }
 
 func (m model) renderFooter(width int) string {
@@ -1053,10 +1305,10 @@ func (m model) commandSuggestions(input string) []string {
 		return prefixMatches(m.namespaceCandidates(), valuePrefix)
 	case "ctx", "context":
 		return prefixMatches(m.contextCandidates(), valuePrefix)
-	case "crs", "crd", "filter":
+	case "cr", "crs", "crd", "filter", "customresource", "customresources":
 		return prefixMatches(m.crdCandidates(), valuePrefix)
 	case "resource":
-		return prefixMatches(defaultResources, valuePrefix)
+		return prefixMatches(resourceSuggestions(), valuePrefix)
 	default:
 		return nil
 	}
@@ -1115,17 +1367,23 @@ func (m *model) clearAutocomplete() {
 }
 
 func (m model) renderCommandLine() string {
-	line := m.input.View()
 	if !m.commandMode || !m.autocomplete.active || len(m.autocomplete.options) == 0 {
-		return line
+		return m.input.View()
 	}
 
 	option := m.autocomplete.options[m.autocomplete.index]
-	tail := autocompleteTail(m.input.Value(), option)
-	if tail == "" {
-		return line
+	base := m.input.Value()
+	tail := autocompleteTail(base, option)
+
+	prompt := m.input.Prompt
+	typed := base
+	if m.useColor {
+		prompt = m.input.PromptStyle.Render(prompt)
+		typed = m.input.TextStyle.Render(typed)
 	}
-	return line + m.styles.CommandSuggest.Render(tail)
+
+	cursor := m.input.Cursor.View()
+	return prompt + typed + m.styles.CommandSuggest.Render(tail) + cursor
 }
 
 func (m model) renderAutocompleteStatus() string {
@@ -1199,7 +1457,7 @@ func (m model) autocompleteOptions(input string) []string {
 		}
 		for _, choice := range candidates {
 			newValue := choice
-			if choice == "ns" || choice == "namespace" || choice == "ctx" || choice == "context" || choice == "resource" || choice == "crd" || choice == "filter" || choice == "crs" {
+			if commandSupportsArgument(choice) {
 				newValue += " "
 			}
 			options = append(options, newValue)
@@ -1291,6 +1549,9 @@ func (m model) crdCandidates() []string {
 	}
 
 	appendUnique(m.session.Filter)
+	for _, value := range m.crdSuggestions {
+		appendUnique(value)
+	}
 	if strings.EqualFold(m.resourceList.Resource, "crds") {
 		for _, item := range m.resourceList.Items {
 			appendUnique(item.Name)
@@ -1303,9 +1564,16 @@ func baseSuggestions() []string {
 	return []string{
 		"ctx",
 		"context",
+		"cr",
+		"crd",
+		"crds",
+		"crs",
+		"customresource",
+		"customresources",
+		"customresourcedefinition",
+		"customresourcedefinitions",
 		"ns",
 		"namespace",
-		"crd",
 		"filter",
 		"resource",
 		"pods",
@@ -1315,8 +1583,6 @@ func baseSuggestions() []string {
 		"daemonsets",
 		"jobs",
 		"cronjobs",
-		"crds",
-		"crs",
 	}
 }
 
@@ -1335,12 +1601,44 @@ func displayResource(session protocol.SessionState) string {
 }
 
 func isKnownResource(value string) bool {
+	_, ok := canonicalResourceName(value)
+	return ok
+}
+
+func canonicalResourceName(value string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case "cr", "crs", "customresource", "customresources":
+		return "crs", true
+	case "crd", "crds", "customresourcedefinition", "customresourcedefinitions":
+		return "crds", true
+	}
 	for _, resource := range defaultResources {
-		if value == resource {
-			return true
+		if normalized == resource {
+			return resource, true
 		}
 	}
-	return false
+	return "", false
+}
+
+func resourceSuggestions() []string {
+	return []string{
+		"pods",
+		"services",
+		"deployments",
+		"statefulsets",
+		"daemonsets",
+		"jobs",
+		"cronjobs",
+		"cr",
+		"crd",
+		"crds",
+		"crs",
+		"customresource",
+		"customresources",
+		"customresourcedefinition",
+		"customresourcedefinitions",
+	}
 }
 
 func prefixMatches(values []string, prefix string) []string {
@@ -1414,7 +1712,7 @@ func equalStringSlices(a []string, b []string) bool {
 }
 
 func prefersArgumentCompletion(token string, commandCandidates []string) bool {
-	if token != "ns" && token != "namespace" && token != "ctx" && token != "context" && token != "resource" && token != "crd" && token != "filter" && token != "crs" {
+	if !commandSupportsArgument(token) {
 		return false
 	}
 	if len(commandCandidates) < 2 {
@@ -1426,4 +1724,13 @@ func prefersArgumentCompletion(token string, commandCandidates []string) bool {
 		}
 	}
 	return false
+}
+
+func commandSupportsArgument(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources":
+		return true
+	default:
+		return false
+	}
 }

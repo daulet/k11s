@@ -86,6 +86,9 @@ func TestCachePreservesItemsWhenRefreshFails(t *testing.T) {
 	if payload.Items[0].Name != "svc-a" {
 		t.Fatalf("expected cached item svc-a, got %q", payload.Items[0].Name)
 	}
+	if !strings.Contains(payload.Freshness.Error, "apiserver timeout") {
+		t.Fatalf("expected freshness error to include refresh failure, got %q", payload.Freshness.Error)
+	}
 }
 
 func TestCacheKeysIncludeKubeContext(t *testing.T) {

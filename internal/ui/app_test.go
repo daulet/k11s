@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -93,6 +95,54 @@ func TestApplyCommandCRDTargetsCRs(t *testing.T) {
 	}
 	if m.session.Filter != "widgets.example.com" {
 		t.Fatalf("expected filter widgets.example.com, got %q", m.session.Filter)
+	}
+}
+
+func TestApplyCommandCRAliasSwitchesToCRs(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	updated, _, reload, err := m.applyCommand("cr")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected command to update session and trigger reload")
+	}
+	if m.session.Resource != "crs" {
+		t.Fatalf("expected resource crs, got %q", m.session.Resource)
+	}
+}
+
+func TestApplyCommandCustomResourceDefinitionsAliasSwitchesToCRDs(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	updated, _, reload, err := m.applyCommand("customresourcedefinitions")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected command to update session and trigger reload")
+	}
+	if m.session.Resource != "crds" {
+		t.Fatalf("expected resource crds, got %q", m.session.Resource)
 	}
 }
 
@@ -244,6 +294,266 @@ func TestCRDSuggestionsFromCRDList(t *testing.T) {
 	}
 }
 
+func TestCRAliasSuggestionsFromCRDList(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "crds",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "crds",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "widgets.example.com", Namespace: "-", Status: "Namespaced v1"},
+				{Name: "gadgets.example.com", Namespace: "-", Status: "Cluster v1"},
+			},
+		},
+	})
+
+	suggestions := m.commandSuggestions("cr w")
+	if len(suggestions) == 0 {
+		t.Fatalf("expected crd suggestions for cr command")
+	}
+	if suggestions[0] != "widgets.example.com" {
+		t.Fatalf("expected widgets.example.com suggestion, got %q", suggestions[0])
+	}
+}
+
+func TestCommandSuggestionsIncludeCustomResourceDefinitionAlias(t *testing.T) {
+	m := newModel(Options{})
+	suggestions := m.commandSuggestions("customresourced")
+	if len(suggestions) == 0 {
+		t.Fatalf("expected customresourcedefinition suggestions")
+	}
+	if suggestions[0] != "customresourcedefinition" {
+		t.Fatalf("expected customresourcedefinition suggestion, got %q", suggestions[0])
+	}
+}
+
+func TestCRDSuggestionsUseDaemonValues(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		CRDSuggestions: []string{"widgets.example.com", "gadgets.example.com"},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	suggestions := m.commandSuggestions("crd w")
+	if len(suggestions) == 0 {
+		t.Fatalf("expected crd suggestions from daemon values")
+	}
+	if suggestions[0] != "widgets.example.com" {
+		t.Fatalf("expected widgets.example.com suggestion, got %q", suggestions[0])
+	}
+}
+
+func TestListLinesShowErrorWhenListFails(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "crds",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "crds",
+			Namespace: "default",
+			Items:     nil,
+			Freshness: protocol.FreshnessMeta{
+				State: protocol.FreshnessStateStale,
+				Error: "crds.apiextensions.k8s.io is forbidden: User cannot list resource",
+			},
+		},
+	})
+
+	lines := m.listLines()
+	if len(lines) == 0 {
+		t.Fatalf("expected list lines to include error")
+	}
+	if !strings.Contains(lines[0], "list error:") {
+		t.Fatalf("expected first line to be list error, got %q", lines[0])
+	}
+	if !strings.Contains(strings.ToLower(lines[0]), "forbidden") {
+		t.Fatalf("expected forbidden reason in error line, got %q", lines[0])
+	}
+}
+
+func TestListLinesShowNoItemsLoadingState(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Freshness: protocol.FreshnessMeta{
+				State:              protocol.FreshnessStateCatchingUp,
+				SnapshotTimeUnixMs: 0,
+				Source:             "watch-cold",
+			},
+		},
+	})
+
+	lines := m.listLines()
+	if len(lines) == 0 || !strings.Contains(lines[0], "no items (loading)") {
+		t.Fatalf("expected loading empty-state line, got %#v", lines)
+	}
+}
+
+func TestListLinesShowNoItemsLiveState(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Freshness: protocol.FreshnessMeta{
+				State:              protocol.FreshnessStateLive,
+				SnapshotTimeUnixMs: 123,
+				Source:             "watch-cache",
+			},
+		},
+	})
+
+	lines := m.listLines()
+	if len(lines) == 0 || !strings.Contains(lines[0], "no items") || strings.Contains(lines[0], "(live)") {
+		t.Fatalf("expected live empty-state line, got %#v", lines)
+	}
+}
+
+func TestListLinesShowNoItemsCachedState(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Freshness: protocol.FreshnessMeta{
+				State:              protocol.FreshnessStateStale,
+				SnapshotTimeUnixMs: 456,
+				Source:             "watch-stale",
+			},
+		},
+	})
+
+	lines := m.listLines()
+	if len(lines) == 0 || !strings.Contains(lines[0], "no items (cached)") {
+		t.Fatalf("expected cached empty-state line, got %#v", lines)
+	}
+}
+
+func TestCRDLoaderFailureShowsInCRSView(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "crs",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "crs",
+			Namespace: "default",
+		},
+	})
+
+	updated, _ := m.Update(crdsFailedMsg{
+		kubeContext: "dev",
+		err:         fmt.Errorf("crds.apiextensions.k8s.io is forbidden"),
+	})
+	next := updated.(model)
+	if !strings.Contains(strings.ToLower(next.commandMessage), "forbidden") {
+		t.Fatalf("expected command message to include forbidden, got %q", next.commandMessage)
+	}
+
+	mainPane := next.renderMainPane(80, 10)
+	if !strings.Contains(strings.ToLower(mainPane), "forbidden") {
+		t.Fatalf("expected forbidden text in main pane, got %q", mainPane)
+	}
+	if strings.Contains(strings.ToLower(mainPane), "no items (cached)") {
+		t.Fatalf("expected centered error block instead of empty cached state, got %q", mainPane)
+	}
+}
+
+func TestRenderMainPaneWrapsErrorAndHidesEmptyState(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Freshness: protocol.FreshnessMeta{
+				State: protocol.FreshnessStateStale,
+				Error: "pods is forbidden: User cannot list resource pods in API group in the namespace default",
+			},
+		},
+		UseColor: true,
+	})
+
+	mainPane := m.renderMainPane(48, 8)
+	if !strings.Contains(strings.ToLower(mainPane), "forbidden") {
+		t.Fatalf("expected forbidden text in main pane, got %q", mainPane)
+	}
+	if strings.Contains(strings.ToLower(mainPane), "no items (live)") ||
+		strings.Contains(strings.ToLower(mainPane), "no items (cached)") ||
+		strings.Contains(strings.ToLower(mainPane), "no items (loading)") {
+		t.Fatalf("expected error block without empty-state labels, got %q", mainPane)
+	}
+}
+
+func TestRenderMainPaneCentersNoItemsState(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Freshness: protocol.FreshnessMeta{
+				State:              protocol.FreshnessStateLive,
+				SnapshotTimeUnixMs: 123,
+				Source:             "watch-cache",
+			},
+		},
+		UseColor: true,
+	})
+
+	mainPane := m.renderMainPane(64, 9)
+	lines := strings.Split(mainPane, "\n")
+	ansiRE := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	foundAt := -1
+	for i, line := range lines {
+		plain := ansiRE.ReplaceAllString(line, "")
+		if strings.Contains(plain, "no items") {
+			foundAt = i
+			break
+		}
+	}
+	if foundAt == -1 {
+		t.Fatalf("expected no items label in main pane, got %q", mainPane)
+	}
+	if foundAt <= 2 {
+		t.Fatalf("expected centered no-items label, got line index %d in %q", foundAt, mainPane)
+	}
+}
+
 func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 	var seen protocol.ResourceListQuery
 
@@ -341,6 +651,41 @@ func TestLoadNamespacesUsesSessionContext(t *testing.T) {
 	}
 	if loaded.kubeContext != "prod-cluster" {
 		t.Fatalf("expected loaded context prod-cluster, got %q", loaded.kubeContext)
+	}
+}
+
+func TestLoadCRDsUsesSessionContext(t *testing.T) {
+	var seenContext string
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "prod-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		LoadCRDs: func(_ context.Context, kubeContext string) ([]string, error) {
+			seenContext = kubeContext
+			return []string{"widgets.example.com"}, nil
+		},
+	})
+
+	cmd := m.loadCRDsCmd(m.session.KubeContext)
+	if cmd == nil {
+		t.Fatalf("expected crd load command")
+	}
+	msg := cmd()
+	loaded, ok := msg.(crdsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected crdsLoadedMsg, got %T", msg)
+	}
+	if seenContext != "prod-cluster" {
+		t.Fatalf("expected context prod-cluster, got %q", seenContext)
+	}
+	if loaded.kubeContext != "prod-cluster" {
+		t.Fatalf("expected loaded context prod-cluster, got %q", loaded.kubeContext)
+	}
+	if len(loaded.names) != 1 || loaded.names[0] != "widgets.example.com" {
+		t.Fatalf("unexpected crd names payload: %#v", loaded.names)
 	}
 }
 
@@ -589,7 +934,7 @@ func TestEscClearsAutocompleteWithoutClosingCommandMode(t *testing.T) {
 	}
 }
 
-func TestEnterAcceptsAutocompleteBeforeApplyingCommand(t *testing.T) {
+func TestEnterAcceptsAutocompleteAndAppliesCommand(t *testing.T) {
 	var seen protocol.ResourceListQuery
 
 	m := newModel(Options{
@@ -628,27 +973,12 @@ func TestEnterAcceptsAutocompleteBeforeApplyingCommand(t *testing.T) {
 		t.Fatalf("expected autocomplete active after tab")
 	}
 	updated, cmd := withAutocomplete.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	afterAccept := updated.(model)
-	if cmd != nil {
-		t.Fatalf("expected no reload command when enter only accepts autocomplete")
-	}
-	if !afterAccept.commandMode {
-		t.Fatalf("expected command mode to stay open after accepting autocomplete")
-	}
-	if got := afterAccept.input.Value(); got != "ctx mc1" {
-		t.Fatalf("expected enter to accept selected suggestion ctx mc1, got %q", got)
-	}
-	if afterAccept.autocomplete.active {
-		t.Fatalf("expected autocomplete to clear after accept")
-	}
-
-	updated, cmd = afterAccept.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	afterApply := updated.(model)
 	if afterApply.commandMode {
-		t.Fatalf("expected command mode closed after apply")
+		t.Fatalf("expected command mode closed after enter apply")
 	}
 	if cmd == nil {
-		t.Fatalf("expected reload command from second enter apply")
+		t.Fatalf("expected reload command from enter apply")
 	}
 	msg := cmd()
 	updated, _ = afterApply.Update(msg)

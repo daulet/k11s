@@ -319,6 +319,7 @@ func (c *Cache) buildFreshnessMeta(entry *cacheEntry, now time.Time, simulateSta
 		AgeMs:              0,
 		WatchHealthy:       entry.lastErr == "" && !entry.lastSync.IsZero(),
 		Source:             "cache-cold",
+		Error:              entry.lastErr,
 	}
 	if entry.watching {
 		meta.Source = "watch-cold"

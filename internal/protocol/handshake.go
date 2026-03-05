@@ -61,6 +61,7 @@ type FreshnessMeta struct {
 	AgeMs              int64          `json:"ageMs"`
 	WatchHealthy       bool           `json:"watchHealthy"`
 	Source             string         `json:"source"`
+	Error              string         `json:"error,omitempty"`
 }
 
 type ResourceListQuery struct {
