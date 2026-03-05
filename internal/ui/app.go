@@ -33,6 +33,7 @@ const (
 	defaultBackgroundRefreshInterval = 1200 * time.Millisecond
 	defaultNamespaceRefreshInterval  = 5 * time.Second
 	defaultCRDRefreshInterval        = 5 * time.Second
+	defaultLogsFollowInterval        = 1500 * time.Millisecond
 )
 
 type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error)
@@ -97,18 +98,21 @@ type actionFailedMsg struct {
 }
 
 type logsLoadedMsg struct {
-	seq     int
-	payload protocol.LogsPayload
+	seq      int
+	payload  protocol.LogsPayload
+	announce bool
 }
 
 type logsFailedMsg struct {
-	seq int
-	err error
+	seq      int
+	err      error
+	announce bool
 }
 
 type pollTickMsg struct{}
 type namespacePollTickMsg struct{}
 type crdPollTickMsg struct{}
+type logsPollTickMsg struct{}
 
 type namespacesLoadedMsg struct {
 	kubeContext string
@@ -293,6 +297,9 @@ type model struct {
 	logsLoading        bool
 	logsRequestSeq     int
 	logsActiveSeq      int
+	logsFollow         bool
+	logsFollowQuery    protocol.LogsQuery
+	logsPollEvery      time.Duration
 	pollEvery          time.Duration
 	namespacePollEvery time.Duration
 	crdPollEvery       time.Duration
@@ -357,6 +364,7 @@ func newModel(opts Options) model {
 		pollEvery:            defaultBackgroundRefreshInterval,
 		namespacePollEvery:   defaultNamespaceRefreshInterval,
 		crdPollEvery:         defaultCRDRefreshInterval,
+		logsPollEvery:        defaultLogsFollowInterval,
 	}
 	m.selectFromSession()
 	return m
@@ -401,6 +409,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tickCmd
 		}
 		return m, tea.Batch(tickCmd, m.loadCRDsCmd(m.session.KubeContext))
+	case logsPollTickMsg:
+		if !m.logsFollow {
+			return m, nil
+		}
+		if m.commandMode || m.logsLoading || m.loadLogs == nil {
+			return m, m.scheduleLogsPoll()
+		}
+		m.logsRequestSeq++
+		m.logsActiveSeq = m.logsRequestSeq
+		m.logsLoading = true
+		return m, m.loadLogsCmd(m.logsActiveSeq, m.logsFollowQuery, false)
 	case listLoadedMsg:
 		if msg.seq != m.activeSeq {
 			return m, nil
@@ -481,14 +500,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.logsLoading = false
 		m.logs = msg.payload
-		m.commandMessage = fmt.Sprintf("logs loaded: %d lines for %s", len(msg.payload.Lines), msg.payload.Name)
+		if msg.announce {
+			m.commandMessage = fmt.Sprintf("logs loaded: %d lines for %s", len(msg.payload.Lines), msg.payload.Name)
+		}
+		if m.logsFollow {
+			return m, m.scheduleLogsPoll()
+		}
 		return m, nil
 	case logsFailedMsg:
 		if msg.seq != m.logsActiveSeq {
 			return m, nil
 		}
 		m.logsLoading = false
-		m.commandMessage = fmt.Sprintf("logs failed: %v", msg.err)
+		if msg.announce {
+			m.commandMessage = fmt.Sprintf("logs failed: %v", msg.err)
+		} else if m.logsFollow {
+			m.commandMessage = fmt.Sprintf("logs refresh failed: %v", msg.err)
+		}
+		if m.logsFollow {
+			return m, m.scheduleLogsPoll()
+		}
 		return m, nil
 	case namespacesLoadedMsg:
 		if msg.kubeContext != strings.TrimSpace(m.session.KubeContext) {
@@ -893,21 +924,36 @@ func (m model) logsQueryFromCommand(input string) (protocol.LogsQuery, bool, err
 		return protocol.LogsQuery{}, true, fmt.Errorf("logs are currently supported in pods view only")
 	}
 
-	name, itemNamespace, err := m.actionTargetFromFields(fields[1:])
-	if err != nil {
-		return protocol.LogsQuery{}, true, err
+	nonFollowArgs := make([]string, 0, len(fields)-1)
+	follow := false
+	for _, arg := range fields[1:] {
+		if isLogsFollowToken(arg) {
+			follow = true
+			continue
+		}
+		nonFollowArgs = append(nonFollowArgs, arg)
 	}
 
 	tailLines := int64(200)
-	if len(fields) >= 3 {
-		parsed, parseErr := strconv.Atoi(strings.TrimSpace(fields[2]))
+	targetArgs := nonFollowArgs
+	if len(nonFollowArgs) > 1 {
+		parsed, parseErr := strconv.Atoi(strings.TrimSpace(nonFollowArgs[len(nonFollowArgs)-1]))
 		if parseErr != nil {
-			return protocol.LogsQuery{}, true, fmt.Errorf("invalid logs tail lines %q", fields[2])
+			return protocol.LogsQuery{}, true, fmt.Errorf("invalid logs tail lines %q", nonFollowArgs[len(nonFollowArgs)-1])
 		}
 		if parsed <= 0 {
 			return protocol.LogsQuery{}, true, fmt.Errorf("logs tail lines must be > 0")
 		}
 		tailLines = int64(parsed)
+		targetArgs = nonFollowArgs[:len(nonFollowArgs)-1]
+	}
+	if len(targetArgs) > 1 {
+		return protocol.LogsQuery{}, true, fmt.Errorf("logs accepts at most one target: try `:logs <pod> [tailLines] [-f]`")
+	}
+
+	name, itemNamespace, err := m.actionTargetFromFields(targetArgs)
+	if err != nil {
+		return protocol.LogsQuery{}, true, err
 	}
 
 	return protocol.LogsQuery{
@@ -918,6 +964,7 @@ func (m model) logsQueryFromCommand(input string) (protocol.LogsQuery, bool, err
 		ItemNamespace: itemNamespace,
 		Name:          name,
 		TailLines:     tailLines,
+		Follow:        follow,
 	}, true, nil
 }
 
@@ -979,8 +1026,14 @@ func (m model) startLogs(query protocol.LogsQuery) (tea.Model, tea.Cmd) {
 	m.logsActiveSeq = m.logsRequestSeq
 	m.logsLoading = true
 	m.logs = protocol.LogsPayload{}
-	m.commandMessage = fmt.Sprintf("loading logs for %s...", query.Name)
-	return m, m.loadLogsCmd(m.logsActiveSeq, query)
+	m.logsFollow = query.Follow
+	m.logsFollowQuery = query
+	if query.Follow {
+		m.commandMessage = fmt.Sprintf("following logs for %s...", query.Name)
+	} else {
+		m.commandMessage = fmt.Sprintf("loading logs for %s...", query.Name)
+	}
+	return m, m.loadLogsCmd(m.logsActiveSeq, query, true)
 }
 
 func (m model) loadListCmd(seq int, query protocol.ResourceListQuery, announce bool) tea.Cmd {
@@ -1051,12 +1104,13 @@ func (m model) loadActionCmd(seq int, query protocol.ActionQuery) tea.Cmd {
 	}
 }
 
-func (m model) loadLogsCmd(seq int, query protocol.LogsQuery) tea.Cmd {
+func (m model) loadLogsCmd(seq int, query protocol.LogsQuery, announce bool) tea.Cmd {
 	if m.loadLogs == nil {
 		return func() tea.Msg {
 			return logsFailedMsg{
-				seq: seq,
-				err: fmt.Errorf("logs loader is not configured"),
+				seq:      seq,
+				err:      fmt.Errorf("logs loader is not configured"),
+				announce: announce,
 			}
 		}
 	}
@@ -1066,9 +1120,9 @@ func (m model) loadLogsCmd(seq int, query protocol.LogsQuery) tea.Cmd {
 
 		payload, err := m.loadLogs(ctx, query)
 		if err != nil {
-			return logsFailedMsg{seq: seq, err: err}
+			return logsFailedMsg{seq: seq, err: err, announce: announce}
 		}
-		return logsLoadedMsg{seq: seq, payload: payload}
+		return logsLoadedMsg{seq: seq, payload: payload, announce: announce}
 	}
 }
 
@@ -1144,6 +1198,16 @@ func (m model) scheduleCRDPoll() tea.Cmd {
 	}
 	return tea.Tick(interval, func(time.Time) tea.Msg {
 		return crdPollTickMsg{}
+	})
+}
+
+func (m model) scheduleLogsPoll() tea.Cmd {
+	interval := m.logsPollEvery
+	if interval <= 0 {
+		interval = defaultLogsFollowInterval
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg {
+		return logsPollTickMsg{}
 	})
 }
 
@@ -1555,6 +1619,8 @@ func (m *model) clearLogs() {
 	m.logsRequestSeq++
 	m.logsActiveSeq = m.logsRequestSeq
 	m.logsLoading = false
+	m.logsFollow = false
+	m.logsFollowQuery = protocol.LogsQuery{}
 	m.logs = protocol.LogsPayload{}
 }
 
@@ -1651,15 +1717,19 @@ func (m model) detailLines() []string {
 }
 
 func (m model) logsLines() []string {
-	if m.logsLoading {
-		return []string{"logs: loading..."}
-	}
 	if m.logs.Name == "" && len(m.logs.Lines) == 0 {
+		if m.logsLoading {
+			return []string{"logs: loading..."}
+		}
 		return nil
 	}
 
+	header := fmt.Sprintf("logs: %s/%s", strings.TrimSpace(m.logs.ItemNamespace), strings.TrimSpace(m.logs.Name))
+	if m.logsFollow {
+		header += " (following)"
+	}
 	lines := []string{
-		fmt.Sprintf("logs: %s/%s", strings.TrimSpace(m.logs.ItemNamespace), strings.TrimSpace(m.logs.Name)),
+		header,
 	}
 	displayLines := m.logs.Lines
 	const maxLines = 20
@@ -1672,6 +1742,9 @@ func (m model) logsLines() []string {
 	}
 	if m.logs.Truncated {
 		lines = append(lines, "  ... output truncated")
+	}
+	if m.logsLoading && m.logsFollow {
+		lines = append(lines, "  refreshing...")
 	}
 	return lines
 }
@@ -2202,6 +2275,15 @@ func prefersArgumentCompletion(token string, commandCandidates []string) bool {
 		}
 	}
 	return false
+}
+
+func isLogsFollowToken(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "-f", "--follow", "follow":
+		return true
+	default:
+		return false
+	}
 }
 
 func commandSupportsArgument(token string) bool {

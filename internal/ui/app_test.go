@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -445,6 +446,9 @@ func TestLogsCommandLoadsPayload(t *testing.T) {
 	if logsSeen.Name != "api" || logsSeen.TailLines != 200 {
 		t.Fatalf("unexpected logs query: %#v", logsSeen)
 	}
+	if logsSeen.Follow {
+		t.Fatalf("expected logs command without follow to keep follow=false")
+	}
 }
 
 func TestLogsCommandRequiresPodsView(t *testing.T) {
@@ -478,6 +482,147 @@ func TestLogsCommandRequiresPodsView(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(next.commandMessage), "pods view") {
 		t.Fatalf("expected pods-view validation message, got %q", next.commandMessage)
+	}
+}
+
+func TestLogsCommandParsesFollowAndTail(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	query, isLogs, err := m.logsQueryFromCommand("logs api 500 -f")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !isLogs {
+		t.Fatalf("expected logs command to be detected")
+	}
+	if query.Name != "api" || query.TailLines != 500 || !query.Follow {
+		t.Fatalf("unexpected logs query: %#v", query)
+	}
+}
+
+func TestLogsCommandParsesFollowWithoutExplicitTarget(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	query, isLogs, err := m.logsQueryFromCommand("logs follow")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !isLogs {
+		t.Fatalf("expected logs command to be detected")
+	}
+	if query.Name != "api" || query.TailLines != 200 || !query.Follow {
+		t.Fatalf("unexpected logs query: %#v", query)
+	}
+}
+
+func TestLogsFollowSchedulesPollingRefresh(t *testing.T) {
+	callCount := 0
+	var seen []protocol.LogsQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadLogs: func(_ context.Context, query protocol.LogsQuery) (protocol.LogsPayload, error) {
+			callCount++
+			seen = append(seen, query)
+			return protocol.LogsPayload{
+				Resource:      "pods",
+				Namespace:     "default",
+				ItemNamespace: "default",
+				Name:          "api",
+				Lines:         []string{fmt.Sprintf("line-%d", callCount)},
+			}, nil
+		},
+	})
+	m.logsPollEvery = time.Nanosecond
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("logs -f")
+
+	updated, firstLoadCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterApply := updated.(model)
+	if !afterApply.logsFollow {
+		t.Fatalf("expected logs follow mode to be enabled")
+	}
+	if firstLoadCmd == nil {
+		t.Fatalf("expected first logs load command")
+	}
+
+	firstMsg := firstLoadCmd()
+	updated, pollCmd := afterApply.Update(firstMsg)
+	afterFirstLoad := updated.(model)
+	if afterFirstLoad.logs.Name != "api" || len(afterFirstLoad.logs.Lines) != 1 {
+		t.Fatalf("unexpected first logs payload: %#v", afterFirstLoad.logs)
+	}
+	if pollCmd == nil {
+		t.Fatalf("expected follow mode to schedule poll")
+	}
+
+	updated, secondLoadCmd := afterFirstLoad.Update(logsPollTickMsg{})
+	afterTick := updated.(model)
+	if !afterTick.logsLoading {
+		t.Fatalf("expected background follow refresh to start loading")
+	}
+	if secondLoadCmd == nil {
+		t.Fatalf("expected refresh logs load command on tick")
+	}
+
+	secondMsg := secondLoadCmd()
+	updated, nextPollCmd := afterTick.Update(secondMsg)
+	afterSecondLoad := updated.(model)
+	if afterSecondLoad.logsLoading {
+		t.Fatalf("expected logs loading to be cleared after refresh")
+	}
+	if len(afterSecondLoad.logs.Lines) != 1 || afterSecondLoad.logs.Lines[0] != "line-2" {
+		t.Fatalf("expected second refresh payload, got %#v", afterSecondLoad.logs)
+	}
+	if nextPollCmd == nil {
+		t.Fatalf("expected next poll scheduling after refresh")
+	}
+	if len(seen) != 2 || !seen[0].Follow || !seen[1].Follow {
+		t.Fatalf("expected follow=true on all logs refresh queries, got %#v", seen)
 	}
 }
 

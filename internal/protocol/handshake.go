@@ -162,6 +162,7 @@ type LogsQuery struct {
 	ItemNamespace string `json:"itemNamespace,omitempty"`
 	Name          string `json:"name"`
 	TailLines     int64  `json:"tailLines,omitempty"`
+	Follow        bool   `json:"follow,omitempty"`
 }
 
 type LogsPayload struct {
