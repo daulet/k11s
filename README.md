@@ -86,11 +86,13 @@ Command line examples:
 - `:pods`, `:services`, `:deployments` (switch resource view)
 - `:crds` (list custom resource definitions)
 - `:crs widgets.example.com` or `:crd widgets.example.com` (list CRs for a selected CRD)
+- `:delete` (delete selected row), `:delete <name>`, or `:delete <namespace>/<name>` when in `all` namespace
 
 Autocomplete notes:
 - `:ctx ` / `:context ` suggestions are loaded from kubeconfig (`KUBECONFIG` or `~/.kube/config`).
 - `:ns ` / `:namespace ` suggestions are loaded via daemon RPC and refreshed per selected kube context.
 - `:crd ` / `:crs ` / `:filter ` suggestions are loaded from cached `crds` via daemon RPC and refreshed per selected kube context.
+- Mutating commands require a `LIVE` view; stale or recovering views fail with `STALE_DATA` guardrail feedback.
 
 CI checks:
 - `.github/workflows/ci.yml` runs format, vet, tests, startup smoke test, and advisory perf sanity.

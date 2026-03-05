@@ -18,6 +18,7 @@ import (
 	"github.com/daulet/k11s/internal/kube"
 	"github.com/daulet/k11s/internal/protocol"
 	"github.com/daulet/k11s/internal/session"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
@@ -50,6 +51,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	clientFactory := kube.NewClientFactory()
 	resourceCache := resourcecache.New(ctx, kube.NewResourceFetcher(clientFactory), logger)
 	namespaceCache := namespacecache.New(ctx, kube.NewNamespaceFetcher(clientFactory), logger)
+	actionExecutor := kube.NewActionExecutor(clientFactory)
 
 	var shutdownOnce sync.Once
 	shutdown := func() {
@@ -74,7 +76,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 			continue
 		}
 
-		go handleConn(conn, daemonVersion, shutdown, store, resourceCache, namespaceCache, logger)
+		go handleConn(conn, daemonVersion, shutdown, store, resourceCache, namespaceCache, actionExecutor, logger)
 	}
 }
 
@@ -85,6 +87,7 @@ func handleConn(
 	store *session.Store,
 	resourceCache *resourcecache.Cache,
 	namespaceCache *namespacecache.Cache,
+	actionExecutor *kube.ActionExecutor,
 	logger *log.Logger,
 ) {
 	defer conn.Close()
@@ -222,10 +225,139 @@ func handleConn(
 		resp := protocol.BuildNamespaceListResponse(req, daemonVersion, os.Getpid(), payload)
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
+	case protocol.IntentAction:
+		if req.ActionQuery == nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "missing action query payload",
+			})
+			return
+		}
+
+		query := normalizeActionQuery(*req.ActionQuery)
+		result := executeAction(context.Background(), query, resourceCache, actionExecutor)
+		resp := protocol.BuildActionResponse(req, daemonVersion, os.Getpid(), result)
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
 	}
 
 	resp := protocol.BuildHandshakeResponse(req, daemonVersion, os.Getpid())
 	_ = json.NewEncoder(conn).Encode(resp)
+}
+
+func executeAction(
+	ctx context.Context,
+	query protocol.ActionQuery,
+	resourceCache *resourcecache.Cache,
+	actionExecutor *kube.ActionExecutor,
+) protocol.ActionResult {
+	if strings.TrimSpace(query.Action) == "" {
+		return protocol.ActionResult{
+			Success: false,
+			Code:    protocol.ActionCodeValidation,
+			Message: "action is required",
+		}
+	}
+	if query.Action != protocol.ActionDelete {
+		return protocol.ActionResult{
+			Success: false,
+			Code:    protocol.ActionCodeUnsupported,
+			Message: fmt.Sprintf("unsupported action %q", query.Action),
+		}
+	}
+	if strings.TrimSpace(query.Name) == "" {
+		return protocol.ActionResult{
+			Success: false,
+			Code:    protocol.ActionCodeValidation,
+			Message: "action target name is required",
+		}
+	}
+
+	listPayload := resourceCache.Get(protocol.ResourceListQuery{
+		KubeContext: query.KubeContext,
+		Resource:    query.Resource,
+		Namespace:   query.Namespace,
+		Filter:      query.Filter,
+	})
+	if listPayload.Freshness.State != protocol.FreshnessStateLive || strings.TrimSpace(listPayload.Freshness.Error) != "" {
+		message := fmt.Sprintf(
+			"view freshness is %s (source=%s); refresh before running %s",
+			listPayload.Freshness.State,
+			listPayload.Freshness.Source,
+			query.Action,
+		)
+		if errText := strings.TrimSpace(listPayload.Freshness.Error); errText != "" {
+			message = fmt.Sprintf("view is not fresh: %s", errText)
+		}
+		return protocol.ActionResult{
+			Success: false,
+			Code:    protocol.ActionCodeStaleData,
+			Message: message,
+		}
+	}
+
+	if actionExecutor == nil {
+		return protocol.ActionResult{
+			Success: false,
+			Code:    protocol.ActionCodeInternal,
+			Message: "action executor is not configured",
+		}
+	}
+
+	if err := actionExecutor.Delete(ctx, query); err != nil {
+		return mapActionError(err)
+	}
+
+	target := query.Name
+	if query.ItemNamespace != "" {
+		target = query.ItemNamespace + "/" + query.Name
+	}
+	return protocol.ActionResult{
+		Success: true,
+		Code:    protocol.ActionCodeOK,
+		Message: fmt.Sprintf("deleted %s %s", query.Resource, target),
+	}
+}
+
+func mapActionError(err error) protocol.ActionResult {
+	code := protocol.ActionCodeInternal
+	switch {
+	case errors.Is(err, kube.ErrUnsupportedActionResource):
+		code = protocol.ActionCodeUnsupported
+	case errors.Is(err, kube.ErrActionValidation):
+		code = protocol.ActionCodeValidation
+	case apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err):
+		code = protocol.ActionCodeAuth
+	case apierrors.IsNotFound(err):
+		code = protocol.ActionCodeNotFound
+	case apierrors.IsBadRequest(err) || apierrors.IsInvalid(err):
+		code = protocol.ActionCodeValidation
+	}
+	return protocol.ActionResult{
+		Success: false,
+		Code:    code,
+		Message: err.Error(),
+	}
+}
+
+func normalizeActionQuery(query protocol.ActionQuery) protocol.ActionQuery {
+	query.Action = strings.TrimSpace(strings.ToLower(query.Action))
+	query.KubeContext = strings.TrimSpace(query.KubeContext)
+	query.Resource = strings.TrimSpace(strings.ToLower(query.Resource))
+	if query.Resource == "" {
+		query.Resource = "pods"
+	}
+	query.Namespace = strings.TrimSpace(query.Namespace)
+	if query.Namespace == "" {
+		query.Namespace = "default"
+	}
+	query.Filter = strings.TrimSpace(query.Filter)
+	query.ItemNamespace = strings.TrimSpace(query.ItemNamespace)
+	query.Name = strings.TrimSpace(query.Name)
+	return query
 }
 
 func buildPlaceholderResourceList(query protocol.ResourceListQuery) protocol.ResourceListPayload {

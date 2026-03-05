@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQ
 type LoadResourceDetailFunc func(ctx context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error)
 type LoadNamespacesFunc func(ctx context.Context, kubeContext string) (protocol.NamespaceListPayload, error)
 type LoadCRDsFunc func(ctx context.Context, kubeContext string) ([]string, error)
+type LoadActionFunc func(ctx context.Context, query protocol.ActionQuery) (protocol.ActionResult, error)
 
 type Options struct {
 	Session              protocol.SessionState
@@ -50,6 +52,7 @@ type Options struct {
 	LoadResourceDetail   LoadResourceDetailFunc
 	LoadNamespaces       LoadNamespacesFunc
 	LoadCRDs             LoadCRDsFunc
+	LoadAction           LoadActionFunc
 }
 
 type Result struct {
@@ -78,6 +81,16 @@ type detailFailedMsg struct {
 	seq      int
 	err      error
 	announce bool
+}
+
+type actionLoadedMsg struct {
+	seq    int
+	result protocol.ActionResult
+}
+
+type actionFailedMsg struct {
+	seq int
+	err error
 }
 
 type pollTickMsg struct{}
@@ -116,6 +129,7 @@ type keyMap struct {
 	Detail       key.Binding
 	Command      key.Binding
 	Autocomplete key.Binding
+	ReverseTab   key.Binding
 	Accept       key.Binding
 	Apply        key.Binding
 	Quit         key.Binding
@@ -143,6 +157,10 @@ func defaultKeyMap() keyMap {
 			key.WithKeys("tab"),
 			key.WithHelp("tab", "complete"),
 		),
+		ReverseTab: key.NewBinding(
+			key.WithKeys("shift+tab", "backtab"),
+			key.WithHelp("S-tab", "prev"),
+		),
 		Accept: key.NewBinding(
 			key.WithKeys("right"),
 			key.WithHelp("->", "accept"),
@@ -159,11 +177,11 @@ func defaultKeyMap() keyMap {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Detail, k.Command, k.Autocomplete, k.Accept, k.Apply, k.Quit}
+	return []key.Binding{k.Up, k.Detail, k.Command, k.Autocomplete, k.ReverseTab, k.Accept, k.Apply, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{{k.Up, k.Down, k.Detail, k.Command, k.Autocomplete, k.Accept, k.Apply, k.Quit}}
+	return [][]key.Binding{{k.Up, k.Down, k.Detail, k.Command, k.Autocomplete, k.ReverseTab, k.Accept, k.Apply, k.Quit}}
 }
 
 type styles struct {
@@ -237,6 +255,7 @@ type model struct {
 	loadResourceDetail LoadResourceDetailFunc
 	loadNamespaces     LoadNamespacesFunc
 	loadCRDs           LoadCRDsFunc
+	loadAction         LoadActionFunc
 
 	input          textinput.Model
 	commandMode    bool
@@ -253,6 +272,9 @@ type model struct {
 	detailLoading      bool
 	detailRequestSeq   int
 	detailActiveSeq    int
+	actionLoading      bool
+	actionRequestSeq   int
+	actionActiveSeq    int
 	pollEvery          time.Duration
 	namespacePollEvery time.Duration
 	crdPollEvery       time.Duration
@@ -308,6 +330,7 @@ func newModel(opts Options) model {
 		loadResourceDetail:   opts.LoadResourceDetail,
 		loadNamespaces:       opts.LoadNamespaces,
 		loadCRDs:             opts.LoadCRDs,
+		loadAction:           opts.LoadAction,
 		input:                input,
 		keys:                 keys,
 		help:                 h,
@@ -406,6 +429,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.commandMessage = fmt.Sprintf("detail load failed: %v", msg.err)
 		}
 		return m, nil
+	case actionLoadedMsg:
+		if msg.seq != m.actionActiveSeq {
+			return m, nil
+		}
+		m.actionLoading = false
+		if !msg.result.Success {
+			code := strings.TrimSpace(string(msg.result.Code))
+			if code == "" {
+				code = string(protocol.ActionCodeInternal)
+			}
+			m.commandMessage = fmt.Sprintf("action failed (%s): %s", code, msg.result.Message)
+			return m, nil
+		}
+		m.commandMessage = msg.result.Message
+		if m.loadResourceList == nil {
+			return m, nil
+		}
+		updatedModel, listCmd := m.startListReloadWithAnnouncement(false)
+		return updatedModel, listCmd
+	case actionFailedMsg:
+		if msg.seq != m.actionActiveSeq {
+			return m, nil
+		}
+		m.actionLoading = false
+		m.commandMessage = fmt.Sprintf("action request failed: %v", msg.err)
+		return m, nil
 	case namespacesLoadedMsg:
 		if msg.kubeContext != strings.TrimSpace(m.session.KubeContext) {
 			return m, nil
@@ -493,7 +542,16 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case msg.String() == "ctrl+c":
 		return m, tea.Quit
 	case key.Matches(msg, m.keys.Autocomplete):
-		m.triggerAutocomplete()
+		m.triggerAutocompleteStep(1)
+		return m, nil
+	case key.Matches(msg, m.keys.ReverseTab):
+		m.triggerAutocompleteStep(-1)
+		return m, nil
+	case msg.Type == tea.KeyDown && m.autocomplete.active:
+		m.triggerAutocompleteStep(1)
+		return m, nil
+	case msg.Type == tea.KeyUp && m.autocomplete.active:
+		m.triggerAutocompleteStep(-1)
 		return m, nil
 	case key.Matches(msg, m.keys.Accept) && m.autocomplete.active:
 		m.acceptAutocomplete()
@@ -503,7 +561,6 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.acceptAutocomplete()
 		}
 		commandText := strings.TrimSpace(m.input.Value())
-		previousContext := m.session.KubeContext
 		m.commandMode = false
 		m.input.Blur()
 		m.input.SetValue("")
@@ -512,6 +569,19 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if commandText == "" {
 			return m, nil
 		}
+		if actionQuery, isAction, actionErr := m.actionQueryFromCommand(commandText); isAction {
+			if actionErr != nil {
+				m.commandMode = true
+				m.input.Focus()
+				m.input.SetValue(commandText)
+				m.commandMessage = actionErr.Error()
+				m.suggestions = m.commandSuggestions(m.input.Value())
+				return m, nil
+			}
+			return m.startAction(actionQuery)
+		}
+
+		previousContext := m.session.KubeContext
 
 		updated, message, reload, err := m.applyCommand(commandText)
 		if err != nil {
@@ -649,7 +719,64 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 	}
 }
 
+func (m model) actionQueryFromCommand(input string) (protocol.ActionQuery, bool, error) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return protocol.ActionQuery{}, false, nil
+	}
+
+	command := strings.ToLower(strings.TrimSpace(fields[0]))
+	switch command {
+	case "delete", "del", "rm":
+	default:
+		return protocol.ActionQuery{}, false, nil
+	}
+
+	var name string
+	itemNamespace := ""
+	if len(fields) >= 2 {
+		target := strings.TrimSpace(fields[1])
+		if target == "" {
+			return protocol.ActionQuery{}, true, fmt.Errorf("delete target name is required")
+		}
+		if ns, itemName, ok := strings.Cut(target, "/"); ok {
+			itemNamespace = strings.TrimSpace(ns)
+			name = strings.TrimSpace(itemName)
+		} else {
+			name = target
+		}
+	} else {
+		item, ok := m.currentItem()
+		if !ok {
+			return protocol.ActionQuery{}, true, fmt.Errorf("delete target required: select an item or run `:delete <name>`")
+		}
+		name = strings.TrimSpace(item.Name)
+		itemNamespace = strings.TrimSpace(item.Namespace)
+	}
+
+	if name == "" {
+		return protocol.ActionQuery{}, true, fmt.Errorf("delete target name is required")
+	}
+	if itemNamespace == "-" || strings.EqualFold(itemNamespace, "<cluster>") {
+		itemNamespace = ""
+	}
+
+	return protocol.ActionQuery{
+		Action:        protocol.ActionDelete,
+		KubeContext:   m.session.KubeContext,
+		Resource:      m.session.Resource,
+		Namespace:     m.session.Namespace,
+		Filter:        m.session.Filter,
+		ItemNamespace: itemNamespace,
+		Name:          name,
+	}, true, nil
+}
+
 func (m model) startListReload() (tea.Model, tea.Cmd) {
+	return m.startListReloadWithAnnouncement(true)
+}
+
+func (m model) startListReloadWithAnnouncement(announce bool) (tea.Model, tea.Cmd) {
 	m.requestSeq++
 	m.activeSeq = m.requestSeq
 	m.loading = true
@@ -661,7 +788,7 @@ func (m model) startListReload() (tea.Model, tea.Cmd) {
 		Filter:        m.session.Filter,
 		SimulateStale: m.simulateStale,
 	}
-	return m, m.loadListCmd(m.activeSeq, query, true)
+	return m, m.loadListCmd(m.activeSeq, query, announce)
 }
 
 func (m model) startBackgroundReload() (tea.Model, tea.Cmd) {
@@ -688,6 +815,14 @@ func (m model) startDetailReload(announce bool) (tea.Model, tea.Cmd) {
 	m.detailActiveSeq = m.detailRequestSeq
 	m.detailLoading = true
 	return m, m.loadDetailCmd(m.detailActiveSeq, query, announce)
+}
+
+func (m model) startAction(query protocol.ActionQuery) (tea.Model, tea.Cmd) {
+	m.actionRequestSeq++
+	m.actionActiveSeq = m.actionRequestSeq
+	m.actionLoading = true
+	m.commandMessage = fmt.Sprintf("%s %s...", query.Action, query.Name)
+	return m, m.loadActionCmd(m.actionActiveSeq, query)
 }
 
 func (m model) loadListCmd(seq int, query protocol.ResourceListQuery, announce bool) tea.Cmd {
@@ -733,6 +868,28 @@ func (m model) loadDetailCmd(seq int, query protocol.ResourceDetailQuery, announ
 			return detailFailedMsg{seq: seq, err: err, announce: announce}
 		}
 		return detailLoadedMsg{seq: seq, payload: payload, announce: announce}
+	}
+}
+
+func (m model) loadActionCmd(seq int, query protocol.ActionQuery) tea.Cmd {
+	if m.loadAction == nil {
+		return func() tea.Msg {
+			return actionFailedMsg{
+				seq: seq,
+				err: fmt.Errorf("action loader is not configured"),
+			}
+		}
+	}
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		result, err := m.loadAction(ctx, query)
+		if err != nil {
+			return actionFailedMsg{seq: seq, err: err}
+		}
+		return actionLoadedMsg{seq: seq, result: result}
 	}
 }
 
@@ -1307,6 +1464,8 @@ func (m model) commandSuggestions(input string) []string {
 		return prefixMatches(m.contextCandidates(), valuePrefix)
 	case "cr", "crs", "crd", "filter", "customresource", "customresources":
 		return prefixMatches(m.crdCandidates(), valuePrefix)
+	case "delete", "del", "rm":
+		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "resource":
 		return prefixMatches(resourceSuggestions(), valuePrefix)
 	default:
@@ -1314,7 +1473,10 @@ func (m model) commandSuggestions(input string) []string {
 	}
 }
 
-func (m *model) triggerAutocomplete() {
+func (m *model) triggerAutocompleteStep(step int) {
+	if step == 0 {
+		step = 1
+	}
 	currentValue := m.input.Value()
 	options := m.autocompleteOptions(currentValue)
 	if len(options) == 0 {
@@ -1337,15 +1499,19 @@ func (m *model) triggerAutocomplete() {
 	}
 
 	if prefixChanged || !equalStringSlices(m.autocomplete.options, options) || !m.autocomplete.active {
+		initialIndex := 0
+		if step < 0 && !prefixChanged {
+			initialIndex = len(options) - 1
+		}
 		m.autocomplete = autocompleteState{
 			active:  true,
 			options: options,
-			index:   0,
+			index:   initialIndex,
 		}
 		return
 	}
 
-	m.autocomplete.index = (m.autocomplete.index + 1) % len(m.autocomplete.options)
+	m.autocomplete.index = normalizedAutocompleteIndex(m.autocomplete.index+step, len(m.autocomplete.options))
 }
 
 func (m *model) acceptAutocomplete() {
@@ -1414,7 +1580,7 @@ func (m model) renderAutocompleteStatus() string {
 
 	return m.styles.CommandHint.Render(
 		fmt.Sprintf(
-			"suggestion %d/%d: %s   next: %s   (tab cycle, -> accept, esc clear)",
+			"suggestion %d/%d: %s   next: %s   (tab/↓ next, S-tab/↑ prev, -> accept, esc clear)",
 			m.autocomplete.index+1,
 			len(m.autocomplete.options),
 			currentTail,
@@ -1560,6 +1726,32 @@ func (m model) crdCandidates() []string {
 	return values
 }
 
+func (m model) deleteCandidates() []string {
+	values := make([]string, 0, len(m.resourceList.Items))
+	seen := map[string]struct{}{}
+	appendUnique := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, exists := seen[value]; exists {
+			return
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+
+	for _, item := range m.resourceList.Items {
+		name := item.Name
+		if strings.EqualFold(m.session.Namespace, "all") && item.Namespace != "" && item.Namespace != "-" && !strings.EqualFold(item.Namespace, "<cluster>") {
+			name = item.Namespace + "/" + item.Name
+		}
+		appendUnique(name)
+	}
+	appendUnique(m.session.Selection)
+	return values
+}
+
 func baseSuggestions() []string {
 	return []string{
 		"ctx",
@@ -1572,6 +1764,9 @@ func baseSuggestions() []string {
 		"customresources",
 		"customresourcedefinition",
 		"customresourcedefinitions",
+		"delete",
+		"del",
+		"rm",
 		"ns",
 		"namespace",
 		"filter",
@@ -1696,6 +1891,14 @@ func dedupeStrings(values []string) []string {
 		seen[value] = struct{}{}
 		result = append(result, value)
 	}
+	sort.SliceStable(result, func(i int, j int) bool {
+		left := strings.ToLower(result[i])
+		right := strings.ToLower(result[j])
+		if left == right {
+			return result[i] < result[j]
+		}
+		return left < right
+	})
 	return result
 }
 
@@ -1709,6 +1912,17 @@ func equalStringSlices(a []string, b []string) bool {
 		}
 	}
 	return true
+}
+
+func normalizedAutocompleteIndex(value int, size int) int {
+	if size <= 0 {
+		return 0
+	}
+	idx := value % size
+	if idx < 0 {
+		idx += size
+	}
+	return idx
 }
 
 func prefersArgumentCompletion(token string, commandCandidates []string) bool {
@@ -1728,7 +1942,7 @@ func prefersArgumentCompletion(token string, commandCandidates []string) bool {
 
 func commandSupportsArgument(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
-	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources":
+	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm":
 		return true
 	default:
 		return false

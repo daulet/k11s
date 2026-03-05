@@ -12,6 +12,7 @@ const (
 	IntentResourceList   = "resource_list"
 	IntentResourceDetail = "resource_detail"
 	IntentNamespaceList  = "namespace_list"
+	IntentAction         = "action"
 )
 
 type HandshakeRequest struct {
@@ -23,6 +24,7 @@ type HandshakeRequest struct {
 	ListQuery      *ResourceListQuery   `json:"listQuery,omitempty"`
 	DetailQuery    *ResourceDetailQuery `json:"detailQuery,omitempty"`
 	NamespaceQuery *NamespaceListQuery  `json:"namespaceQuery,omitempty"`
+	ActionQuery    *ActionQuery         `json:"actionQuery,omitempty"`
 }
 
 type HandshakeResponse struct {
@@ -35,6 +37,7 @@ type HandshakeResponse struct {
 	ResourceList   *ResourceListPayload   `json:"resourceList,omitempty"`
 	ResourceDetail *ResourceDetailPayload `json:"resourceDetail,omitempty"`
 	NamespaceList  *NamespaceListPayload  `json:"namespaceList,omitempty"`
+	ActionResult   *ActionResult          `json:"actionResult,omitempty"`
 	Message        string                 `json:"message,omitempty"`
 }
 
@@ -113,6 +116,36 @@ type NamespaceListPayload struct {
 	KubeContext string        `json:"kubeContext,omitempty"`
 	Namespaces  []string      `json:"namespaces"`
 	Freshness   FreshnessMeta `json:"freshness"`
+}
+
+type ActionCode string
+
+const (
+	ActionCodeOK          ActionCode = "OK"
+	ActionCodeStaleData   ActionCode = "STALE_DATA"
+	ActionCodeAuth        ActionCode = "AUTH"
+	ActionCodeNotFound    ActionCode = "NOT_FOUND"
+	ActionCodeValidation  ActionCode = "VALIDATION"
+	ActionCodeUnsupported ActionCode = "UNSUPPORTED"
+	ActionCodeInternal    ActionCode = "INTERNAL"
+)
+
+const ActionDelete = "delete"
+
+type ActionQuery struct {
+	Action        string `json:"action"`
+	KubeContext   string `json:"kubeContext,omitempty"`
+	Resource      string `json:"resource"`
+	Namespace     string `json:"namespace"`
+	Filter        string `json:"filter,omitempty"`
+	ItemNamespace string `json:"itemNamespace,omitempty"`
+	Name          string `json:"name"`
+}
+
+type ActionResult struct {
+	Success bool       `json:"success"`
+	Code    ActionCode `json:"code,omitempty"`
+	Message string     `json:"message"`
 }
 
 func BuildHandshakeResponse(req HandshakeRequest, daemonVersion string, pid int) HandshakeResponse {
@@ -215,6 +248,22 @@ func BuildResourceDetailResponse(
 
 	resp.ResourceDetail = &payload
 	resp.Message = "resource detail ready"
+	return resp
+}
+
+func BuildActionResponse(
+	req HandshakeRequest,
+	daemonVersion string,
+	pid int,
+	payload ActionResult,
+) HandshakeResponse {
+	resp := BuildHandshakeResponse(req, daemonVersion, pid)
+	if !resp.Compatible {
+		return resp
+	}
+
+	resp.ActionResult = &payload
+	resp.Message = "action result ready"
 	return resp
 }
 

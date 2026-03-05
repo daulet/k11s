@@ -146,6 +146,80 @@ func TestApplyCommandCustomResourceDefinitionsAliasSwitchesToCRDs(t *testing.T) 
 	}
 }
 
+func TestDeleteCommandRunsActionAndReloadsList(t *testing.T) {
+	var actionSeen protocol.ActionQuery
+	var listSeen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadAction: func(_ context.Context, query protocol.ActionQuery) (protocol.ActionResult, error) {
+			actionSeen = query
+			return protocol.ActionResult{
+				Success: true,
+				Code:    protocol.ActionCodeOK,
+				Message: "deleted pods default/api",
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listSeen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("delete")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterApply := updated.(model)
+	if !afterApply.actionLoading {
+		t.Fatalf("expected action to start loading")
+	}
+	if cmd == nil {
+		t.Fatalf("expected action command")
+	}
+
+	msg := cmd()
+	updated, nextCmd := afterApply.Update(msg)
+	afterAction := updated.(model)
+	if nextCmd == nil {
+		t.Fatalf("expected list reload after successful action")
+	}
+	if afterAction.commandMessage != "deleted pods default/api" {
+		t.Fatalf("expected action feedback preserved, got %q", afterAction.commandMessage)
+	}
+	if actionSeen.Action != protocol.ActionDelete || actionSeen.Name != "api" {
+		t.Fatalf("unexpected action query: %#v", actionSeen)
+	}
+
+	reloadMsg := nextCmd()
+	updated, _ = afterAction.Update(reloadMsg)
+	final := updated.(model)
+	if listSeen.Resource != "pods" || listSeen.Namespace != "default" {
+		t.Fatalf("unexpected list reload query: %#v", listSeen)
+	}
+	if final.commandMessage != "deleted pods default/api" {
+		t.Fatalf("expected action message to remain after silent reload, got %q", final.commandMessage)
+	}
+}
+
 func TestApplyCommandCRsUsesSelectedCRDWhenInCRDView(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -899,6 +973,96 @@ func TestTabCyclesAndRightArrowAcceptsOption(t *testing.T) {
 	}
 	if accepted.autocomplete.active {
 		t.Fatalf("expected autocomplete to be cleared after accept")
+	}
+}
+
+func TestShiftTabCyclesAutocompleteBackward(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		NamespaceSuggestions: []string{"payments", "payroll"},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("ns pa")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	first := updated.(model)
+	if first.autocomplete.index != 0 {
+		t.Fatalf("expected first autocomplete index 0, got %d", first.autocomplete.index)
+	}
+
+	updated, _ = first.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	backward := updated.(model)
+	if backward.autocomplete.index != 1 {
+		t.Fatalf("expected shift-tab to cycle backward to index 1, got %d", backward.autocomplete.index)
+	}
+
+	updated, _ = backward.Update(tea.KeyMsg{Type: tea.KeyRight})
+	accepted := updated.(model)
+	if got := accepted.input.Value(); got != "ns payroll" {
+		t.Fatalf("expected accepted backward option ns payroll, got %q", got)
+	}
+}
+
+func TestArrowKeysCycleAutocomplete(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		NamespaceSuggestions: []string{"payments", "payroll"},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("ns pa")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	first := updated.(model)
+	if first.autocomplete.index != 0 {
+		t.Fatalf("expected first autocomplete index 0, got %d", first.autocomplete.index)
+	}
+
+	updated, _ = first.Update(tea.KeyMsg{Type: tea.KeyDown})
+	down := updated.(model)
+	if down.autocomplete.index != 1 {
+		t.Fatalf("expected down arrow to move to index 1, got %d", down.autocomplete.index)
+	}
+
+	updated, _ = down.Update(tea.KeyMsg{Type: tea.KeyUp})
+	up := updated.(model)
+	if up.autocomplete.index != 0 {
+		t.Fatalf("expected up arrow to move back to index 0, got %d", up.autocomplete.index)
+	}
+}
+
+func TestAutocompleteOptionsAreSortedAlphabetically(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "zeta", Namespace: "default", Status: "Running"},
+				{Name: "alpha", Namespace: "default", Status: "Running"},
+			},
+		},
+	})
+
+	options := m.autocompleteOptions("delete ")
+	if len(options) < 2 {
+		t.Fatalf("expected at least two delete options, got %#v", options)
+	}
+	if options[0] != "delete alpha" || options[1] != "delete zeta" {
+		t.Fatalf("expected sorted delete options, got %#v", options)
 	}
 }
 

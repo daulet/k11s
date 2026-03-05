@@ -1,0 +1,3 @@
+- [x] order of tab completions - sorted alphabetically?
+- [x] shift tab to go back in suggestion
+- [x] arrows up/down should work too?

@@ -182,3 +182,29 @@ func TestBuildResourceDetailResponse(t *testing.T) {
 		t.Fatalf("unexpected detail item: %#v", resp.ResourceDetail.Item)
 	}
 }
+
+func TestBuildActionResponse(t *testing.T) {
+	payload := ActionResult{
+		Success: true,
+		Code:    ActionCodeOK,
+		Message: "deleted pods default/api",
+	}
+	resp := BuildActionResponse(
+		HandshakeRequest{RPCVersion: RPCVersion, Intent: IntentAction},
+		"dev",
+		123,
+		payload,
+	)
+	if !resp.Compatible {
+		t.Fatalf("expected compatible response")
+	}
+	if resp.ActionResult == nil {
+		t.Fatalf("expected action payload")
+	}
+	if !resp.ActionResult.Success {
+		t.Fatalf("expected success action result")
+	}
+	if resp.ActionResult.Code != ActionCodeOK {
+		t.Fatalf("unexpected action code: %q", resp.ActionResult.Code)
+	}
+}
