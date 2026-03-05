@@ -51,3 +51,7 @@ Session override flags (persisted through daemon):
 - `--resource`
 - `--filter`
 - `--selection`
+
+Perf measurement:
+- `k11s debug perf` prints startup output, span timings, and JSON report.
+- `k11s debug perf --json-only` prints machine-readable JSON only.

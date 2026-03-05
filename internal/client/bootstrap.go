@@ -20,6 +20,18 @@ type BootstrapResult struct {
 	Spawned   bool
 	Restarted bool
 	Handshake protocol.HandshakeResponse
+	Metrics   BootstrapMetrics
+}
+
+type BootstrapMetrics struct {
+	ConnectDuration   time.Duration
+	HandshakeDuration time.Duration
+	BootstrapDuration time.Duration
+}
+
+type HandshakeMetrics struct {
+	ConnectDuration   time.Duration
+	HandshakeDuration time.Duration
 }
 
 type IncompatibleRPCError struct {
@@ -45,12 +57,27 @@ func (e *DaemonUnavailableError) Unwrap() error {
 }
 
 func Bootstrap(ctx context.Context, cfg config.Config, clientVersion string) (BootstrapResult, error) {
-	resp, err := handshake(ctx, cfg, clientVersion)
+	bootstrapStart := time.Now()
+	resp, handshakeMetrics, err := handshake(ctx, cfg, clientVersion)
 	if err == nil {
 		if shouldUpgradeDaemon(clientVersion, resp.DaemonVersion) {
-			return restartDaemon(ctx, cfg, clientVersion, resp)
+			result, restartErr := restartDaemon(ctx, cfg, clientVersion, resp)
+			if restartErr != nil {
+				return BootstrapResult{}, restartErr
+			}
+			result.Metrics.BootstrapDuration = time.Since(bootstrapStart)
+			return result, nil
 		}
-		return BootstrapResult{Spawned: false, Restarted: false, Handshake: resp}, nil
+		return BootstrapResult{
+			Spawned:   false,
+			Restarted: false,
+			Handshake: resp,
+			Metrics: BootstrapMetrics{
+				ConnectDuration:   handshakeMetrics.ConnectDuration,
+				HandshakeDuration: handshakeMetrics.HandshakeDuration,
+				BootstrapDuration: time.Since(bootstrapStart),
+			},
+		}, nil
 	}
 
 	var incompatibleErr *IncompatibleRPCError
@@ -67,12 +94,21 @@ func Bootstrap(ctx context.Context, cfg config.Config, clientVersion string) (Bo
 		return BootstrapResult{}, fmt.Errorf("start daemon: %w", err)
 	}
 
-	resp, err = waitForDaemonReady(ctx, cfg, clientVersion)
+	resp, handshakeMetrics, err = waitForDaemonReady(ctx, cfg, clientVersion)
 	if err != nil {
 		return BootstrapResult{}, err
 	}
 
-	return BootstrapResult{Spawned: true, Restarted: false, Handshake: resp}, nil
+	return BootstrapResult{
+		Spawned:   true,
+		Restarted: false,
+		Handshake: resp,
+		Metrics: BootstrapMetrics{
+			ConnectDuration:   handshakeMetrics.ConnectDuration,
+			HandshakeDuration: handshakeMetrics.HandshakeDuration,
+			BootstrapDuration: time.Since(bootstrapStart),
+		},
+	}, nil
 }
 
 func restartDaemon(ctx context.Context, cfg config.Config, clientVersion string, current protocol.HandshakeResponse) (BootstrapResult, error) {
@@ -95,7 +131,7 @@ func restartDaemon(ctx context.Context, cfg config.Config, clientVersion string,
 		return BootstrapResult{}, fmt.Errorf("start upgraded daemon: %w", err)
 	}
 
-	resp, err := waitForDaemonReady(ctx, cfg, clientVersion)
+	resp, handshakeMetrics, err := waitForDaemonReady(ctx, cfg, clientVersion)
 	if err != nil {
 		return BootstrapResult{}, err
 	}
@@ -107,22 +143,30 @@ func restartDaemon(ctx context.Context, cfg config.Config, clientVersion string,
 		)
 	}
 
-	return BootstrapResult{Spawned: true, Restarted: true, Handshake: resp}, nil
+	return BootstrapResult{
+		Spawned:   true,
+		Restarted: true,
+		Handshake: resp,
+		Metrics: BootstrapMetrics{
+			ConnectDuration:   handshakeMetrics.ConnectDuration,
+			HandshakeDuration: handshakeMetrics.HandshakeDuration,
+		},
+	}, nil
 }
 
-func waitForDaemonReady(ctx context.Context, cfg config.Config, clientVersion string) (protocol.HandshakeResponse, error) {
+func waitForDaemonReady(ctx context.Context, cfg config.Config, clientVersion string) (protocol.HandshakeResponse, HandshakeMetrics, error) {
 	deadline := time.Now().Add(cfg.SpawnTimeout)
 	for {
-		resp, err := handshake(ctx, cfg, clientVersion)
+		resp, handshakeMetrics, err := handshake(ctx, cfg, clientVersion)
 		if err == nil {
-			return resp, nil
+			return resp, handshakeMetrics, nil
 		}
 		var unavailableErr *DaemonUnavailableError
 		if !errors.As(err, &unavailableErr) {
-			return protocol.HandshakeResponse{}, err
+			return protocol.HandshakeResponse{}, HandshakeMetrics{}, err
 		}
 		if time.Now().After(deadline) {
-			return protocol.HandshakeResponse{}, fmt.Errorf("daemon did not become ready within %s: %w", cfg.SpawnTimeout, err)
+			return protocol.HandshakeResponse{}, HandshakeMetrics{}, fmt.Errorf("daemon did not become ready within %s: %w", cfg.SpawnTimeout, err)
 		}
 		time.Sleep(cfg.RetryInterval)
 	}
@@ -164,7 +208,7 @@ func requestDaemonShutdown(ctx context.Context, cfg config.Config, clientVersion
 func waitForDaemonExit(ctx context.Context, cfg config.Config, clientVersion string) error {
 	deadline := time.Now().Add(cfg.SpawnTimeout)
 	for time.Now().Before(deadline) {
-		_, err := handshake(ctx, cfg, clientVersion)
+		_, _, err := handshake(ctx, cfg, clientVersion)
 		var unavailableErr *DaemonUnavailableError
 		if errors.As(err, &unavailableErr) {
 			return nil
@@ -192,15 +236,18 @@ func signalDaemonProcess(pid int) error {
 	return process.Signal(syscall.SIGTERM)
 }
 
-func handshake(ctx context.Context, cfg config.Config, clientVersion string) (protocol.HandshakeResponse, error) {
+func handshake(ctx context.Context, cfg config.Config, clientVersion string) (protocol.HandshakeResponse, HandshakeMetrics, error) {
 	dialer := &net.Dialer{Timeout: cfg.ConnectTimeout}
+	connectStart := time.Now()
 	conn, err := dialer.DialContext(ctx, "unix", cfg.SocketPath)
+	metrics := HandshakeMetrics{ConnectDuration: time.Since(connectStart)}
 	if err != nil {
-		return protocol.HandshakeResponse{}, &DaemonUnavailableError{Cause: err}
+		return protocol.HandshakeResponse{}, metrics, &DaemonUnavailableError{Cause: err}
 	}
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(cfg.ConnectTimeout))
+	handshakeStart := time.Now()
 
 	req := protocol.HandshakeRequest{
 		ClientName:    "k11s",
@@ -208,23 +255,26 @@ func handshake(ctx context.Context, cfg config.Config, clientVersion string) (pr
 		RPCVersion:    cfg.RPCVersion,
 	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return protocol.HandshakeResponse{}, fmt.Errorf("send handshake request: %w", err)
+		metrics.HandshakeDuration = time.Since(handshakeStart)
+		return protocol.HandshakeResponse{}, metrics, fmt.Errorf("send handshake request: %w", err)
 	}
 
 	var resp protocol.HandshakeResponse
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return protocol.HandshakeResponse{}, fmt.Errorf("receive handshake response: %w", err)
+		metrics.HandshakeDuration = time.Since(handshakeStart)
+		return protocol.HandshakeResponse{}, metrics, fmt.Errorf("receive handshake response: %w", err)
 	}
+	metrics.HandshakeDuration = time.Since(handshakeStart)
 
 	if !resp.Compatible {
-		return protocol.HandshakeResponse{}, &IncompatibleRPCError{
+		return protocol.HandshakeResponse{}, metrics, &IncompatibleRPCError{
 			ClientRPC: cfg.RPCVersion,
 			DaemonRPC: resp.RPCVersion,
 			Message:   resp.Message,
 		}
 	}
 
-	return resp, nil
+	return resp, metrics, nil
 }
 
 func spawnDaemon(socketPath string) error {
