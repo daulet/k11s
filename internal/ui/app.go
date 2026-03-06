@@ -1946,7 +1946,7 @@ func (m model) loadPodViewCmd(seq int, query protocol.PodViewQuery, announce boo
 	}
 
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 		defer cancel()
 
 		payload, err := m.loadPodView(ctx, query)

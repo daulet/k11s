@@ -21,6 +21,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
+const (
+	connDecodeDeadline  = 2 * time.Second
+	connRequestDeadline = 10 * time.Second
+)
+
 func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	if err := config.EnsureSocketDir(cfg.SocketPath); err != nil {
 		return fmt.Errorf("prepare socket directory: %w", err)
@@ -106,7 +111,7 @@ func handleConn(
 	logger *log.Logger,
 ) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(connDecodeDeadline))
 
 	var req protocol.HandshakeRequest
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
@@ -119,6 +124,7 @@ func handleConn(
 		})
 		return
 	}
+	_ = conn.SetDeadline(time.Now().Add(connRequestDeadline))
 
 	switch req.Intent {
 	case protocol.IntentShutdown:
