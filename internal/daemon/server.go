@@ -53,6 +53,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	namespaceCache := namespacecache.New(ctx, kube.NewNamespaceFetcher(clientFactory), logger)
 	actionExecutor := kube.NewActionExecutor(clientFactory)
 	logsFetcher := kube.NewLogsFetcher(clientFactory)
+	podViewFetcher := kube.NewPodViewFetcher(clientFactory)
 
 	var shutdownOnce sync.Once
 	shutdown := func() {
@@ -77,7 +78,18 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 			continue
 		}
 
-		go handleConn(conn, daemonVersion, shutdown, store, resourceCache, namespaceCache, actionExecutor, logsFetcher, logger)
+		go handleConn(
+			conn,
+			daemonVersion,
+			shutdown,
+			store,
+			resourceCache,
+			namespaceCache,
+			actionExecutor,
+			logsFetcher,
+			podViewFetcher,
+			logger,
+		)
 	}
 }
 
@@ -90,6 +102,7 @@ func handleConn(
 	namespaceCache *namespacecache.Cache,
 	actionExecutor *kube.ActionExecutor,
 	logsFetcher *kube.LogsFetcher,
+	podViewFetcher *kube.PodViewFetcher,
 	logger *log.Logger,
 ) {
 	defer conn.Close()
@@ -292,6 +305,65 @@ func handleConn(
 		resp := protocol.BuildLogsResponse(req, daemonVersion, os.Getpid(), payload)
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
+	case protocol.IntentPodView:
+		if req.PodViewQuery == nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "missing pod view query payload",
+			})
+			return
+		}
+		if podViewFetcher == nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "pod view fetcher is not configured",
+			})
+			return
+		}
+
+		query := normalizePodViewQuery(*req.PodViewQuery)
+		if strings.TrimSpace(query.Name) == "" {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "pod view query requires pod name",
+			})
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(query.Namespace), "all") {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       "pod view query requires concrete namespace",
+			})
+			return
+		}
+
+		payload, err := podViewFetcher.Fetch(context.Background(), query)
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(protocol.HandshakeResponse{
+				Compatible:    false,
+				DaemonVersion: daemonVersion,
+				RPCVersion:    protocol.RPCVersion,
+				PID:           os.Getpid(),
+				Message:       fmt.Sprintf("pod view fetch failed: %v", err),
+			})
+			return
+		}
+
+		resp := protocol.BuildPodViewResponse(req, daemonVersion, os.Getpid(), payload)
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
 	}
 
 	resp := protocol.BuildHandshakeResponse(req, daemonVersion, os.Getpid())
@@ -444,9 +516,20 @@ func normalizeLogsQuery(query protocol.LogsQuery) protocol.LogsQuery {
 	query.Filter = strings.TrimSpace(query.Filter)
 	query.ItemNamespace = strings.TrimSpace(query.ItemNamespace)
 	query.Name = strings.TrimSpace(query.Name)
+	query.Container = strings.TrimSpace(query.Container)
 	if query.TailLines <= 0 {
 		query.TailLines = 200
 	}
+	return query
+}
+
+func normalizePodViewQuery(query protocol.PodViewQuery) protocol.PodViewQuery {
+	query.KubeContext = strings.TrimSpace(query.KubeContext)
+	query.Namespace = strings.TrimSpace(query.Namespace)
+	if query.Namespace == "" {
+		query.Namespace = "default"
+	}
+	query.Name = strings.TrimSpace(query.Name)
 	return query
 }
 

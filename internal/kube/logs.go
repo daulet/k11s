@@ -66,6 +66,7 @@ func (f *LogsFetcher) Fetch(ctx context.Context, query protocol.LogsQuery) (prot
 		tailLines = defaultLogTailLines
 	}
 	req := client.CoreV1().Pods(namespace).GetLogs(name, &corev1.PodLogOptions{
+		Container: strings.TrimSpace(query.Container),
 		TailLines: &tailLines,
 	})
 

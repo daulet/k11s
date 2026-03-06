@@ -2743,3 +2743,237 @@ func TestBackShortcutAfterMouseNodeJump(t *testing.T) {
 		t.Fatalf("expected list reloads for click and back, got %d", len(seen))
 	}
 }
+
+func TestEnterInPodsViewOpensPodViewAndEscCloses(t *testing.T) {
+	var seen protocol.PodViewQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadPodView: func(_ context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			seen = query
+			return protocol.PodViewPayload{
+				KubeContext: query.KubeContext,
+				Namespace:   query.Namespace,
+				Name:        query.Name,
+				Found:       true,
+				Overview: protocol.PodOverview{
+					Owner: "ReplicaSet/api-123",
+					Node:  "node-a",
+					Phase: "Running",
+				},
+				Containers: []protocol.PodContainer{
+					{Name: "app", Status: "Running"},
+				},
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 10,
+					Source:             "api",
+				},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	withLoading := updated.(model)
+	if !withLoading.podViewLoading {
+		t.Fatalf("expected pod view loading after enter")
+	}
+	if cmd == nil {
+		t.Fatalf("expected pod view load command")
+	}
+
+	updated, _ = withLoading.Update(cmd())
+	withView := updated.(model)
+	if !withView.podViewOpen || withView.podViewLoading {
+		t.Fatalf("expected open loaded pod view, got open=%v loading=%v", withView.podViewOpen, withView.podViewLoading)
+	}
+	if seen.Name != "api" || seen.Namespace != "default" {
+		t.Fatalf("unexpected pod view query: %#v", seen)
+	}
+
+	updated, _ = withView.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed := updated.(model)
+	if closed.podViewOpen {
+		t.Fatalf("expected esc to close pod view")
+	}
+}
+
+func TestPodViewLogsTabLoadsSelectedContainer(t *testing.T) {
+	var seen []protocol.LogsQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadPodView: func(_ context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			return protocol.PodViewPayload{
+				KubeContext: query.KubeContext,
+				Namespace:   query.Namespace,
+				Name:        query.Name,
+				Found:       true,
+				Overview:    protocol.PodOverview{Phase: "Running"},
+				Containers: []protocol.PodContainer{
+					{Name: "app", Status: "Running"},
+					{Name: "sidecar", Status: "Running"},
+				},
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 20,
+					Source:             "api",
+				},
+			}, nil
+		},
+		LoadLogs: func(_ context.Context, query protocol.LogsQuery) (protocol.LogsPayload, error) {
+			seen = append(seen, query)
+			return protocol.LogsPayload{
+				Resource:      "pods",
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Lines:         []string{"line"},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("expected pod view load command")
+	}
+	updated, _ = updated.(model).Update(cmd())
+	withView := updated.(model)
+	if !withView.podViewOpen {
+		t.Fatalf("expected pod view to be open")
+	}
+
+	updated, _ = withView.Update(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ = updated.(model).Update(tea.KeyMsg{Type: tea.KeyTab})
+	updated, logsCmd := updated.(model).Update(tea.KeyMsg{Type: tea.KeyTab})
+	if logsCmd == nil {
+		t.Fatalf("expected logs load command on logs tab")
+	}
+	updated, _ = updated.(model).Update(logsCmd())
+	withLogs := updated.(model)
+	if len(seen) == 0 {
+		t.Fatalf("expected logs request")
+	}
+	if seen[0].Container != "app" {
+		t.Fatalf("expected first logs request for app container, got %#v", seen[0])
+	}
+	if !withLogs.isPodLogsTabActive() {
+		t.Fatalf("expected logs tab active")
+	}
+
+	updated, nextLogsCmd := withLogs.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	if nextLogsCmd == nil {
+		t.Fatalf("expected logs reload when switching container")
+	}
+	updated, _ = updated.(model).Update(nextLogsCmd())
+	if len(seen) < 2 {
+		t.Fatalf("expected second logs request for container switch")
+	}
+	if seen[1].Container != "sidecar" {
+		t.Fatalf("expected second logs request for sidecar, got %#v", seen[1])
+	}
+}
+
+func TestPodViewShortcutNodeNavigatesToNodesList(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadPodView: func(_ context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			return protocol.PodViewPayload{
+				KubeContext: query.KubeContext,
+				Namespace:   query.Namespace,
+				Name:        query.Name,
+				Found:       true,
+				Overview: protocol.PodOverview{
+					Owner: "ReplicaSet/api-123",
+					Node:  "node-a",
+					Phase: "Running",
+				},
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 30,
+					Source:             "api",
+				},
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("expected pod view load command")
+	}
+	updated, _ = updated.(model).Update(cmd())
+	withView := updated.(model)
+	if !withView.podViewOpen {
+		t.Fatalf("expected pod view open")
+	}
+
+	updated, listCmd := withView.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	withNodeNav := updated.(model)
+	if withNodeNav.session.Resource != "nodes" {
+		t.Fatalf("expected v shortcut to switch to nodes, got %q", withNodeNav.session.Resource)
+	}
+	if withNodeNav.podViewOpen {
+		t.Fatalf("expected pod view to close when navigating to nodes")
+	}
+	if listCmd == nil {
+		t.Fatalf("expected list reload command for nodes")
+	}
+
+	updated, _ = withNodeNav.Update(listCmd())
+	afterReload := updated.(model)
+	if seen.Resource != "nodes" || seen.Namespace != "all" {
+		t.Fatalf("expected nodes/all list query, got %#v", seen)
+	}
+	if afterReload.resourceList.Resource != "nodes" {
+		t.Fatalf("expected nodes payload after reload, got %q", afterReload.resourceList.Resource)
+	}
+}

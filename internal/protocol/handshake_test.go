@@ -183,6 +183,49 @@ func TestBuildResourceDetailResponse(t *testing.T) {
 	}
 }
 
+func TestBuildPodViewResponse(t *testing.T) {
+	payload := PodViewPayload{
+		KubeContext: "dev",
+		Namespace:   "default",
+		Name:        "api-0",
+		Found:       true,
+		Overview: PodOverview{
+			Owner: "ReplicaSet/api-0",
+			Phase: "Running",
+		},
+		Containers: []PodContainer{
+			{Name: "api", Image: "api:latest", Status: "Running"},
+		},
+		Events: []PodEvent{
+			{Type: "Normal", Reason: "Started"},
+		},
+		YAML: "apiVersion: v1\nkind: Pod\n",
+		Freshness: FreshnessMeta{
+			State:              FreshnessStateLive,
+			SnapshotTimeUnixMs: 350,
+			AgeMs:              5,
+			WatchHealthy:       true,
+			Source:             "api",
+		},
+	}
+
+	resp := BuildPodViewResponse(
+		HandshakeRequest{RPCVersion: RPCVersion, Intent: IntentPodView},
+		"dev",
+		123,
+		payload,
+	)
+	if !resp.Compatible {
+		t.Fatalf("expected compatible response")
+	}
+	if resp.PodViewPayload == nil {
+		t.Fatalf("expected pod view payload")
+	}
+	if !resp.PodViewPayload.Found || resp.PodViewPayload.Name != "api-0" {
+		t.Fatalf("unexpected pod view payload: %#v", resp.PodViewPayload)
+	}
+}
+
 func TestBuildActionResponse(t *testing.T) {
 	payload := ActionResult{
 		Success: true,

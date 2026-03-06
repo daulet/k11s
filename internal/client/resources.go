@@ -59,6 +59,31 @@ func GetResourceDetail(
 	return *resp.ResourceDetail, nil
 }
 
+func GetPodView(
+	ctx context.Context,
+	cfg config.Config,
+	clientVersion string,
+	query protocol.PodViewQuery,
+) (protocol.PodViewPayload, error) {
+	req := protocol.HandshakeRequest{
+		ClientName:    "k11s",
+		ClientVersion: clientVersion,
+		RPCVersion:    cfg.RPCVersion,
+		Intent:        protocol.IntentPodView,
+		PodViewQuery:  &query,
+	}
+
+	resp, err := sendControlRequest(ctx, cfg, req)
+	if err != nil {
+		return protocol.PodViewPayload{}, err
+	}
+	if resp.PodViewPayload == nil {
+		return protocol.PodViewPayload{}, errors.New("daemon returned empty pod view payload")
+	}
+
+	return *resp.PodViewPayload, nil
+}
+
 func ListCRDNames(
 	ctx context.Context,
 	cfg config.Config,

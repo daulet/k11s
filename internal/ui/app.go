@@ -42,6 +42,7 @@ const (
 
 type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error)
 type LoadResourceDetailFunc func(ctx context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error)
+type LoadPodViewFunc func(ctx context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error)
 type LoadNamespacesFunc func(ctx context.Context, kubeContext string) (protocol.NamespaceListPayload, error)
 type LoadCRDsFunc func(ctx context.Context, kubeContext string) ([]string, error)
 type LoadActionFunc func(ctx context.Context, query protocol.ActionQuery) (protocol.ActionResult, error)
@@ -57,6 +58,7 @@ type Options struct {
 	SimulateStale        bool
 	LoadResourceList     LoadResourceListFunc
 	LoadResourceDetail   LoadResourceDetailFunc
+	LoadPodView          LoadPodViewFunc
 	LoadNamespaces       LoadNamespacesFunc
 	LoadCRDs             LoadCRDsFunc
 	LoadAction           LoadActionFunc
@@ -86,6 +88,18 @@ type detailLoadedMsg struct {
 }
 
 type detailFailedMsg struct {
+	seq      int
+	err      error
+	announce bool
+}
+
+type podViewLoadedMsg struct {
+	seq      int
+	payload  protocol.PodViewPayload
+	announce bool
+}
+
+type podViewFailedMsg struct {
 	seq      int
 	err      error
 	announce bool
@@ -142,6 +156,22 @@ type autocompleteState struct {
 	active  bool
 	options []string
 	index   int
+}
+
+type podTabKind string
+
+const (
+	podTabOverview  podTabKind = "overview"
+	podTabContainer podTabKind = "container"
+	podTabLogs      podTabKind = "logs"
+	podTabEvents    podTabKind = "events"
+	podTabYAML      podTabKind = "yaml"
+)
+
+type podTabEntry struct {
+	kind      podTabKind
+	label     string
+	container string
 }
 
 type keyMap struct {
@@ -370,6 +400,7 @@ type model struct {
 	simulateStale      bool
 	loadResourceList   LoadResourceListFunc
 	loadResourceDetail LoadResourceDetailFunc
+	loadPodView        LoadPodViewFunc
 	loadNamespaces     LoadNamespacesFunc
 	loadCRDs           LoadCRDsFunc
 	loadAction         LoadActionFunc
@@ -390,6 +421,14 @@ type model struct {
 	loading            bool
 	requestSeq         int
 	activeSeq          int
+	podViewOpen        bool
+	podView            protocol.PodViewPayload
+	podViewErr         string
+	podViewTab         int
+	podViewLogIndex    int
+	podViewLoading     bool
+	podViewRequestSeq  int
+	podViewActiveSeq   int
 	detail             protocol.ResourceDetailPayload
 	detailLoading      bool
 	detailRequestSeq   int
@@ -460,6 +499,7 @@ func newModel(opts Options) model {
 		simulateStale:        opts.SimulateStale,
 		loadResourceList:     opts.LoadResourceList,
 		loadResourceDetail:   opts.LoadResourceDetail,
+		loadPodView:          opts.LoadPodView,
 		loadNamespaces:       opts.LoadNamespaces,
 		loadCRDs:             opts.LoadCRDs,
 		loadAction:           opts.LoadAction,
@@ -544,6 +584,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clearFlashingItems()
 		}
 		m.selectFromSession()
+		m.syncPodViewSelection()
 		m.syncDetailSelection()
 		m.syncLogsSelection()
 		if errText := strings.TrimSpace(msg.payload.Freshness.Error); errText != "" {
@@ -587,6 +628,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detailLoading = false
 		if msg.announce {
 			m.commandMessage = fmt.Sprintf("detail load failed: %v", msg.err)
+		}
+		return m, nil
+	case podViewLoadedMsg:
+		if msg.seq != m.podViewActiveSeq {
+			return m, nil
+		}
+		m.podViewLoading = false
+		m.podViewOpen = true
+		m.podViewErr = ""
+		m.podView = msg.payload
+		m.ensurePodViewLogSelection()
+		if msg.announce {
+			if msg.payload.Found {
+				m.commandMessage = fmt.Sprintf("pod view loaded: %s/%s", msg.payload.Namespace, msg.payload.Name)
+			} else {
+				m.commandMessage = fmt.Sprintf("pod not found: %s/%s", msg.payload.Namespace, msg.payload.Name)
+			}
+		}
+		if m.isPodLogsTabActive() {
+			return m.startPodTabLogsReload(false)
+		}
+		return m, nil
+	case podViewFailedMsg:
+		if msg.seq != m.podViewActiveSeq {
+			return m, nil
+		}
+		m.podViewLoading = false
+		m.podViewOpen = true
+		m.podViewErr = strings.TrimSpace(msg.err.Error())
+		if msg.announce {
+			m.commandMessage = fmt.Sprintf("pod view load failed: %v", msg.err)
 		}
 		return m, nil
 	case actionLoadedMsg:
@@ -710,6 +782,13 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Search):
 		m.enterSearchMode()
 		return m, nil
+	}
+
+	if m.podViewOpen {
+		return m.updatePodViewMode(msg)
+	}
+
+	switch {
 	case key.Matches(msg, m.keys.SearchNext):
 		if !m.jumpToSearchMatch(1) {
 			if strings.TrimSpace(m.searchQuery) == "" {
@@ -733,6 +812,9 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.commandMessage = "no selected item for detail"
 			return m, nil
 		}
+		if strings.EqualFold(strings.TrimSpace(m.session.Resource), "pods") && m.loadPodView != nil {
+			return m.startPodViewReload(true)
+		}
 		return m.startDetailReload(true)
 	case key.Matches(msg, m.keys.OpenNamespace):
 		return m.navigateSelectedColumn("namespace", "shortcut")
@@ -748,6 +830,45 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.jumpSelection(-1)
 	case key.Matches(msg, m.keys.Down):
 		m.jumpSelection(1)
+	}
+
+	return m, nil
+}
+
+func (m model) updatePodViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case msg.String() == "esc":
+		m.clearPodView()
+		m.commandMessage = "closed pod view"
+		return m, nil
+	case msg.Type == tea.KeyTab || msg.String() == "right":
+		m.stepPodViewTab(1)
+		if m.isPodLogsTabActive() {
+			return m.startPodTabLogsReload(false)
+		}
+		return m, nil
+	case msg.Type == tea.KeyShiftTab || msg.String() == "left":
+		m.stepPodViewTab(-1)
+		if m.isPodLogsTabActive() {
+			return m.startPodTabLogsReload(false)
+		}
+		return m, nil
+	case msg.String() == "]":
+		if !m.isPodLogsTabActive() || !m.stepPodLogContainer(1) {
+			return m, nil
+		}
+		return m.startPodTabLogsReload(false)
+	case msg.String() == "[":
+		if !m.isPodLogsTabActive() || !m.stepPodLogContainer(-1) {
+			return m, nil
+		}
+		return m.startPodTabLogsReload(false)
+	case key.Matches(msg, m.keys.OpenNode):
+		return m.navigatePodNode("shortcut")
+	case key.Matches(msg, m.keys.OpenOwner):
+		return m.navigatePodOwner("shortcut")
+	case key.Matches(msg, m.keys.Detail):
+		return m.startPodViewReload(true)
 	}
 
 	return m, nil
@@ -775,7 +896,7 @@ func (m model) updateSearchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if m.commandMode || m.searchMode {
+	if m.commandMode || m.searchMode || m.podViewOpen {
 		return m, nil
 	}
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
@@ -834,6 +955,7 @@ func (m model) navigateItemColumn(item protocol.ResourceItem, column string, via
 		m.session.Namespace = namespace
 		m.session.Selection = ""
 		m.pushNavigationHistory(previousSession)
+		m.clearPodView()
 		m.clearDetail()
 		m.clearFlashingItems()
 		m.commandMessage = "namespace switched to " + namespace + " via " + via
@@ -847,6 +969,7 @@ func (m model) navigateItemColumn(item protocol.ResourceItem, column string, via
 		m.session.Resource = "nodes"
 		m.session.Selection = node
 		m.pushNavigationHistory(previousSession)
+		m.clearPodView()
 		m.clearDetail()
 		m.clearFlashingItems()
 		m.commandMessage = "opened node " + node + " via " + via
@@ -866,6 +989,7 @@ func (m model) navigateItemColumn(item protocol.ResourceItem, column string, via
 		m.session.Resource = resource
 		m.session.Selection = ownerSelection
 		m.pushNavigationHistory(previousSession)
+		m.clearPodView()
 		m.clearDetail()
 		m.clearFlashingItems()
 		m.commandMessage = fmt.Sprintf("opened owner %s/%s via %s", item.OwnerKind, ownerSelection, via)
@@ -873,6 +997,162 @@ func (m model) navigateItemColumn(item protocol.ResourceItem, column string, via
 	default:
 		return m, nil
 	}
+}
+
+func (m model) navigatePodNode(via string) (tea.Model, tea.Cmd) {
+	node := strings.TrimSpace(m.podView.Overview.Node)
+	if node == "" || node == "-" {
+		m.commandMessage = "node is not available for this pod"
+		return m, nil
+	}
+
+	previousSession := m.session
+	m.session.Resource = "nodes"
+	m.session.Selection = node
+	m.pushNavigationHistory(previousSession)
+	m.clearPodView()
+	m.clearDetail()
+	m.clearFlashingItems()
+	m.commandMessage = "opened node " + node + " via " + via
+	return m.startListReload()
+}
+
+func (m model) navigatePodOwner(via string) (tea.Model, tea.Cmd) {
+	ownerKind, ownerName, ok := parsePodOwner(m.podView.Overview.Owner)
+	if !ok {
+		m.commandMessage = "owner is not available for this pod"
+		return m, nil
+	}
+
+	resource, selection, ok := ownerNavigation(ownerKind, ownerName)
+	if !ok {
+		m.commandMessage = fmt.Sprintf("owner %s/%s is not navigable yet", ownerKind, ownerName)
+		return m, nil
+	}
+
+	previousSession := m.session
+	if resourceUsesNamespace(resource) {
+		namespace := strings.TrimSpace(m.podView.Namespace)
+		if namespace != "" && namespace != "-" && !strings.EqualFold(namespace, "<cluster>") {
+			m.session.Namespace = namespace
+		}
+	}
+	m.session.Resource = resource
+	m.session.Selection = selection
+	m.pushNavigationHistory(previousSession)
+	m.clearPodView()
+	m.clearDetail()
+	m.clearFlashingItems()
+	m.commandMessage = fmt.Sprintf("opened owner %s/%s via %s", ownerKind, selection, via)
+	return m.startListReload()
+}
+
+func parsePodOwner(value string) (kind string, name string, ok bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", "", false
+	}
+	kind, name, hasSlash := strings.Cut(value, "/")
+	if !hasSlash {
+		return "", "", false
+	}
+	kind = strings.TrimSpace(kind)
+	name = strings.TrimSpace(name)
+	if kind == "" || name == "" {
+		return "", "", false
+	}
+	return kind, name, true
+}
+
+func (m *model) stepPodViewTab(step int) {
+	tabs := m.podTabs()
+	if len(tabs) == 0 {
+		m.podViewTab = 0
+		return
+	}
+	m.podViewTab = normalizedAutocompleteIndex(m.podViewTab+step, len(tabs))
+	m.ensurePodViewLogSelection()
+}
+
+func (m *model) ensurePodViewLogSelection() {
+	containers := m.podLogContainers()
+	if len(containers) == 0 {
+		m.podViewLogIndex = 0
+		return
+	}
+	if m.podViewLogIndex < 0 || m.podViewLogIndex >= len(containers) {
+		m.podViewLogIndex = 0
+	}
+}
+
+func (m *model) stepPodLogContainer(step int) bool {
+	containers := m.podLogContainers()
+	if len(containers) <= 1 {
+		m.ensurePodViewLogSelection()
+		return false
+	}
+	m.ensurePodViewLogSelection()
+	next := normalizedAutocompleteIndex(m.podViewLogIndex+step, len(containers))
+	if next == m.podViewLogIndex {
+		return false
+	}
+	m.podViewLogIndex = next
+	return true
+}
+
+func (m model) isPodLogsTabActive() bool {
+	tab, ok := m.activePodTab()
+	return ok && tab.kind == podTabLogs
+}
+
+func (m model) activePodTab() (podTabEntry, bool) {
+	tabs := m.podTabs()
+	if len(tabs) == 0 {
+		return podTabEntry{}, false
+	}
+	index := m.podViewTab
+	if index < 0 || index >= len(tabs) {
+		index = 0
+	}
+	return tabs[index], true
+}
+
+func (m model) podLogContainers() []string {
+	if len(m.podView.Containers) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(m.podView.Containers))
+	for _, container := range m.podView.Containers {
+		name := strings.TrimSpace(container.Name)
+		if name == "" {
+			continue
+		}
+		values = append(values, name)
+	}
+	return values
+}
+
+func (m model) podTabs() []podTabEntry {
+	tabs := []podTabEntry{
+		{kind: podTabOverview, label: "overview"},
+	}
+	for _, container := range m.podView.Containers {
+		name := strings.TrimSpace(container.Name)
+		if name == "" {
+			continue
+		}
+		tabs = append(tabs, podTabEntry{
+			kind:      podTabContainer,
+			label:     name,
+			container: name,
+		})
+	}
+	tabs = append(tabs,
+		podTabEntry{kind: podTabLogs, label: "logs"},
+		podTabEntry{kind: podTabEvents, label: "events"},
+		podTabEntry{kind: podTabYAML, label: "yaml"},
+	)
+	return tabs
 }
 
 func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -947,6 +1227,7 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if updated {
 			m.pushNavigationHistory(previousSession)
 			m.session.Selection = ""
+			m.clearPodView()
 			m.clearDetail()
 			m.clearFlashingItems()
 		}
@@ -1499,6 +1780,7 @@ func (m model) startListReloadWithContext(previousContext string) (model, tea.Cm
 func (m model) navigateToSession(target protocol.SessionState) (tea.Model, tea.Cmd) {
 	previousContext := m.session.KubeContext
 	m.session = target
+	m.clearPodView()
 	m.clearDetail()
 	m.clearFlashingItems()
 	next, cmd := m.startListReloadWithContext(previousContext)
@@ -1546,6 +1828,31 @@ func (m model) startDetailReload(announce bool) (tea.Model, tea.Cmd) {
 	return m, m.loadDetailCmd(m.detailActiveSeq, query, announce)
 }
 
+func (m model) startPodViewReload(announce bool) (tea.Model, tea.Cmd) {
+	query, ok := m.buildSelectedPodViewQuery()
+	if !ok {
+		m.commandMessage = "pod view requires a concrete namespaced pod selection"
+		return m, nil
+	}
+
+	m.podViewRequestSeq++
+	m.podViewActiveSeq = m.podViewRequestSeq
+	m.podViewLoading = true
+	m.podViewOpen = true
+	m.podViewErr = ""
+	if !strings.EqualFold(strings.TrimSpace(m.podView.Name), strings.TrimSpace(query.Name)) ||
+		!strings.EqualFold(strings.TrimSpace(m.podView.Namespace), strings.TrimSpace(query.Namespace)) {
+		m.podViewTab = 0
+		m.podViewLogIndex = 0
+	}
+	m.podView = protocol.PodViewPayload{
+		KubeContext: query.KubeContext,
+		Namespace:   query.Namespace,
+		Name:        query.Name,
+	}
+	return m, m.loadPodViewCmd(m.podViewActiveSeq, query, announce)
+}
+
 func (m model) startAction(query protocol.ActionQuery) (tea.Model, tea.Cmd) {
 	m.actionRequestSeq++
 	m.actionActiveSeq = m.actionRequestSeq
@@ -1555,18 +1862,30 @@ func (m model) startAction(query protocol.ActionQuery) (tea.Model, tea.Cmd) {
 }
 
 func (m model) startLogs(query protocol.LogsQuery) (tea.Model, tea.Cmd) {
+	return m.startLogsWithAnnouncement(query, true)
+}
+
+func (m model) startLogsWithAnnouncement(query protocol.LogsQuery, announce bool) (tea.Model, tea.Cmd) {
 	m.logsRequestSeq++
 	m.logsActiveSeq = m.logsRequestSeq
 	m.logsLoading = true
 	m.logs = protocol.LogsPayload{}
 	m.logsFollow = query.Follow
 	m.logsFollowQuery = query
-	if query.Follow {
+	if announce && query.Follow {
 		m.commandMessage = fmt.Sprintf("following logs for %s...", query.Name)
-	} else {
+	} else if announce {
 		m.commandMessage = fmt.Sprintf("loading logs for %s...", query.Name)
 	}
-	return m, m.loadLogsCmd(m.logsActiveSeq, query, true)
+	return m, m.loadLogsCmd(m.logsActiveSeq, query, announce)
+}
+
+func (m model) startPodTabLogsReload(announce bool) (tea.Model, tea.Cmd) {
+	query, ok := m.buildPodLogsQuery()
+	if !ok {
+		return m, nil
+	}
+	return m.startLogsWithAnnouncement(query, announce)
 }
 
 func (m model) loadListCmd(seq int, query protocol.ResourceListQuery, announce bool) tea.Cmd {
@@ -1612,6 +1931,29 @@ func (m model) loadDetailCmd(seq int, query protocol.ResourceDetailQuery, announ
 			return detailFailedMsg{seq: seq, err: err, announce: announce}
 		}
 		return detailLoadedMsg{seq: seq, payload: payload, announce: announce}
+	}
+}
+
+func (m model) loadPodViewCmd(seq int, query protocol.PodViewQuery, announce bool) tea.Cmd {
+	if m.loadPodView == nil {
+		return func() tea.Msg {
+			return podViewFailedMsg{
+				seq:      seq,
+				err:      fmt.Errorf("pod view loader is not configured"),
+				announce: announce,
+			}
+		}
+	}
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		payload, err := m.loadPodView(ctx, query)
+		if err != nil {
+			return podViewFailedMsg{seq: seq, err: err, announce: announce}
+		}
+		return podViewLoadedMsg{seq: seq, payload: payload, announce: announce}
 	}
 }
 
@@ -1810,6 +2152,14 @@ func (m model) renderInputBox(width int) string {
 
 func (m model) renderMainPane(width int, innerHeight int) string {
 	title := m.styles.Title.Render(m.mainPaneTitle())
+	if m.podViewOpen {
+		innerWidth := width - 2
+		if innerWidth < 1 {
+			innerWidth = 1
+		}
+		lines := m.podViewLines(innerWidth, innerHeight)
+		return drawBox(width, title, lines, innerHeight)
+	}
 	if len(m.resourceList.Items) == 0 {
 		innerWidth := width - 2
 		if innerWidth < 1 {
@@ -1828,6 +2178,19 @@ func (m model) renderMainPane(width int, innerHeight int) string {
 }
 
 func (m model) mainPaneTitle() string {
+	if m.podViewOpen {
+		contextText := displayContext(m.session)
+		namespace := strings.TrimSpace(m.podView.Namespace)
+		if namespace == "" {
+			namespace = displayNamespace(m.session)
+		}
+		name := strings.TrimSpace(m.podView.Name)
+		if name == "" {
+			return fmt.Sprintf("%s > %s > pod", contextText, namespace)
+		}
+		return fmt.Sprintf("%s > %s > pod/%s", contextText, namespace, name)
+	}
+
 	contextText := displayContext(m.session)
 	resourceText := displayResource(m.session)
 	if !m.mainPaneUsesNamespace() {
@@ -1862,6 +2225,269 @@ func (m model) crsViewUsesNamespace() bool {
 		}
 	}
 	return false
+}
+
+func (m model) podViewLines(innerWidth int, innerHeight int) []string {
+	if m.podViewLoading {
+		return m.centeredStyledLines("loading pod view...", innerWidth, innerHeight, m.styles.EmptyLoading)
+	}
+	if errText := strings.TrimSpace(m.podViewErr); errText != "" {
+		return m.centeredStyledLines("error: "+errText, innerWidth, innerHeight, m.styles.MainError)
+	}
+	if !m.podView.Found {
+		target := strings.TrimSpace(m.podView.Name)
+		if target == "" {
+			target = "selected pod"
+		}
+		return m.centeredStyledLines("pod not found: "+target, innerWidth, innerHeight, m.styles.MainError)
+	}
+
+	lines := []string{m.renderPodTabBar(), ""}
+	tab, ok := m.activePodTab()
+	if !ok {
+		return lines
+	}
+
+	contentWidth := innerWidth - 2
+	if contentWidth < 12 {
+		contentWidth = innerWidth
+	}
+
+	switch tab.kind {
+	case podTabOverview:
+		lines = append(lines, m.podOverviewLines(contentWidth)...)
+	case podTabContainer:
+		lines = append(lines, m.podContainerLines(tab.container, contentWidth)...)
+	case podTabLogs:
+		lines = append(lines, m.podLogsLines(contentWidth)...)
+	case podTabEvents:
+		lines = append(lines, m.podEventsLines(contentWidth)...)
+	case podTabYAML:
+		lines = append(lines, m.podYAMLLines(contentWidth)...)
+	default:
+		lines = append(lines, "tab unavailable")
+	}
+
+	return lines
+}
+
+func (m model) renderPodTabBar() string {
+	tabs := m.podTabs()
+	if len(tabs) == 0 {
+		return ""
+	}
+	active := m.podViewTab
+	if active < 0 || active >= len(tabs) {
+		active = 0
+	}
+
+	parts := make([]string, 0, len(tabs))
+	for idx, tab := range tabs {
+		label := tab.label
+		if tab.kind == podTabContainer {
+			label = "ctr:" + label
+		}
+		text := "[" + label + "]"
+		if idx == active {
+			parts = append(parts, m.styles.ColumnHeader.Render(text))
+			continue
+		}
+		parts = append(parts, text)
+	}
+	return strings.Join(parts, " ")
+}
+
+func (m model) podOverviewLines(width int) []string {
+	overview := m.podView.Overview
+	lines := []string{
+		"owner: " + defaultDash(overview.Owner),
+		"phase: " + defaultDash(overview.Phase),
+		"node: " + defaultDash(overview.Node),
+		"serviceAccount: " + defaultDash(overview.ServiceAccount),
+		"podIP: " + defaultDash(overview.PodIP),
+		"age: " + defaultDash(overview.Age),
+	}
+
+	if len(overview.Conditions) == 0 {
+		lines = append(lines, "conditions: -")
+	} else {
+		lines = append(lines, "conditions:")
+		for _, condition := range overview.Conditions {
+			line := fmt.Sprintf("  - %s=%s", condition.Type, condition.Status)
+			if strings.TrimSpace(condition.Reason) != "" {
+				line += " (" + condition.Reason + ")"
+			}
+			lines = appendWrappedLines(lines, line, width)
+			if strings.TrimSpace(condition.Message) != "" {
+				lines = appendWrappedLines(lines, "    "+condition.Message, width)
+			}
+		}
+	}
+
+	lines = appendSortedMap(lines, "labels", overview.Labels, width)
+	lines = appendSortedMap(lines, "annotations", overview.Annotations, width)
+	lines = appendSortedMap(lines, "nodeSelector", overview.NodeSelector, width)
+
+	if len(overview.Tolerations) == 0 {
+		lines = append(lines, "tolerations: -")
+	} else {
+		lines = append(lines, "tolerations:")
+		for _, toleration := range overview.Tolerations {
+			lines = appendWrappedLines(lines, "  - "+toleration, width)
+		}
+	}
+	return lines
+}
+
+func appendSortedMap(lines []string, label string, values map[string]string, width int) []string {
+	if len(values) == 0 {
+		return append(lines, label+": -")
+	}
+	lines = append(lines, label+":")
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		lines = appendWrappedLines(lines, "  "+key+"="+values[key], width)
+	}
+	return lines
+}
+
+func (m model) podContainerLines(name string, width int) []string {
+	container, ok := m.podContainer(name)
+	if !ok {
+		return []string{"container " + name + " not found"}
+	}
+
+	lines := []string{
+		"name: " + defaultDash(container.Name),
+		"image: " + defaultDash(container.Image),
+		"command: " + defaultDash(strings.Join(container.Command, " ")),
+		"status: " + defaultDash(container.Status),
+		fmt.Sprintf("restarts: %d", container.Restarts),
+		"lastRestartAt: " + defaultDash(container.LastRestartAt),
+		"lastRestartReason: " + defaultDash(container.LastRestartReason),
+		"startupProbe: " + defaultDash(container.StartupProbe),
+		"livenessProbe: " + defaultDash(container.LivenessProbe),
+		"readinessProbe: " + defaultDash(container.ReadinessProbe),
+	}
+
+	lines = appendStringList(lines, "env", container.Env, width)
+	lines = appendStringList(lines, "ports", container.Ports, width)
+	lines = appendStringList(lines, "mounts", container.Mounts, width)
+	return lines
+}
+
+func appendStringList(lines []string, label string, values []string, width int) []string {
+	if len(values) == 0 {
+		return append(lines, label+": -")
+	}
+	lines = append(lines, label+":")
+	for _, value := range values {
+		lines = appendWrappedLines(lines, "  - "+value, width)
+	}
+	return lines
+}
+
+func (m model) podContainer(name string) (protocol.PodContainer, bool) {
+	needle := strings.TrimSpace(name)
+	if needle == "" {
+		return protocol.PodContainer{}, false
+	}
+	for _, container := range m.podView.Containers {
+		if strings.TrimSpace(container.Name) == needle {
+			return container, true
+		}
+	}
+	return protocol.PodContainer{}, false
+}
+
+func (m model) podLogsLines(width int) []string {
+	lines := []string{}
+	containers := m.podLogContainers()
+	if len(containers) > 0 {
+		idx := m.podViewLogIndex
+		if idx < 0 || idx >= len(containers) {
+			idx = 0
+		}
+		line := "container: " + containers[idx]
+		if len(containers) > 1 {
+			line += fmt.Sprintf(" (%d/%d, use [ and ] to switch)", idx+1, len(containers))
+		}
+		lines = append(lines, line)
+	}
+
+	if m.logsLoading && len(m.logs.Lines) == 0 {
+		lines = append(lines, "loading logs...")
+		return lines
+	}
+	if strings.TrimSpace(m.logs.Name) == "" && len(m.logs.Lines) == 0 {
+		lines = append(lines, "logs unavailable")
+		return lines
+	}
+
+	displayLines := m.logs.Lines
+	const maxLines = 28
+	if len(displayLines) > maxLines {
+		lines = append(lines, fmt.Sprintf("... %d earlier lines omitted", len(displayLines)-maxLines))
+		displayLines = displayLines[len(displayLines)-maxLines:]
+	}
+	for _, line := range displayLines {
+		lines = appendWrappedLines(lines, line, width)
+	}
+	if m.logs.Truncated {
+		lines = append(lines, "... output truncated")
+	}
+	return lines
+}
+
+func (m model) podEventsLines(width int) []string {
+	if len(m.podView.Events) == 0 {
+		return []string{"no events"}
+	}
+	lines := make([]string, 0, len(m.podView.Events)*2)
+	for _, event := range m.podView.Events {
+		header := fmt.Sprintf(
+			"[%s] %s x%d last=%s first=%s",
+			defaultDash(event.Type),
+			defaultDash(event.Reason),
+			event.Count,
+			defaultDash(event.LastSeen),
+			defaultDash(event.FirstSeen),
+		)
+		lines = appendWrappedLines(lines, header, width)
+		if strings.TrimSpace(event.Message) != "" {
+			lines = appendWrappedLines(lines, "  "+event.Message, width)
+		}
+		lines = append(lines, "")
+	}
+	if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func (m model) podYAMLLines(_ int) []string {
+	text := strings.TrimSpace(m.podView.YAML)
+	if text == "" {
+		return []string{"yaml unavailable"}
+	}
+	return strings.Split(text, "\n")
+}
+
+func appendWrappedLines(lines []string, value string, width int) []string {
+	wrapped := wrapText(value, width)
+	return append(lines, wrapped...)
+}
+
+func defaultDash(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	return value
 }
 
 func (m model) listLines() []string {
@@ -2203,7 +2829,11 @@ func splitLongWord(value string, width int) []string {
 }
 
 func (m model) renderFooter(width int) string {
-	left := buildStatusAgeBlocks(m.resourceList.Freshness, m.styles)
+	meta := m.resourceList.Freshness
+	if m.podViewOpen && m.podView.Freshness.SnapshotTimeUnixMs > 0 {
+		meta = m.podView.Freshness
+	}
+	left := buildStatusAgeBlocks(meta, m.styles)
 	right := m.styles.Legend.Render(strings.Join(m.legendHints(), "  "))
 	return alignLeftRight(left, right, width)
 }
@@ -2236,6 +2866,23 @@ func (m model) legendHints() []string {
 			"q quit",
 		}
 	}
+	if m.podViewOpen {
+		hints := []string{
+			"tab next",
+			"S-tab prev",
+		}
+		if m.isPodLogsTabActive() && len(m.podLogContainers()) > 1 {
+			hints = append(hints, "[/ ] container")
+		}
+		if m.canNavigatePodNode() {
+			hints = append(hints, "v node")
+		}
+		if m.canNavigatePodOwner() {
+			hints = append(hints, "o owner")
+		}
+		hints = append(hints, "esc back", ": cmd", "q quit")
+		return hints
+	}
 
 	hints := make([]string, 0, 10)
 	if m.canNavigateSelectedNamespace() {
@@ -2247,8 +2894,12 @@ func (m model) legendHints() []string {
 	if m.canNavigateSelectedOwner() {
 		hints = append(hints, "o owner")
 	}
+	enterHint := "enter detail"
+	if strings.EqualFold(strings.TrimSpace(m.session.Resource), "pods") && m.loadPodView != nil {
+		enterHint = "enter pod"
+	}
 	hints = append(hints,
-		"enter detail",
+		enterHint,
 		": cmd",
 		"/ search",
 		"C-o back",
@@ -2256,6 +2907,26 @@ func (m model) legendHints() []string {
 		"q quit",
 	)
 	return hints
+}
+
+func (m model) canNavigatePodNode() bool {
+	if !m.podViewOpen {
+		return false
+	}
+	node := strings.TrimSpace(m.podView.Overview.Node)
+	return node != "" && node != "-"
+}
+
+func (m model) canNavigatePodOwner() bool {
+	if !m.podViewOpen {
+		return false
+	}
+	ownerKind, ownerName, ok := parsePodOwner(m.podView.Overview.Owner)
+	if !ok {
+		return false
+	}
+	_, _, ok = ownerNavigation(ownerKind, ownerName)
+	return ok
 }
 
 func (m model) canNavigateSelectedNamespace() bool {
@@ -2441,6 +3112,74 @@ func (m model) buildSelectedDetailQuery() (protocol.ResourceDetailQuery, bool) {
 	}, true
 }
 
+func (m model) buildSelectedPodViewQuery() (protocol.PodViewQuery, bool) {
+	if !strings.EqualFold(strings.TrimSpace(m.session.Resource), "pods") {
+		return protocol.PodViewQuery{}, false
+	}
+	item, ok := m.currentItem()
+	if !ok {
+		return protocol.PodViewQuery{}, false
+	}
+
+	namespace := strings.TrimSpace(item.Namespace)
+	if namespace == "" || namespace == "-" || strings.EqualFold(namespace, "<cluster>") {
+		namespace = strings.TrimSpace(m.session.Namespace)
+	}
+	if strings.EqualFold(namespace, "all") || namespace == "" {
+		return protocol.PodViewQuery{}, false
+	}
+
+	return protocol.PodViewQuery{
+		KubeContext: m.session.KubeContext,
+		Namespace:   namespace,
+		Name:        item.Name,
+	}, true
+}
+
+func (m model) buildPodLogsQuery() (protocol.LogsQuery, bool) {
+	if !m.podViewOpen || !m.podView.Found || strings.TrimSpace(m.podView.Name) == "" {
+		return protocol.LogsQuery{}, false
+	}
+	namespace := strings.TrimSpace(m.podView.Namespace)
+	if namespace == "" {
+		return protocol.LogsQuery{}, false
+	}
+
+	container := ""
+	containers := m.podLogContainers()
+	if len(containers) > 0 {
+		index := m.podViewLogIndex
+		if index < 0 || index >= len(containers) {
+			index = 0
+		}
+		container = containers[index]
+	}
+
+	return protocol.LogsQuery{
+		KubeContext:   m.session.KubeContext,
+		Resource:      "pods",
+		Namespace:     namespace,
+		Filter:        m.session.Filter,
+		ItemNamespace: namespace,
+		Name:          m.podView.Name,
+		Container:     container,
+		TailLines:     200,
+		Follow:        false,
+	}, true
+}
+
+func (m *model) clearPodView() {
+	m.podViewRequestSeq++
+	m.podViewActiveSeq = m.podViewRequestSeq
+	m.podViewLoading = false
+	m.podViewOpen = false
+	m.podViewErr = ""
+	m.podView = protocol.PodViewPayload{}
+	m.podViewTab = 0
+	m.podViewLogIndex = 0
+	m.clearLogs()
+}
+
 func (m *model) clearDetail() {
 	m.detailRequestSeq++
 	m.detailActiveSeq = m.detailRequestSeq
@@ -2456,6 +3195,40 @@ func (m *model) clearLogs() {
 	m.logsFollow = false
 	m.logsFollowQuery = protocol.LogsQuery{}
 	m.logs = protocol.LogsPayload{}
+}
+
+func (m *model) syncPodViewSelection() {
+	if !m.podViewOpen && !m.podViewLoading {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(m.session.Resource), "pods") {
+		m.clearPodView()
+		return
+	}
+
+	item, ok := m.currentItem()
+	if !ok {
+		m.clearPodView()
+		return
+	}
+
+	podName := strings.TrimSpace(m.podView.Name)
+	if podName != "" && podName != item.Name {
+		m.clearPodView()
+		return
+	}
+
+	podNamespace := strings.TrimSpace(m.podView.Namespace)
+	if podNamespace == "" {
+		podNamespace = strings.TrimSpace(m.session.Namespace)
+	}
+	itemNamespace := strings.TrimSpace(item.Namespace)
+	if podNamespace != "" && itemNamespace != "" && podNamespace != itemNamespace {
+		m.clearPodView()
+		return
+	}
+
+	m.ensurePodViewLogSelection()
 }
 
 func (m *model) syncDetailSelection() {

@@ -11,6 +11,7 @@ const (
 	IntentSessionSave    = "session_save"
 	IntentResourceList   = "resource_list"
 	IntentResourceDetail = "resource_detail"
+	IntentPodView        = "pod_view"
 	IntentNamespaceList  = "namespace_list"
 	IntentAction         = "action"
 	IntentLogs           = "logs"
@@ -24,6 +25,7 @@ type HandshakeRequest struct {
 	Session        *SessionState        `json:"session,omitempty"`
 	ListQuery      *ResourceListQuery   `json:"listQuery,omitempty"`
 	DetailQuery    *ResourceDetailQuery `json:"detailQuery,omitempty"`
+	PodViewQuery   *PodViewQuery        `json:"podViewQuery,omitempty"`
 	NamespaceQuery *NamespaceListQuery  `json:"namespaceQuery,omitempty"`
 	ActionQuery    *ActionQuery         `json:"actionQuery,omitempty"`
 	LogsQuery      *LogsQuery           `json:"logsQuery,omitempty"`
@@ -38,6 +40,7 @@ type HandshakeResponse struct {
 	Session        *SessionState          `json:"session,omitempty"`
 	ResourceList   *ResourceListPayload   `json:"resourceList,omitempty"`
 	ResourceDetail *ResourceDetailPayload `json:"resourceDetail,omitempty"`
+	PodViewPayload *PodViewPayload        `json:"podViewPayload,omitempty"`
 	NamespaceList  *NamespaceListPayload  `json:"namespaceList,omitempty"`
 	ActionResult   *ActionResult          `json:"actionResult,omitempty"`
 	LogsPayload    *LogsPayload           `json:"logsPayload,omitempty"`
@@ -114,6 +117,70 @@ type ResourceDetailPayload struct {
 	Freshness     FreshnessMeta `json:"freshness"`
 }
 
+type PodViewQuery struct {
+	KubeContext string `json:"kubeContext,omitempty"`
+	Namespace   string `json:"namespace"`
+	Name        string `json:"name"`
+}
+
+type PodCondition struct {
+	Type    string `json:"type"`
+	Status  string `json:"status"`
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+type PodOverview struct {
+	Owner          string            `json:"owner,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	Annotations    map[string]string `json:"annotations,omitempty"`
+	Phase          string            `json:"phase,omitempty"`
+	Conditions     []PodCondition    `json:"conditions,omitempty"`
+	PodIP          string            `json:"podIp,omitempty"`
+	ServiceAccount string            `json:"serviceAccount,omitempty"`
+	Node           string            `json:"node,omitempty"`
+	NodeSelector   map[string]string `json:"nodeSelector,omitempty"`
+	Tolerations    []string          `json:"tolerations,omitempty"`
+	Age            string            `json:"age,omitempty"`
+}
+
+type PodContainer struct {
+	Name              string   `json:"name"`
+	Image             string   `json:"image,omitempty"`
+	Command           []string `json:"command,omitempty"`
+	Status            string   `json:"status,omitempty"`
+	Restarts          int32    `json:"restarts,omitempty"`
+	LastRestartAt     string   `json:"lastRestartAt,omitempty"`
+	LastRestartReason string   `json:"lastRestartReason,omitempty"`
+	StartupProbe      string   `json:"startupProbe,omitempty"`
+	LivenessProbe     string   `json:"livenessProbe,omitempty"`
+	ReadinessProbe    string   `json:"readinessProbe,omitempty"`
+	Env               []string `json:"env,omitempty"`
+	Ports             []string `json:"ports,omitempty"`
+	Mounts            []string `json:"mounts,omitempty"`
+}
+
+type PodEvent struct {
+	Type      string `json:"type,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Count     int32  `json:"count,omitempty"`
+	LastSeen  string `json:"lastSeen,omitempty"`
+	FirstSeen string `json:"firstSeen,omitempty"`
+}
+
+type PodViewPayload struct {
+	KubeContext string         `json:"kubeContext,omitempty"`
+	Namespace   string         `json:"namespace"`
+	Name        string         `json:"name"`
+	Found       bool           `json:"found"`
+	Overview    PodOverview    `json:"overview"`
+	Containers  []PodContainer `json:"containers,omitempty"`
+	Events      []PodEvent     `json:"events,omitempty"`
+	YAML        string         `json:"yaml,omitempty"`
+	Freshness   FreshnessMeta  `json:"freshness"`
+}
+
 type NamespaceListQuery struct {
 	KubeContext string `json:"kubeContext,omitempty"`
 }
@@ -164,6 +231,7 @@ type LogsQuery struct {
 	Filter        string `json:"filter,omitempty"`
 	ItemNamespace string `json:"itemNamespace,omitempty"`
 	Name          string `json:"name"`
+	Container     string `json:"container,omitempty"`
 	TailLines     int64  `json:"tailLines,omitempty"`
 	Follow        bool   `json:"follow,omitempty"`
 }
@@ -277,6 +345,22 @@ func BuildResourceDetailResponse(
 
 	resp.ResourceDetail = &payload
 	resp.Message = "resource detail ready"
+	return resp
+}
+
+func BuildPodViewResponse(
+	req HandshakeRequest,
+	daemonVersion string,
+	pid int,
+	payload PodViewPayload,
+) HandshakeResponse {
+	resp := BuildHandshakeResponse(req, daemonVersion, pid)
+	if !resp.Compatible {
+		return resp
+	}
+
+	resp.PodViewPayload = &payload
+	resp.Message = "pod view ready"
 	return resp
 }
 

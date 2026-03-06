@@ -308,6 +308,9 @@ func runTUI(state startupState, startMode string) error {
 		LoadResourceDetail: func(ctx context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
 			return client.GetResourceDetail(ctx, state.Config, buildinfo.Version, query)
 		},
+		LoadPodView: func(ctx context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			return client.GetPodView(ctx, state.Config, buildinfo.Version, query)
+		},
 		LoadNamespaces: func(ctx context.Context, kubeContext string) (protocol.NamespaceListPayload, error) {
 			return client.ListNamespaces(ctx, state.Config, buildinfo.Version, kubeContext)
 		},
