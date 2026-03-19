@@ -3,6 +3,8 @@
 - [x] order of tab completions - sorted alphabetically?
 - [x] shift tab to go back in suggestion
 - [x] arrows up/down should work too?
+- [ ] timeouts are frequent, eg list pods in ns:all
+- [ ] cant list iei, no autocomplete, only clusters for some reason
 
 # Features
 
