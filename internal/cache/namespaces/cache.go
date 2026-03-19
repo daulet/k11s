@@ -15,7 +15,7 @@ import (
 const (
 	defaultRefreshInterval = 5 * time.Second
 	defaultStaleAfter      = 20 * time.Second
-	defaultFetchTimeout    = 1500 * time.Millisecond
+	defaultFetchTimeout    = 2 * time.Minute
 )
 
 type Fetcher interface {
@@ -43,9 +43,6 @@ type entry struct {
 }
 
 func New(ctx context.Context, fetcher Fetcher, logger *log.Logger) *Cache {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	if fetcher == nil {
 		fetcher = noopFetcher{}
 	}

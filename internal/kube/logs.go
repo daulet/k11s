@@ -86,6 +86,7 @@ func (f *LogsFetcher) Fetch(ctx context.Context, query protocol.LogsQuery) (prot
 		Namespace:     query.Namespace,
 		ItemNamespace: namespace,
 		Name:          name,
+		Container:     strings.TrimSpace(query.Container),
 		Lines:         lines,
 		Truncated:     truncated,
 	}, nil

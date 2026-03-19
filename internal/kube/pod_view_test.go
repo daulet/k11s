@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,9 @@ func TestPodOverviewFromPod(t *testing.T) {
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
 			PodIP: "10.0.0.11",
+			StartTime: &metav1.Time{
+				Time: now.Add(-2 * time.Hour),
+			},
 			Conditions: []corev1.PodCondition{
 				{Type: corev1.PodReady, Status: corev1.ConditionTrue, Reason: "Ready"},
 			},
@@ -53,11 +57,99 @@ func TestPodOverviewFromPod(t *testing.T) {
 	if overview.Age != "2h3m" {
 		t.Fatalf("unexpected age: %q", overview.Age)
 	}
+	if overview.StartTime == "" {
+		t.Fatalf("expected start time to be rendered")
+	}
 	if len(overview.Conditions) != 1 || overview.Conditions[0].Type != string(corev1.PodReady) {
 		t.Fatalf("unexpected conditions: %#v", overview.Conditions)
 	}
 	if overview.Labels["app"] != "api" || overview.Annotations["team"] != "platform" {
 		t.Fatalf("unexpected labels/annotations: %#v %#v", overview.Labels, overview.Annotations)
+	}
+}
+
+func TestSanitizePodForYAMLStripsInternalState(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "api",
+			Namespace:       "default",
+			Labels:          map[string]string{"app": "api"},
+			Annotations:     map[string]string{"team": "platform"},
+			ResourceVersion: "12345",
+			ManagedFields: []metav1.ManagedFieldsEntry{
+				{Manager: "kube-controller-manager"},
+			},
+		},
+		Spec: corev1.PodSpec{
+			ServiceAccountName: "default",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	yamlBytes, err := marshalSanitizedPodYAML(pod)
+	if err != nil {
+		t.Fatalf("marshal sanitized pod yaml: %v", err)
+	}
+	text := string(yamlBytes)
+	if strings.Contains(text, "managedFields:") {
+		t.Fatalf("expected managedFields to be stripped, got %q", text)
+	}
+	if strings.Contains(text, "resourceVersion:") {
+		t.Fatalf("expected resourceVersion to be stripped, got %q", text)
+	}
+	if strings.Contains(text, "status:") {
+		t.Fatalf("expected status block to be stripped, got %q", text)
+	}
+	if !strings.Contains(text, "spec:") {
+		t.Fatalf("expected spec block to be present, got %q", text)
+	}
+	if strings.Contains(text, ": null") {
+		t.Fatalf("expected null fields to be omitted, got %q", text)
+	}
+	if !strings.Contains(text, "serviceAccountName: default") {
+		t.Fatalf("expected serialized spec field to be preserved, got %q", text)
+	}
+}
+
+func TestSanitizePodForYAMLPreservesExplicitEmptyObjects(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "app",
+					Image: "example/api:v1",
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "scratch", MountPath: "/scratch"},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "scratch",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
+				},
+			},
+		},
+	}
+
+	yamlBytes, err := marshalSanitizedPodYAML(pod)
+	if err != nil {
+		t.Fatalf("marshal sanitized pod yaml: %v", err)
+	}
+	text := string(yamlBytes)
+	if !strings.Contains(text, "emptyDir: {}") {
+		t.Fatalf("expected explicit empty object markers to be preserved, got %q", text)
+	}
+	if strings.Contains(text, ": null") {
+		t.Fatalf("expected null fields to remain omitted, got %q", text)
 	}
 }
 

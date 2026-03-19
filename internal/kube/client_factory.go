@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-const defaultClientTimeout = 1500 * time.Millisecond
+const defaultClientTimeout = 2 * time.Minute
 
 type ClientFactory struct {
 	mu            sync.Mutex

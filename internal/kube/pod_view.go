@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -10,11 +11,11 @@ import (
 	"time"
 
 	"github.com/daulet/k11s/internal/protocol"
-	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"sigs.k8s.io/yaml"
 )
 
 const defaultPodViewEventsLimit = 200
@@ -25,6 +26,20 @@ type PodViewFetcher struct {
 	clients     *ClientFactory
 	maxEvents   int
 	nowProvider func() time.Time
+}
+
+type podYAMLView struct {
+	APIVersion string              `json:"apiVersion"`
+	Kind       string              `json:"kind"`
+	Metadata   podYAMLViewMetadata `json:"metadata"`
+	Spec       map[string]any      `json:"spec,omitempty"`
+}
+
+type podYAMLViewMetadata struct {
+	Name        string            `json:"name"`
+	Namespace   string            `json:"namespace,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 func NewPodViewFetcher(clients *ClientFactory) *PodViewFetcher {
@@ -87,12 +102,104 @@ func (f *PodViewFetcher) Fetch(ctx context.Context, query protocol.PodViewQuery)
 		payload.Events = events
 	}
 
-	yamlBytes, err := yaml.Marshal(pod)
+	yamlBytes, err := marshalSanitizedPodYAML(*pod)
 	if err == nil {
 		payload.YAML = string(yamlBytes)
 	}
 
 	return payload, nil
+}
+
+func sanitizePodForYAML(pod corev1.Pod) podYAMLView {
+	return podYAMLView{
+		APIVersion: "v1",
+		Kind:       "Pod",
+		Metadata: podYAMLViewMetadata{
+			Name:        strings.TrimSpace(pod.Name),
+			Namespace:   strings.TrimSpace(pod.Namespace),
+			Labels:      cloneStringMap(pod.Labels),
+			Annotations: cloneStringMap(pod.Annotations),
+		},
+		Spec: sanitizePodSpecForYAML(pod.Spec),
+	}
+}
+
+func marshalSanitizedPodYAML(pod corev1.Pod) ([]byte, error) {
+	return yaml.Marshal(sanitizePodForYAML(pod))
+}
+
+func sanitizePodSpecForYAML(spec corev1.PodSpec) map[string]any {
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		return map[string]any{}
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return map[string]any{}
+	}
+
+	sanitized, ok := pruneEmptyManifestValue(decoded).(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	return sanitized
+}
+
+func pruneEmptyManifestValue(value any) any {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case map[string]any:
+		filtered := make(map[string]any, len(typed))
+		for key, child := range typed {
+			sanitized := pruneEmptyManifestValue(child)
+			if isEmptyManifestValue(sanitized) {
+				if original, ok := child.(map[string]any); ok && len(original) == 0 {
+					// Preserve explicit empty-object markers from the source manifest (for example emptyDir: {}).
+					filtered[key] = map[string]any{}
+				}
+				continue
+			}
+			filtered[key] = sanitized
+		}
+		if len(filtered) == 0 {
+			return nil
+		}
+		return filtered
+	case []any:
+		filtered := make([]any, 0, len(typed))
+		for _, child := range typed {
+			sanitized := pruneEmptyManifestValue(child)
+			if isEmptyManifestValue(sanitized) {
+				if original, ok := child.(map[string]any); ok && len(original) == 0 {
+					filtered = append(filtered, map[string]any{})
+				}
+				continue
+			}
+			filtered = append(filtered, sanitized)
+		}
+		if len(filtered) == 0 {
+			return nil
+		}
+		return filtered
+	default:
+		return value
+	}
+}
+
+func isEmptyManifestValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		return len(typed) == 0
+	case []any:
+		return len(typed) == 0
+	default:
+		return false
+	}
 }
 
 func (f *PodViewFetcher) now() time.Time {
@@ -120,6 +227,9 @@ func podOverviewFromPod(pod corev1.Pod, now time.Time) protocol.PodOverview {
 		NodeSelector:   cloneStringMap(pod.Spec.NodeSelector),
 		Tolerations:    tolerationsToStrings(pod.Spec.Tolerations),
 		Age:            formatHumanDuration(now.Sub(pod.CreationTimestamp.Time)),
+	}
+	if pod.Status.StartTime != nil && !pod.Status.StartTime.IsZero() {
+		overview.StartTime = pod.Status.StartTime.Time.UTC().Format(time.RFC3339)
 	}
 
 	conditions := make([]protocol.PodCondition, 0, len(pod.Status.Conditions))

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -664,14 +665,143 @@ func TestLogsFollowSchedulesPollingRefresh(t *testing.T) {
 	if afterSecondLoad.logsLoading {
 		t.Fatalf("expected logs loading to be cleared after refresh")
 	}
-	if len(afterSecondLoad.logs.Lines) != 1 || afterSecondLoad.logs.Lines[0] != "line-2" {
-		t.Fatalf("expected second refresh payload, got %#v", afterSecondLoad.logs)
+	if len(afterSecondLoad.logs.Lines) != 2 || afterSecondLoad.logs.Lines[0] != "line-1" || afterSecondLoad.logs.Lines[1] != "line-2" {
+		t.Fatalf("expected tailed logs to append new lines, got %#v", afterSecondLoad.logs)
 	}
 	if nextPollCmd == nil {
 		t.Fatalf("expected next poll scheduling after refresh")
 	}
 	if len(seen) != 2 || !seen[0].Follow || !seen[1].Follow {
 		t.Fatalf("expected follow=true on all logs refresh queries, got %#v", seen)
+	}
+}
+
+func TestStartPodTabLogsReloadKeepsExistingFollowLinesOnSameTarget(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "dev-cluster",
+		Namespace:   "default",
+		Name:        "api",
+		Found:       true,
+		Containers: []protocol.PodContainer{
+			{Name: "app"},
+		},
+	}
+	m.podViewTab = 2 // overview + container + logs
+	m.logsFollow = true
+	m.logsFollowQuery = protocol.LogsQuery{
+		KubeContext:   "dev-cluster",
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Container:     "app",
+		Follow:        true,
+	}
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Lines:         []string{"line-1", "line-2"},
+	}
+
+	updated, cmd := m.startPodTabLogsReload(false)
+	next := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected logs reload command")
+	}
+	if !next.logsLoading {
+		t.Fatalf("expected logs loading state")
+	}
+	if len(next.logs.Lines) != 2 {
+		t.Fatalf("expected existing follow lines to be retained, got %#v", next.logs.Lines)
+	}
+}
+
+func TestStartLogsWithAnnouncementClearsFollowBufferOnTargetChange(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.logsFollow = true
+	m.logsFollowQuery = protocol.LogsQuery{
+		KubeContext:   "dev-cluster",
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Container:     "app",
+		Follow:        true,
+	}
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Container:     "app",
+		Lines:         []string{"line-1", "line-2"},
+	}
+
+	updated, _ := m.startLogsWithAnnouncement(protocol.LogsQuery{
+		KubeContext:   "dev-cluster",
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Container:     "sidecar",
+		Follow:        true,
+	}, false)
+	next := updated.(model)
+	if len(next.logs.Lines) != 0 || strings.TrimSpace(next.logs.Name) != "" {
+		t.Fatalf("expected target change to clear stale follow buffer, got %#v", next.logs)
+	}
+}
+
+func TestLogsFollowContainerChangeReplacesBufferInsteadOfMerging(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.logsFollow = true
+	m.logsActiveSeq = 3
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Container:     "app",
+		Lines:         []string{"app-1", "app-2"},
+	}
+
+	updated, _ := m.Update(logsLoadedMsg{
+		seq: 3,
+		payload: protocol.LogsPayload{
+			Resource:      "pods",
+			Namespace:     "default",
+			ItemNamespace: "default",
+			Name:          "api",
+			Container:     "sidecar",
+			Lines:         []string{"sidecar-1"},
+		},
+		announce: false,
+	})
+	next := updated.(model)
+	if len(next.logs.Lines) != 1 || next.logs.Lines[0] != "sidecar-1" {
+		t.Fatalf("expected container change to replace logs buffer, got %#v", next.logs.Lines)
 	}
 }
 
@@ -2881,6 +3011,9 @@ func TestPodViewLogsTabLoadsSelectedContainer(t *testing.T) {
 	if seen[0].Container != "app" {
 		t.Fatalf("expected first logs request for app container, got %#v", seen[0])
 	}
+	if !seen[0].Follow {
+		t.Fatalf("expected pod logs tab query to run in follow mode")
+	}
 	if !withLogs.isPodLogsTabActive() {
 		t.Fatalf("expected logs tab active")
 	}
@@ -2895,6 +3028,248 @@ func TestPodViewLogsTabLoadsSelectedContainer(t *testing.T) {
 	}
 	if seen[1].Container != "sidecar" {
 		t.Fatalf("expected second logs request for sidecar, got %#v", seen[1])
+	}
+	if !seen[1].Follow {
+		t.Fatalf("expected pod logs container switch query to keep follow mode")
+	}
+}
+
+func TestPodViewLogsAutoSwitchesWhenSelectedContainerHasNoLogs(t *testing.T) {
+	var seen []protocol.LogsQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "mc1-lab1",
+			Namespace:   "inference-engine",
+			Resource:    "pods",
+		},
+		LoadLogs: func(_ context.Context, query protocol.LogsQuery) (protocol.LogsPayload, error) {
+			seen = append(seen, query)
+			payload := protocol.LogsPayload{
+				Resource:      "pods",
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Container:     query.Container,
+			}
+			if query.Container == "conductor" {
+				payload.Lines = []string{"hello-from-conductor"}
+			}
+			return payload, nil
+		},
+	})
+	m.podViewOpen = true
+	m.podViewTab = 3 // overview + 2 containers + logs
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "mc1-lab1",
+		Namespace:   "inference-engine",
+		Name:        "cyborg-conductor",
+		Found:       true,
+		Containers: []protocol.PodContainer{
+			{Name: "cyborg"},
+			{Name: "conductor"},
+		},
+	}
+	m.logsFollow = true
+	m.logsFollowQuery = protocol.LogsQuery{
+		KubeContext:   "mc1-lab1",
+		Resource:      "pods",
+		Namespace:     "inference-engine",
+		ItemNamespace: "inference-engine",
+		Name:          "cyborg-conductor",
+		Container:     "cyborg",
+		Follow:        true,
+	}
+	m.logsActiveSeq = 1
+	m.logsRequestSeq = 1
+	m.podLogsAutoSwitch = 1
+
+	updated, cmd := m.Update(logsLoadedMsg{
+		seq: 1,
+		payload: protocol.LogsPayload{
+			Resource:      "pods",
+			Namespace:     "inference-engine",
+			ItemNamespace: "inference-engine",
+			Name:          "cyborg-conductor",
+			Container:     "cyborg",
+			Lines:         nil,
+		},
+		announce: false,
+	})
+	next := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected auto-switch reload command when selected container has no logs")
+	}
+	if next.podViewLogIndex != 1 {
+		t.Fatalf("expected auto-switch to second container, got index %d", next.podViewLogIndex)
+	}
+
+	updated, _ = next.Update(cmd())
+	withLogs := updated.(model)
+	if len(seen) != 1 || seen[0].Container != "conductor" {
+		t.Fatalf("expected auto-switch reload for conductor container, got %#v", seen)
+	}
+	if len(withLogs.logs.Lines) == 0 || withLogs.logs.Lines[0] != "hello-from-conductor" {
+		t.Fatalf("expected logs from auto-switched container, got %#v", withLogs.logs)
+	}
+}
+
+func TestPodLogsLinesDistinguishLoadingVsNoLogs(t *testing.T) {
+	base := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "mc1-lab1",
+			Namespace:   "inference-engine",
+			Resource:    "pods",
+		},
+	})
+	base.podViewOpen = true
+	base.podViewTab = 2 // overview + container + logs
+	base.podView = protocol.PodViewPayload{
+		KubeContext: "mc1-lab1",
+		Namespace:   "inference-engine",
+		Name:        "cyborg-conductor",
+		Found:       true,
+		Containers: []protocol.PodContainer{
+			{Name: "cyborg"},
+		},
+	}
+
+	loading := base
+	loading.logsLoading = true
+	loading.logsFollow = true
+	loading.logs = protocol.LogsPayload{}
+	if rendered := strings.Join(loading.podLogsLines(90), "\n"); !strings.Contains(rendered, "starting log tail...") {
+		t.Fatalf("expected explicit loading state, got %q", rendered)
+	}
+
+	followEmpty := base
+	followEmpty.logsFollow = true
+	followEmpty.logsLoading = false
+	followEmpty.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "inference-engine",
+		ItemNamespace: "inference-engine",
+		Name:          "cyborg-conductor",
+		Container:     "cyborg",
+	}
+	if rendered := strings.Join(followEmpty.podLogsLines(90), "\n"); !strings.Contains(rendered, "no logs yet for this container (following)") {
+		t.Fatalf("expected explicit no-logs-follow state, got %q", rendered)
+	}
+
+	nonFollowEmpty := base
+	nonFollowEmpty.logsFollow = false
+	nonFollowEmpty.logsLoading = false
+	nonFollowEmpty.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "inference-engine",
+		ItemNamespace: "inference-engine",
+		Name:          "cyborg-conductor",
+		Container:     "cyborg",
+	}
+	if rendered := strings.Join(nonFollowEmpty.podLogsLines(90), "\n"); !strings.Contains(rendered, "no logs for this container") {
+		t.Fatalf("expected explicit no-logs non-follow state, got %q", rendered)
+	}
+}
+
+func TestPodViewLogsFollowKeepsScrollPinnedToBottom(t *testing.T) {
+	lines := make([]string, 0, 45)
+	for i := 1; i <= 45; i++ {
+		lines = append(lines, fmt.Sprintf("line-%02d", i))
+	}
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.width = 100
+	m.height = 18
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Containers: []protocol.PodContainer{
+			{Name: "app"},
+		},
+	}
+	m.podViewTab = 2 // overview + container + logs
+	m.logsFollow = true
+	m.logsActiveSeq = 7
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Lines:         lines[:40],
+	}
+	m.scrollPodToBottom()
+
+	updated, _ := m.Update(logsLoadedMsg{
+		seq: 7,
+		payload: protocol.LogsPayload{
+			Resource:      "pods",
+			Namespace:     "default",
+			ItemNamespace: "default",
+			Name:          "api",
+			Lines:         lines,
+		},
+		announce: false,
+	})
+	next := updated.(model)
+	if len(next.logs.Lines) != 45 {
+		t.Fatalf("expected follow merge to retain tailed lines, got %d", len(next.logs.Lines))
+	}
+	if !next.isPodContentAtBottom() {
+		t.Fatalf("expected pod logs view to stay pinned at bottom while following")
+	}
+}
+
+func TestPodEventsLinesRenderCompactTable(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Events: []protocol.PodEvent{
+			{
+				Type:     "Warning",
+				Reason:   "BackOff",
+				Message:  "Back-off restarting failed container app in pod api-default",
+				Count:    12,
+				LastSeen: "2026-03-19T12:34:56Z",
+			},
+		},
+	}
+
+	lines := m.podEventsLines(88)
+	if len(lines) < 2 {
+		t.Fatalf("expected header + at least one event row, got %#v", lines)
+	}
+
+	ansiRE := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	header := ansiRE.ReplaceAllString(lines[0], "")
+	if !strings.Contains(strings.ToLower(header), "last seen") ||
+		!strings.Contains(strings.ToLower(header), "reason") ||
+		!strings.Contains(strings.ToLower(header), "message") {
+		t.Fatalf("expected compact events table header, got %q", header)
+	}
+
+	body := ansiRE.ReplaceAllString(strings.Join(lines[1:], "\n"), "")
+	if !strings.Contains(body, "2026-03-19 12:34:56") ||
+		!strings.Contains(body, "Warning") ||
+		!strings.Contains(body, "BackOff") ||
+		!strings.Contains(body, "12") ||
+		!strings.Contains(body, "Back-off restarting failed container") {
+		t.Fatalf("expected compact event row with timestamp/type/reason/count/message, got %q", body)
 	}
 }
 
@@ -2975,5 +3350,497 @@ func TestPodViewShortcutNodeNavigatesToNodesList(t *testing.T) {
 	}
 	if afterReload.resourceList.Resource != "nodes" {
 		t.Fatalf("expected nodes payload after reload, got %q", afterReload.resourceList.Resource)
+	}
+}
+
+func TestListSelectionAdjustsScrollOffset(t *testing.T) {
+	items := make([]protocol.ResourceItem, 0, 40)
+	for i := 0; i < 40; i++ {
+		items = append(items, protocol.ResourceItem{
+			Name:      fmt.Sprintf("pod-%02d", i),
+			Namespace: "default",
+			Status:    "Running",
+		})
+	}
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items:     items,
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.height = 16 // keep viewport small to force scrolling
+	m.setSelection(25)
+
+	if m.listScroll <= 0 {
+		t.Fatalf("expected list scroll to advance for low selection, got %d", m.listScroll)
+	}
+
+	_, _, mainInnerHeight := m.normalizedDimensions()
+	viewportHeight := mainInnerHeight - 2
+	selectedLine := m.firstItemBodyLine() + m.selected
+	if selectedLine < m.listScroll || selectedLine >= m.listScroll+viewportHeight {
+		t.Fatalf(
+			"expected selected line in viewport: selectedLine=%d scroll=%d viewport=%d",
+			selectedLine,
+			m.listScroll,
+			viewportHeight,
+		)
+	}
+}
+
+func TestPodViewScrollKeepsTabsVisible(t *testing.T) {
+	env := make([]string, 0, 40)
+	for i := 0; i < 40; i++ {
+		env = append(env, fmt.Sprintf("KEY_%02d=VALUE_%02d", i, i))
+	}
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.width = 100
+	m.height = 16
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Overview:  protocol.PodOverview{Owner: "ReplicaSet/api-123", Phase: "Running", Node: "node-a"},
+		Containers: []protocol.PodContainer{
+			{Name: "app", Env: env, Status: "Running"},
+		},
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+	m.podViewTab = 1 // container tab
+
+	before := m.renderMainPane(100, 10)
+	if !strings.Contains(before, "overview") || !strings.Contains(before, "ctr:app") {
+		t.Fatalf("expected tab labels before scroll, got %q", before)
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	next := updated.(model)
+	if next.podScroll <= 0 {
+		t.Fatalf("expected pod content scroll to increase, got %d", next.podScroll)
+	}
+
+	after := next.renderMainPane(100, 10)
+	if !strings.Contains(after, "overview") || !strings.Contains(after, "ctr:app") {
+		t.Fatalf("expected tab labels after scroll, got %q", after)
+	}
+}
+
+func TestPodOverviewAnnotationsAreCondensedByDefault(t *testing.T) {
+	longAnnotation := strings.Repeat("x", 220)
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.width = 120
+	m.height = 40
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Overview: protocol.PodOverview{
+			Phase:       "Running",
+			Annotations: map[string]string{"long.example/key": longAnnotation},
+		},
+	}
+
+	lines := m.podOverviewLines(100)
+	rendered := strings.Join(lines, "\n")
+	if strings.Contains(rendered, longAnnotation) {
+		t.Fatalf("expected long annotation to be condensed by default")
+	}
+	if !strings.Contains(rendered, "[click to expand]") {
+		t.Fatalf("expected condensed annotation hint, got %q", rendered)
+	}
+}
+
+func TestPodOverviewAnnotationClickExpandsValue(t *testing.T) {
+	longAnnotation := strings.Repeat("value-", 40)
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.width = 120
+	m.height = 40
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Overview: protocol.PodOverview{
+			Phase:       "Running",
+			Annotations: map[string]string{"long.example/key": longAnnotation},
+		},
+	}
+
+	contentWidth := m.width - m.styles.MainPane.GetHorizontalFrameSize()
+	targetLine := -1
+	for i := 0; i < 512; i++ {
+		key, ok := m.podOverviewAnnotationKeyAtLine(contentWidth, i)
+		if ok && key == "long.example/key" {
+			targetLine = i
+			break
+		}
+	}
+	if targetLine < 0 {
+		t.Fatalf("expected annotation line mapping for click")
+	}
+
+	// updatePodViewMouseMode maps content line N to Y=(input box + separator + pod headers) + N
+	// where input box + separator = 5 and pod headers = 4.
+	updated, _ := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      6,
+		Y:      9 + targetLine,
+	})
+	next := updated.(model)
+
+	if !next.podAnnotationOpen["long.example/key"] {
+		t.Fatalf("expected annotation to be expanded after click")
+	}
+	rendered := strings.Join(next.podOverviewLines(contentWidth), "\n")
+	if !strings.Contains(rendered, "long.example/key [expanded]") {
+		t.Fatalf("expected expanded annotation header in overview, got %q", rendered)
+	}
+	if strings.Contains(rendered, "[click to expand]") {
+		t.Fatalf("expected expanded annotation to hide condensed hint, got %q", rendered)
+	}
+}
+
+func TestPollTickRefreshesPodViewWhenOpen(t *testing.T) {
+	var podViewCalls int
+	var listCalls int
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadPodView: func(_ context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			podViewCalls++
+			return protocol.PodViewPayload{
+				KubeContext: query.KubeContext,
+				Namespace:   query.Namespace,
+				Name:        query.Name,
+				Found:       true,
+				Overview:    protocol.PodOverview{Phase: "Running"},
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 1,
+					Source:             "api",
+				},
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "dev",
+		Namespace:   "default",
+		Name:        "api",
+		Found:       true,
+		Overview:    protocol.PodOverview{Phase: "Running"},
+		Freshness: protocol.FreshnessMeta{
+			State:              protocol.FreshnessStateLive,
+			SnapshotTimeUnixMs: 1,
+			Source:             "api",
+		},
+	}
+
+	updated, cmd := m.Update(pollTickMsg{})
+	next := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected pod-view refresh command on poll tick")
+	}
+	if next.podViewLoading {
+		t.Fatalf("expected in-place pod view refresh without loading placeholder")
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list refresh while pod view is open, got %d", listCalls)
+	}
+	if podViewCalls != 0 {
+		t.Fatalf("expected load command to defer execution until cmd() is run")
+	}
+}
+
+func TestSilentPodViewRefreshDoesNotReloadLogsTab(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadLogs: func(_ context.Context, query protocol.LogsQuery) (protocol.LogsPayload, error) {
+			return protocol.LogsPayload{Name: query.Name, Lines: []string{"line-1"}}, nil
+		},
+	})
+	m.podViewOpen = true
+	m.podViewActiveSeq = 11
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "dev",
+		Namespace:   "default",
+		Name:        "api",
+		Found:       true,
+		Overview:    protocol.PodOverview{Phase: "Running"},
+		Containers: []protocol.PodContainer{
+			{Name: "app", Status: "Running"},
+		},
+	}
+	m.podViewTab = 2 // overview + 1 container + logs
+
+	updated, cmd := m.Update(podViewLoadedMsg{
+		seq: 11,
+		payload: protocol.PodViewPayload{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Name:        "api",
+			Found:       true,
+			Overview:    protocol.PodOverview{Phase: "Running"},
+			Containers: []protocol.PodContainer{
+				{Name: "app", Status: "Running"},
+			},
+		},
+		announce: false,
+	})
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected no logs reload command for silent pod refresh while logs tab is active")
+	}
+	if !next.isPodLogsTabActive() {
+		t.Fatalf("expected logs tab to remain active")
+	}
+}
+
+func TestPodViewF2TogglesMouseCapture(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Overview:  protocol.PodOverview{Phase: "Running"},
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF2})
+	next := updated.(model)
+	if next.mouseCapture {
+		t.Fatalf("expected mouse capture to be disabled after first F2")
+	}
+	if cmd == nil {
+		t.Fatalf("expected mouse disable command")
+	}
+
+	updated, cmd = next.Update(tea.KeyMsg{Type: tea.KeyF2})
+	next = updated.(model)
+	if !next.mouseCapture {
+		t.Fatalf("expected mouse capture to be re-enabled after second F2")
+	}
+	if cmd == nil {
+		t.Fatalf("expected mouse enable command")
+	}
+}
+
+func TestPodViewFastScrollTopAndBottom(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.width = 100
+	m.height = 16
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Overview: protocol.PodOverview{
+			Phase: "Running",
+			Annotations: map[string]string{
+				"long.example/key": strings.Repeat("value-", 80),
+			},
+		},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	withBottom := updated.(model)
+	if withBottom.podScroll <= 0 {
+		t.Fatalf("expected G to move pod view scroll to bottom, got %d", withBottom.podScroll)
+	}
+
+	updated, _ = withBottom.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	withTop := updated.(model)
+	if withTop.podScroll != 0 {
+		t.Fatalf("expected g to move pod view scroll to top, got %d", withTop.podScroll)
+	}
+}
+
+func TestPodViewLoadedHighlightsChangedOverviewFields(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.podViewOpen = true
+	m.podViewActiveSeq = 7
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "dev",
+		Namespace:   "default",
+		Name:        "api",
+		Found:       true,
+		Overview: protocol.PodOverview{
+			Phase: "Pending",
+			Node:  "node-a",
+		},
+	}
+
+	updated, _ := m.Update(podViewLoadedMsg{
+		seq: 7,
+		payload: protocol.PodViewPayload{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Name:        "api",
+			Found:       true,
+			Overview: protocol.PodOverview{
+				Phase: "Running",
+				Node:  "node-a",
+			},
+		},
+		announce: false,
+	})
+	next := updated.(model)
+	if !next.isPodFieldFlashing("phase") {
+		t.Fatalf("expected phase field to be highlighted after change")
+	}
+}
+
+func TestBackgroundPodViewFailureKeepsCurrentView(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.podViewOpen = true
+	m.podViewActiveSeq = 9
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "dev",
+		Namespace:   "default",
+		Name:        "api",
+		Found:       true,
+		Overview:    protocol.PodOverview{Phase: "Running"},
+	}
+
+	updated, _ := m.Update(podViewFailedMsg{
+		seq:      9,
+		err:      errors.New("temporary failure"),
+		announce: false,
+	})
+	next := updated.(model)
+	if !next.podView.Found || next.podView.Name != "api" {
+		t.Fatalf("expected pod view payload to be preserved on background error")
+	}
+	if strings.TrimSpace(next.podViewErr) != "" {
+		t.Fatalf("expected no pod view error surface on background refresh failure, got %q", next.podViewErr)
 	}
 }

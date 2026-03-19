@@ -141,6 +141,7 @@ type PodOverview struct {
 	Node           string            `json:"node,omitempty"`
 	NodeSelector   map[string]string `json:"nodeSelector,omitempty"`
 	Tolerations    []string          `json:"tolerations,omitempty"`
+	StartTime      string            `json:"startTime,omitempty"`
 	Age            string            `json:"age,omitempty"`
 }
 
@@ -241,6 +242,7 @@ type LogsPayload struct {
 	Namespace     string   `json:"namespace"`
 	ItemNamespace string   `json:"itemNamespace,omitempty"`
 	Name          string   `json:"name"`
+	Container     string   `json:"container,omitempty"`
 	Lines         []string `json:"lines"`
 	Truncated     bool     `json:"truncated,omitempty"`
 }

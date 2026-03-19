@@ -6,13 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/daulet/k11s/internal/config"
 	"github.com/daulet/k11s/internal/protocol"
 )
-
-const minControlRequestTimeout = 2 * time.Second
 
 func GetSession(ctx context.Context, cfg config.Config, clientVersion string) (protocol.SessionState, error) {
 	req := protocol.HandshakeRequest{
@@ -47,14 +44,18 @@ func SaveSession(ctx context.Context, cfg config.Config, clientVersion string, s
 }
 
 func sendControlRequest(ctx context.Context, cfg config.Config, req protocol.HandshakeRequest) (protocol.HandshakeResponse, error) {
-	dialer := &net.Dialer{Timeout: cfg.ConnectTimeout}
+	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", cfg.SocketPath)
 	if err != nil {
 		return protocol.HandshakeResponse{}, &DaemonUnavailableError{Cause: err}
 	}
 	defer conn.Close()
 
-	setControlConnDeadline(conn, ctx, cfg.ConnectTimeout)
+	setControlConnDeadline(conn, ctx)
+	stopWatching := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopWatching()
 
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return protocol.HandshakeResponse{}, fmt.Errorf("send request (%s): %w", req.Intent, err)
@@ -71,18 +72,11 @@ func sendControlRequest(ctx context.Context, cfg config.Config, req protocol.Han
 	return resp, nil
 }
 
-func setControlConnDeadline(conn net.Conn, ctx context.Context, fallback time.Duration) {
+func setControlConnDeadline(conn net.Conn, ctx context.Context) {
 	if conn == nil {
 		return
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
-		return
 	}
-
-	timeout := fallback
-	if timeout < minControlRequestTimeout {
-		timeout = minControlRequestTimeout
-	}
-	_ = conn.SetDeadline(time.Now().Add(timeout))
 }

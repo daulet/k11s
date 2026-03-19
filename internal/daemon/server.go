@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	connDecodeDeadline  = 2 * time.Second
-	connRequestDeadline = 10 * time.Second
+	connDecodeDeadline  = 30 * time.Second
+	connRequestDeadline = 10 * time.Minute
 )
 
 func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {

@@ -12,9 +12,9 @@ import (
 const (
 	socketFileName         = "k11sd.sock"
 	sessionFileName        = "session.json"
-	defaultConnectTimeout  = 150 * time.Millisecond
-	defaultSpawnTimeout    = 2 * time.Second
-	defaultRetryInterval   = 75 * time.Millisecond
+	defaultConnectTimeout  = 10 * time.Second
+	defaultSpawnTimeout    = 45 * time.Second
+	defaultRetryInterval   = 200 * time.Millisecond
 	defaultWatchRetryDelay = 2 * time.Second // reserved for next phase
 )
 

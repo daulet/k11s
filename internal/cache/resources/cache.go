@@ -15,7 +15,7 @@ import (
 const (
 	defaultRefreshInterval = 3 * time.Second
 	defaultStaleAfter      = 12 * time.Second
-	defaultFetchTimeout    = 1500 * time.Millisecond
+	defaultFetchTimeout    = 2 * time.Minute
 	defaultWatchRetryDelay = 2 * time.Second
 )
 
@@ -63,9 +63,6 @@ type cacheEntry struct {
 }
 
 func New(ctx context.Context, fetcher Fetcher, logger *log.Logger) *Cache {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	if fetcher == nil {
 		fetcher = noopFetcher{}
 	}
