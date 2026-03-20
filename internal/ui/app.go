@@ -935,6 +935,24 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) updatePodViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
+	case key.Matches(msg, m.keys.SearchNext):
+		if !m.jumpToSearchMatch(1) {
+			if strings.TrimSpace(m.searchQuery) == "" {
+				m.commandMessage = "search is empty (press / to search)"
+			} else {
+				m.commandMessage = fmt.Sprintf("no matches for %q", m.searchQuery)
+			}
+		}
+		return m, nil
+	case key.Matches(msg, m.keys.SearchPrev):
+		if !m.jumpToSearchMatch(-1) {
+			if strings.TrimSpace(m.searchQuery) == "" {
+				m.commandMessage = "search is empty (press / to search)"
+			} else {
+				m.commandMessage = fmt.Sprintf("no matches for %q", m.searchQuery)
+			}
+		}
+		return m, nil
 	case msg.String() == "esc":
 		m.clearPodView()
 		m.commandMessage = "closed pod view"
@@ -1570,6 +1588,15 @@ func (m *model) applySearchQuery(query string) {
 		return
 	}
 
+	if m.podViewOpen {
+		if !m.jumpToPodSearchStart() {
+			m.commandMessage = fmt.Sprintf("no matches for %q", m.searchQuery)
+			return
+		}
+		m.commandMessage = fmt.Sprintf("search: %d matches for %q", m.podSearchMatchCount(), m.searchQuery)
+		return
+	}
+
 	matches := m.searchMatchIndices()
 	if len(matches) == 0 {
 		m.commandMessage = fmt.Sprintf("no matches for %q", m.searchQuery)
@@ -1594,6 +1621,10 @@ func (m *model) searchMatchIndices() []int {
 }
 
 func (m *model) jumpToSearchMatch(direction int) bool {
+	if m.podViewOpen {
+		return m.jumpToPodSearchMatch(direction)
+	}
+
 	matches := m.searchMatchIndices()
 	if len(matches) == 0 {
 		return false
@@ -1616,6 +1647,105 @@ func (m *model) jumpToSearchMatch(direction int) bool {
 	}
 	m.setSelection(matches[len(matches)-1])
 	return true
+}
+
+func (m model) searchMatchCount() int {
+	query := strings.TrimSpace(m.searchQuery)
+	if query == "" {
+		return 0
+	}
+	if m.podViewOpen {
+		return m.podSearchMatchCount()
+	}
+	return len(m.searchMatchIndices())
+}
+
+func (m *model) jumpToPodSearchStart() bool {
+	matches, contentHeight, totalLines := m.podSearchMatchLineIndices()
+	if len(matches) == 0 {
+		return false
+	}
+	m.podScroll = podScrollForMatch(matches[0], totalLines, contentHeight)
+	return true
+}
+
+func (m *model) jumpToPodSearchMatch(direction int) bool {
+	matches, contentHeight, totalLines := m.podSearchMatchLineIndices()
+	if len(matches) == 0 {
+		return false
+	}
+
+	currentLine := m.podScroll
+	if direction >= 0 {
+		for _, line := range matches {
+			if line > currentLine {
+				m.podScroll = podScrollForMatch(line, totalLines, contentHeight)
+				return true
+			}
+		}
+		m.podScroll = podScrollForMatch(matches[0], totalLines, contentHeight)
+		return true
+	}
+
+	for i := len(matches) - 1; i >= 0; i-- {
+		if matches[i] < currentLine {
+			m.podScroll = podScrollForMatch(matches[i], totalLines, contentHeight)
+			return true
+		}
+	}
+	m.podScroll = podScrollForMatch(matches[len(matches)-1], totalLines, contentHeight)
+	return true
+}
+
+func (m model) podSearchMatchCount() int {
+	matches, _, _ := m.podSearchMatchLineIndices()
+	return len(matches)
+}
+
+func (m model) podSearchMatchLineIndices() ([]int, int, int) {
+	query := strings.ToLower(strings.TrimSpace(m.searchQuery))
+	if query == "" {
+		return nil, 0, 0
+	}
+
+	lines, contentHeight := m.podSearchLines()
+	matches := make([]int, 0, len(lines))
+	for idx, line := range lines {
+		if strings.Contains(strings.ToLower(line), query) {
+			matches = append(matches, idx)
+		}
+	}
+	return matches, contentHeight, len(lines)
+}
+
+func (m model) podSearchLines() ([]string, int) {
+	width, _, mainInnerHeight := m.normalizedDimensions()
+	contentWidth := width - m.styles.MainPane.GetHorizontalFrameSize()
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+
+	contentHeight := mainInnerHeight - 4 // title + spacer + tabs + spacer
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+
+	lines := m.podViewContentLines(contentWidth, contentHeight)
+	return lines, contentHeight
+}
+
+func podScrollForMatch(matchLine int, totalLines int, contentHeight int) int {
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+	if matchLine < 0 {
+		matchLine = 0
+	}
+	maxScroll := maxInt(0, totalLines-contentHeight)
+	if matchLine > maxScroll {
+		matchLine = maxScroll
+	}
+	return matchLine
 }
 
 func (m *model) jumpSelection(delta int) {
@@ -2545,7 +2675,7 @@ func (m model) renderInputBox(width int) string {
 	secondary := ""
 	if m.searchMode {
 		if m.searchQuery != "" {
-			matchCount := len(m.searchMatchIndices())
+			matchCount := m.searchMatchCount()
 			secondary = m.styles.CommandHint.Render(fmt.Sprintf("search [%s]: %d matches (enter apply, esc cancel, n/N next/prev)", m.searchQuery, matchCount))
 		} else {
 			secondary = m.styles.CommandHint.Render("search: type query and press enter (n/N jump matches)")
@@ -2583,6 +2713,7 @@ func (m model) renderMainPane(width int, innerHeight int) string {
 			contentHeight = 1
 		}
 		contentLines := m.podViewContentLines(contentWidth, contentHeight)
+		contentLines = m.highlightPodSearchMatches(contentLines)
 		scroll := m.normalizedPodScroll(len(contentLines), contentHeight)
 		lines = append(lines, viewportLines(contentLines, scroll, contentHeight)...)
 	} else if len(m.resourceList.Items) == 0 {
@@ -3093,8 +3224,9 @@ func (m model) podEventsLines(width int) []string {
 		eventLastSeenWidth = 19
 		eventTypeWidth     = 7
 		eventReasonWidth   = 16
-		eventCountWidth    = 5
+		eventCountWidth    = 3
 	)
+	const eventCountTitle = "cnt"
 
 	header := fmt.Sprintf(
 		"%-*s %-*s %-*s %*s %s",
@@ -3105,7 +3237,7 @@ func (m model) podEventsLines(width int) []string {
 		eventReasonWidth,
 		"reason",
 		eventCountWidth,
-		"count",
+		eventCountTitle,
 		"message",
 	)
 	lines := []string{m.styles.ColumnHeader.Render(fitToWidth(header, width))}
@@ -3172,6 +3304,23 @@ func (m model) podYAMLLines(_ int) []string {
 	return strings.Split(text, "\n")
 }
 
+func (m model) highlightPodSearchMatches(lines []string) []string {
+	query := strings.ToLower(strings.TrimSpace(m.searchQuery))
+	if query == "" || len(lines) == 0 {
+		return lines
+	}
+
+	highlighted := make([]string, len(lines))
+	for i, line := range lines {
+		if strings.Contains(strings.ToLower(line), query) {
+			highlighted[i] = m.styles.SearchMatch.Render(line)
+			continue
+		}
+		highlighted[i] = line
+	}
+	return highlighted
+}
+
 func appendWrappedLines(lines []string, value string, width int) []string {
 	wrapped := wrapText(value, width)
 	return append(lines, wrapped...)
@@ -3204,7 +3353,7 @@ func (m model) listLines() []string {
 	if m.loading {
 		lines = append(lines, m.styles.EmptyLoading.Render("loading resources..."))
 	}
-	columns := listColumnsForResource(m.resourceList.Resource)
+	columns := m.listColumns()
 	lines = append(lines, m.styles.ColumnHeader.Render(renderListHeader(columns)))
 
 	for i, item := range m.resourceList.Items {
@@ -3241,14 +3390,28 @@ type listColumn struct {
 	width int
 }
 
-func listColumnsForResource(resource string) []listColumn {
+func (m model) listColumns() []listColumn {
+	return listColumnsForResource(m.resourceList.Resource, m.listContentWidth())
+}
+
+func (m model) listContentWidth() int {
+	width, _, _ := m.normalizedDimensions()
+	contentWidth := width - m.styles.MainPane.GetHorizontalFrameSize()
+	if contentWidth < 1 {
+		return 1
+	}
+	return contentWidth
+}
+
+func listColumnsForResource(resource string, contentWidth int) []listColumn {
 	switch strings.ToLower(strings.TrimSpace(resource)) {
 	case "pods":
+		nameWidth, namespaceWidth, statusWidth, nodeWidth := podListColumnWidths(contentWidth)
 		return []listColumn{
-			{id: "name", title: "NAME", width: 24},
-			{id: "namespace", title: "NAMESPACE", width: 14},
-			{id: "status", title: "STATUS", width: 12},
-			{id: "node", title: "NODE", width: 18},
+			{id: "name", title: "NAME", width: nameWidth},
+			{id: "namespace", title: "NAMESPACE", width: namespaceWidth},
+			{id: "status", title: "STATUS", width: statusWidth},
+			{id: "node", title: "NODE", width: nodeWidth},
 			{id: "owner", title: "OWNER", width: 0},
 		}
 	default:
@@ -3258,6 +3421,96 @@ func listColumnsForResource(resource string) []listColumn {
 			{id: "status", title: "STATUS", width: 0},
 		}
 	}
+}
+
+func podListColumnWidths(contentWidth int) (name int, namespace int, status int, node int) {
+	const (
+		nameMin      = 20
+		namespaceMin = 14
+		statusMin    = 10
+		nodeMin      = 12
+
+		nameMax      = 36
+		namespaceMax = 26
+		statusMax    = 12
+		nodeMax      = 24
+
+		ownerMinVisible = 12
+		fixedPadding    = 6 // indent + separators before the trailing owner column
+	)
+
+	name = nameMin
+	namespace = namespaceMin
+	status = statusMin
+	node = nodeMin
+
+	minSum := nameMin + namespaceMin + statusMin + nodeMin
+	maxSum := nameMax + namespaceMax + statusMax + nodeMax
+	target := contentWidth - ownerMinVisible - fixedPadding
+	if target < minSum {
+		target = minSum
+	}
+	if target > maxSum {
+		target = maxSum
+	}
+
+	remaining := target - minSum
+	for remaining > 0 {
+		progressed := false
+		if name < nameMax {
+			name++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if namespace < namespaceMax {
+			namespace++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if node < nodeMax {
+			node++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if name < nameMax {
+			name++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if namespace < namespaceMax {
+			namespace++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if status < statusMax {
+			status++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+
+	return name, namespace, status, node
 }
 
 func renderListHeader(columns []listColumn) string {
@@ -3376,7 +3629,7 @@ func (m model) clickedColumnForItem(itemIndex int, contentX int) (string, bool) 
 	if contentX < 0 {
 		return "", false
 	}
-	columns := listColumnsForResource(m.resourceList.Resource)
+	columns := m.listColumns()
 	values := make([]string, 0, len(columns))
 	for _, column := range columns {
 		values = append(values, listValueForColumn(column.id, m.resourceList.Items[itemIndex]))
@@ -3567,6 +3820,8 @@ func (m model) legendHints() []string {
 			"S-tab prev",
 			"pgup/dn jump",
 			"g/G top/bot",
+			"/ search",
+			"n/N next/prev",
 		}
 		if m.isPodLogsTabActive() && len(m.podLogContainers()) > 1 {
 			hints = append(hints, "[/ ] container")

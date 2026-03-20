@@ -15,6 +15,22 @@ import (
 	"github.com/daulet/k11s/internal/protocol"
 )
 
+func clickXForColumn(t *testing.T, m model, itemIndex int, column string) int {
+	t.Helper()
+	limit := m.listContentWidth() + 24
+	if limit < 64 {
+		limit = 64
+	}
+	for x := 0; x < limit; x++ {
+		columnID, ok := m.clickedColumnForItem(itemIndex, x)
+		if ok && columnID == column {
+			return x + 1
+		}
+	}
+	t.Fatalf("unable to resolve clickable X for column %q", column)
+	return 0
+}
+
 func TestModelInitialSelectionFromSession(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{Selection: "worker"},
@@ -1417,6 +1433,168 @@ func TestSearchNextPrevBindings(t *testing.T) {
 	}
 }
 
+func TestPodLogsSlashSearchAppliesAndScrollsToMatch(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.width = 100
+	m.height = 12
+	m.podViewOpen = true
+	m.podViewTab = 1 // overview + logs + events + yaml
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+	}
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Lines: []string{
+			"line 1",
+			"line 2",
+			"line 3",
+			"line 4",
+			"fatal: boom",
+			"line 6",
+		},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	searching := updated.(model)
+	if !searching.searchMode {
+		t.Fatalf("expected search mode after / in pod logs")
+	}
+	searching.input.SetValue("fatal")
+
+	updated, _ = searching.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	final := updated.(model)
+	if final.searchMode {
+		t.Fatalf("expected search mode closed after enter")
+	}
+	if final.searchQuery != "fatal" {
+		t.Fatalf("expected persisted search query fatal, got %q", final.searchQuery)
+	}
+	if final.podScroll != 4 {
+		t.Fatalf("expected pod logs search to scroll to matching line 4, got %d", final.podScroll)
+	}
+}
+
+func TestPodLogsSearchNextPrevBindings(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.width = 100
+	m.height = 12
+	m.podViewOpen = true
+	m.podViewTab = 1 // overview + logs + events + yaml
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+	}
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Lines: []string{
+			"prefix",
+			"target one",
+			"middle",
+			"middle two",
+			"target two",
+			"tail",
+			"target three",
+		},
+	}
+	m.searchQuery = "target"
+	m.podScroll = 0
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	next := updated.(model)
+	if next.podScroll != 1 {
+		t.Fatalf("expected n to move to first pod match line 1, got %d", next.podScroll)
+	}
+
+	updated, _ = next.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	next = updated.(model)
+	if next.podScroll != 4 {
+		t.Fatalf("expected n to move to next pod match line 4, got %d", next.podScroll)
+	}
+
+	updated, _ = next.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	prev := updated.(model)
+	if prev.podScroll != 1 {
+		t.Fatalf("expected N to move to previous pod match line 1, got %d", prev.podScroll)
+	}
+
+	updated, _ = prev.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	wrapped := updated.(model)
+	if wrapped.podScroll != 6 {
+		t.Fatalf("expected N to wrap to last pod match line 6, got %d", wrapped.podScroll)
+	}
+}
+
+func TestPodYAMLSlashSearchAppliesAndScrollsToMatch(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.width = 100
+	m.height = 12
+	m.podViewOpen = true
+	m.podViewTab = 3 // overview + logs + events + yaml
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		YAML: strings.Join([]string{
+			"apiVersion: v1",
+			"kind: Pod",
+			"metadata:",
+			"  name: api",
+			"spec:",
+			"  containers:",
+			"  - name: app",
+			"    image: app:v1",
+			"  nodeSelector:",
+			"    pool: gpu",
+		}, "\n"),
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	searching := updated.(model)
+	if !searching.searchMode {
+		t.Fatalf("expected search mode after / in pod yaml")
+	}
+	searching.input.SetValue("nodeSelector")
+
+	updated, _ = searching.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	final := updated.(model)
+	if final.searchMode {
+		t.Fatalf("expected search mode closed after enter")
+	}
+	if final.searchQuery != "nodeSelector" {
+		t.Fatalf("expected persisted search query nodeSelector, got %q", final.searchQuery)
+	}
+	if final.podScroll != 8 {
+		t.Fatalf("expected pod yaml search to scroll to matching line 8, got %d", final.podScroll)
+	}
+}
+
 func TestJumpBindingsMoveByTen(t *testing.T) {
 	items := make([]protocol.ResourceItem, 0, 25)
 	for i := 0; i < 25; i++ {
@@ -1759,8 +1937,8 @@ func TestMouseClickNamespaceInPodRowSwitchesNamespace(t *testing.T) {
 	})
 
 	msg := tea.MouseMsg{
-		X:      28, // namespace column
-		Y:      6,  // first item row
+		X:      clickXForColumn(t, m, 0, "namespace"),
+		Y:      6, // first item row
 		Button: tea.MouseButtonLeft,
 		Action: tea.MouseActionPress,
 	}
@@ -1818,8 +1996,8 @@ func TestMouseClickNodeInPodRowOpensNodesView(t *testing.T) {
 	})
 
 	msg := tea.MouseMsg{
-		X:      56, // node column
-		Y:      6,  // first item row
+		X:      clickXForColumn(t, m, 0, "node"),
+		Y:      6, // first item row
 		Button: tea.MouseButtonLeft,
 		Action: tea.MouseActionPress,
 	}
@@ -1880,8 +2058,8 @@ func TestMouseClickOwnerInPodRowOpensOwnerResource(t *testing.T) {
 	})
 
 	msg := tea.MouseMsg{
-		X:      75, // owner column
-		Y:      6,  // first item row
+		X:      clickXForColumn(t, m, 0, "owner"),
+		Y:      6, // first item row
 		Button: tea.MouseButtonLeft,
 		Action: tea.MouseActionPress,
 	}
@@ -2840,7 +3018,7 @@ func TestBackShortcutAfterMouseNodeJump(t *testing.T) {
 	})
 
 	clickNode := tea.MouseMsg{
-		X:      56,
+		X:      clickXForColumn(t, m, 0, "node"),
 		Y:      6,
 		Button: tea.MouseButtonLeft,
 		Action: tea.MouseActionPress,
