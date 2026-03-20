@@ -1250,7 +1250,7 @@ func TestListLinesIncludeColumnHeaders(t *testing.T) {
 			Resource:  "pods",
 			Namespace: "default",
 			Items: []protocol.ResourceItem{
-				{Name: "api", Namespace: "default", Status: "Running"},
+				{Name: "api", Namespace: "default", Ready: "1/1", Status: "Running"},
 			},
 			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 		},
@@ -1260,7 +1260,10 @@ func TestListLinesIncludeColumnHeaders(t *testing.T) {
 	if len(lines) < 2 {
 		t.Fatalf("expected at least header and one row, got %#v", lines)
 	}
-	if !strings.Contains(lines[0], "NAME") || !strings.Contains(lines[0], "NAMESPACE") || !strings.Contains(lines[0], "STATUS") {
+	if !strings.Contains(lines[0], "NAME") ||
+		!strings.Contains(lines[0], "NAMESPACE") ||
+		!strings.Contains(lines[0], "READY") ||
+		!strings.Contains(lines[0], "STATUS") {
 		t.Fatalf("expected column headers in first row, got %q", lines[0])
 	}
 }
@@ -1276,7 +1279,7 @@ func TestPodListColumnHeadersIncludeNodeAndOwner(t *testing.T) {
 			Resource:  "pods",
 			Namespace: "default",
 			Items: []protocol.ResourceItem{
-				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
+				{Name: "api", Namespace: "default", Ready: "1/1", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
 			},
 			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 		},
@@ -1288,6 +1291,33 @@ func TestPodListColumnHeadersIncludeNodeAndOwner(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "NODE") || !strings.Contains(lines[0], "OWNER") {
 		t.Fatalf("expected node/owner headers in first row, got %q", lines[0])
+	}
+}
+
+func TestPodRowNotFullyReady(t *testing.T) {
+	if !podRowNotFullyReady("pods", protocol.ResourceItem{Ready: "0/1", Status: "Running"}) {
+		t.Fatalf("expected 0/1 running pod to be treated as not ready")
+	}
+	if podRowNotFullyReady("pods", protocol.ResourceItem{Ready: "1/1", Status: "Running"}) {
+		t.Fatalf("expected 1/1 pod to be treated as ready")
+	}
+	if podRowNotFullyReady("pods", protocol.ResourceItem{Ready: "0/1", Status: "Succeeded"}) {
+		t.Fatalf("did not expect succeeded pod to be flagged as not ready")
+	}
+	if podRowNotFullyReady("deployments", protocol.ResourceItem{Ready: "0/1", Status: "Running"}) {
+		t.Fatalf("did not expect non-pod row to use pod readiness highlighting")
+	}
+}
+
+func TestRowSucceeded(t *testing.T) {
+	if !rowSucceeded(protocol.ResourceItem{Status: "Succeeded"}) {
+		t.Fatalf("expected succeeded status to be treated as completed")
+	}
+	if !rowSucceeded(protocol.ResourceItem{Status: "  succeeded  "}) {
+		t.Fatalf("expected succeeded status matching to be case-insensitive and trimmed")
+	}
+	if rowSucceeded(protocol.ResourceItem{Status: "Running"}) {
+		t.Fatalf("did not expect running status to be treated as succeeded")
 	}
 }
 
@@ -2606,6 +2636,363 @@ func TestEnterInNormalModeLoadsSelectedDetail(t *testing.T) {
 	}
 }
 
+func TestEnterInNonPodViewOpensResourceExplorer(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			return protocol.ResourceDetailPayload{
+				Resource:      query.Resource,
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Found:         true,
+				Item: &protocol.ResourceItem{
+					Name:      query.Name,
+					Namespace: query.ItemNamespace,
+					Status:    "Available",
+				},
+				Overview: []protocol.DetailField{
+					{Key: "kind", Value: "Deployment"},
+					{Key: "spec.replicas", Value: "3"},
+				},
+				Children: []protocol.DetailChild{
+					{Resource: "replicasets", Namespace: "default", Name: "api-7c7bbf4"},
+				},
+				YAML: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  replicas: 3",
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 10,
+					AgeMs:              2,
+					WatchHealthy:       true,
+					Source:             "watch-cache",
+				},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	withLoading := updated.(model)
+	if !withLoading.resourceViewOpen {
+		t.Fatalf("expected resource view to open after enter")
+	}
+	if !withLoading.detailLoading {
+		t.Fatalf("expected detail loading after enter")
+	}
+	if cmd == nil {
+		t.Fatalf("expected detail load command")
+	}
+
+	updated, _ = withLoading.Update(cmd())
+	withView := updated.(model)
+	if !withView.resourceViewOpen || withView.detailLoading {
+		t.Fatalf("expected loaded resource view, got open=%v loading=%v", withView.resourceViewOpen, withView.detailLoading)
+	}
+	if !withView.detail.Found {
+		t.Fatalf("expected detail payload found")
+	}
+
+	updated, _ = withView.Update(tea.KeyMsg{Type: tea.KeyTab})
+	withOwned := updated.(model)
+	tab, ok := withOwned.activeDetailTab()
+	if !ok || tab.kind != detailTabOwned {
+		t.Fatalf("expected owned tab active, got %#v", tab)
+	}
+
+	updated, _ = withOwned.Update(tea.KeyMsg{Type: tea.KeyTab})
+	withYAML := updated.(model)
+	tab, ok = withYAML.activeDetailTab()
+	if !ok || tab.kind != detailTabYAML {
+		t.Fatalf("expected yaml tab active after second tab, got %#v", tab)
+	}
+
+	updated, _ = withYAML.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed := updated.(model)
+	if closed.resourceViewOpen {
+		t.Fatalf("expected resource view closed on esc")
+	}
+}
+
+func TestEnterInOwnedTabSelectsOwnedResource(t *testing.T) {
+	var detailSeen []protocol.ResourceDetailQuery
+	var listCalls int
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			detailSeen = append(detailSeen, query)
+			if query.Name == "api-222" {
+				return protocol.ResourceDetailPayload{
+					Resource:      query.Resource,
+					Namespace:     query.Namespace,
+					ItemNamespace: query.ItemNamespace,
+					Name:          query.Name,
+					Found:         true,
+					Item: &protocol.ResourceItem{
+						Name:      query.Name,
+						Namespace: query.ItemNamespace,
+						Status:    "Ready",
+					},
+					Overview: []protocol.DetailField{
+						{Key: "kind", Value: "ReplicaSet"},
+					},
+					YAML: "apiVersion: apps/v1\nkind: ReplicaSet\nmetadata:\n  name: api-222",
+					Freshness: protocol.FreshnessMeta{
+						State:              protocol.FreshnessStateLive,
+						SnapshotTimeUnixMs: 12,
+						AgeMs:              1,
+						WatchHealthy:       true,
+						Source:             "watch-cache",
+					},
+				}, nil
+			}
+			return protocol.ResourceDetailPayload{
+				Resource:      query.Resource,
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Found:         true,
+				Item: &protocol.ResourceItem{
+					Name:      query.Name,
+					Namespace: query.ItemNamespace,
+					Status:    "Available",
+				},
+				Children: []protocol.DetailChild{
+					{Resource: "replicasets", Namespace: "default", Name: "api-111"},
+					{Resource: "replicasets", Namespace: "default", Name: "api-222"},
+				},
+				YAML: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api",
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 10,
+					AgeMs:              2,
+					WatchHealthy:       true,
+					Source:             "watch-cache",
+				},
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api-222", Namespace: query.Namespace, Status: "Ready"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("expected detail load command")
+	}
+	updated, _ = updated.(model).Update(cmd())
+	withView := updated.(model)
+	if !withView.resourceViewOpen || withView.detailLoading {
+		t.Fatalf("expected opened loaded resource view, got open=%v loading=%v", withView.resourceViewOpen, withView.detailLoading)
+	}
+
+	updated, _ = withView.Update(tea.KeyMsg{Type: tea.KeyTab})
+	withOwned := updated.(model)
+	tab, ok := withOwned.activeDetailTab()
+	if !ok || tab.kind != detailTabOwned {
+		t.Fatalf("expected owned tab active, got %#v", tab)
+	}
+
+	updated, _ = withOwned.Update(tea.KeyMsg{Type: tea.KeyDown})
+	withSecondOwned := updated.(model)
+	if withSecondOwned.resourceChildIndex != 1 {
+		t.Fatalf("expected second owned resource selected, index=%d", withSecondOwned.resourceChildIndex)
+	}
+
+	updated, detailCmd := withSecondOwned.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterSelect := updated.(model)
+	if detailCmd == nil {
+		t.Fatalf("expected detail load command after selecting owned resource")
+	}
+	if !afterSelect.resourceViewOpen {
+		t.Fatalf("expected resource view to remain open when selecting owned resource")
+	}
+	if !afterSelect.detailLoading {
+		t.Fatalf("expected resource detail loading after selecting owned resource")
+	}
+	if afterSelect.session.Resource != "replicasets" {
+		t.Fatalf("expected session resource replicasets, got %q", afterSelect.session.Resource)
+	}
+	if afterSelect.session.Selection != "api-222" {
+		t.Fatalf("expected selected owned resource name api-222, got %q", afterSelect.session.Selection)
+	}
+	if afterSelect.detail.Name != "api-222" {
+		t.Fatalf("expected detail placeholder for api-222, got %#v", afterSelect.detail)
+	}
+
+	updated, _ = afterSelect.Update(detailCmd())
+	final := updated.(model)
+	if listCalls != 0 {
+		t.Fatalf("expected no list reload when selecting owned resource, got %d calls", listCalls)
+	}
+	if len(detailSeen) < 2 {
+		t.Fatalf("expected second detail request for owned resource, got %d", len(detailSeen))
+	}
+	last := detailSeen[len(detailSeen)-1]
+	if last.Resource != "replicasets" {
+		t.Fatalf("expected detail query for replicasets, got %q", last.Resource)
+	}
+	if last.ItemNamespace != "default" {
+		t.Fatalf("expected detail query item namespace default, got %q", last.ItemNamespace)
+	}
+	if !final.detail.Found || final.detail.Name != "api-222" {
+		t.Fatalf("expected loaded detail for selected owned resource, got %#v", final.detail)
+	}
+}
+
+func TestEnterInOwnedTabOpensPodViewForOwnedPod(t *testing.T) {
+	var detailSeen []protocol.ResourceDetailQuery
+	var podSeen []protocol.PodViewQuery
+	var listCalls int
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "replicasets",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "replicasets",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api-222", Namespace: "default", Status: "Ready"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			detailSeen = append(detailSeen, query)
+			return protocol.ResourceDetailPayload{
+				Resource:      query.Resource,
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Found:         true,
+				Item: &protocol.ResourceItem{
+					Name:      query.Name,
+					Namespace: query.ItemNamespace,
+					Status:    "Ready",
+				},
+				Children: []protocol.DetailChild{
+					{Resource: "pods", Namespace: "default", Name: "api-222-6fbc9"},
+				},
+				YAML: "apiVersion: apps/v1\nkind: ReplicaSet\nmetadata:\n  name: api-222",
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 10,
+					AgeMs:              2,
+					WatchHealthy:       true,
+					Source:             "watch-cache",
+				},
+			}, nil
+		},
+		LoadPodView: func(_ context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			podSeen = append(podSeen, query)
+			return protocol.PodViewPayload{
+				KubeContext: query.KubeContext,
+				Namespace:   query.Namespace,
+				Name:        query.Name,
+				Found:       true,
+				Overview:    protocol.PodOverview{Phase: "Running"},
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 11,
+					Source:             "watch-cache",
+				},
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("expected detail load command")
+	}
+	updated, _ = updated.(model).Update(cmd())
+	withView := updated.(model)
+	if !withView.resourceViewOpen || withView.detailLoading {
+		t.Fatalf("expected opened loaded resource view, got open=%v loading=%v", withView.resourceViewOpen, withView.detailLoading)
+	}
+
+	updated, _ = withView.Update(tea.KeyMsg{Type: tea.KeyTab})
+	withOwned := updated.(model)
+	tab, ok := withOwned.activeDetailTab()
+	if !ok || tab.kind != detailTabOwned {
+		t.Fatalf("expected owned tab active, got %#v", tab)
+	}
+
+	updated, podCmd := withOwned.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterSelect := updated.(model)
+	if podCmd == nil {
+		t.Fatalf("expected pod view load command for owned pod")
+	}
+	if !afterSelect.podViewOpen || !afterSelect.podViewLoading {
+		t.Fatalf("expected pod view open/loading for owned pod, got open=%v loading=%v", afterSelect.podViewOpen, afterSelect.podViewLoading)
+	}
+	if afterSelect.resourceViewOpen {
+		t.Fatalf("expected resource view closed when switching to pod view")
+	}
+	if afterSelect.session.Resource != "pods" || afterSelect.session.Selection != "api-222-6fbc9" {
+		t.Fatalf("expected session switched to owned pod, got resource=%q selection=%q", afterSelect.session.Resource, afterSelect.session.Selection)
+	}
+
+	updated, _ = afterSelect.Update(podCmd())
+	final := updated.(model)
+	if !final.podViewOpen || final.podViewLoading {
+		t.Fatalf("expected loaded pod view, got open=%v loading=%v", final.podViewOpen, final.podViewLoading)
+	}
+	if len(podSeen) != 1 {
+		t.Fatalf("expected exactly one pod-view request, got %d", len(podSeen))
+	}
+	if podSeen[0].Namespace != "default" || podSeen[0].Name != "api-222-6fbc9" {
+		t.Fatalf("unexpected pod-view query: %#v", podSeen[0])
+	}
+	if len(detailSeen) != 1 {
+		t.Fatalf("expected only initial detail request, got %d", len(detailSeen))
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list reload while opening owned pod view, got %d", listCalls)
+	}
+}
+
 func TestSelectionMoveClearsDetail(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -3607,6 +3994,9 @@ func TestPodEventsLinesRenderCompactTable(t *testing.T) {
 			},
 		},
 	}
+	m.now = func() time.Time {
+		return time.Date(2026, time.March, 19, 12, 45, 56, 0, time.UTC)
+	}
 
 	lines := m.podEventsLines(88)
 	if len(lines) < 2 {
@@ -3617,17 +4007,18 @@ func TestPodEventsLinesRenderCompactTable(t *testing.T) {
 	header := ansiRE.ReplaceAllString(lines[0], "")
 	if !strings.Contains(strings.ToLower(header), "last seen") ||
 		!strings.Contains(strings.ToLower(header), "reason") ||
+		!strings.Contains(strings.ToLower(header), "count") ||
 		!strings.Contains(strings.ToLower(header), "message") {
 		t.Fatalf("expected compact events table header, got %q", header)
 	}
 
 	body := ansiRE.ReplaceAllString(strings.Join(lines[1:], "\n"), "")
-	if !strings.Contains(body, "2026-03-19 12:34:56") ||
+	if !strings.Contains(body, "11m0s ago") ||
 		!strings.Contains(body, "Warning") ||
 		!strings.Contains(body, "BackOff") ||
 		!strings.Contains(body, "12") ||
 		!strings.Contains(body, "Back-off restarting failed container") {
-		t.Fatalf("expected compact event row with timestamp/type/reason/count/message, got %q", body)
+		t.Fatalf("expected compact event row with relative age/type/reason/count/message, got %q", body)
 	}
 }
 
@@ -3984,6 +4375,264 @@ func TestPollTickRefreshesPodViewWhenOpen(t *testing.T) {
 	}
 	if podViewCalls != 0 {
 		t.Fatalf("expected load command to defer execution until cmd() is run")
+	}
+}
+
+func TestPollTickRefreshesResourceViewWithoutLoadingPlaceholder(t *testing.T) {
+	var detailCalls int
+	var listCalls int
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "deployments",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			detailCalls++
+			return protocol.ResourceDetailPayload{
+				Resource:      query.Resource,
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Found:         true,
+				Item:          &protocol.ResourceItem{Name: query.Name, Namespace: query.ItemNamespace, Status: "Available"},
+				Overview: []protocol.DetailField{
+					{Key: "spec.replicas", Value: "3"},
+				},
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 1,
+					Source:             "watch-cache",
+				},
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.resourceViewOpen = true
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "deployments",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Found:         true,
+		Item:          &protocol.ResourceItem{Name: "api", Namespace: "default", Status: "Available"},
+		Overview:      []protocol.DetailField{{Key: "spec.replicas", Value: "3"}},
+		Freshness: protocol.FreshnessMeta{
+			State:              protocol.FreshnessStateLive,
+			SnapshotTimeUnixMs: 1,
+			Source:             "watch-cache",
+		},
+	}
+
+	updated, cmd := m.Update(pollTickMsg{})
+	next := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected detail refresh command on poll tick")
+	}
+	if next.resourceViewLoading {
+		t.Fatalf("expected in-place detail refresh without loading placeholder")
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list refresh while resource view is open, got %d", listCalls)
+	}
+	if detailCalls != 0 {
+		t.Fatalf("expected detail load command to defer execution until cmd() is run")
+	}
+}
+
+func TestPollTickRefreshesOwnedSelectionDetailTargetWithoutListReload(t *testing.T) {
+	var listCalls int
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "replicasets",
+			Selection:   "api-222",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, _ protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			return protocol.ResourceDetailPayload{}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.resourceViewOpen = true
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "replicasets",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api-222",
+		Found:         true,
+		Item:          &protocol.ResourceItem{Name: "api-222", Namespace: "default", Status: "Ready"},
+		Freshness: protocol.FreshnessMeta{
+			State:              protocol.FreshnessStateLive,
+			SnapshotTimeUnixMs: 1,
+			Source:             "watch-cache",
+		},
+	}
+
+	updated, cmd := m.Update(pollTickMsg{})
+	next := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected detail refresh command on poll tick")
+	}
+	if next.resourceViewLoading {
+		t.Fatalf("expected in-place detail refresh without loading placeholder")
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list refresh while resource view is open, got %d", listCalls)
+	}
+
+	query, ok := next.buildSelectedDetailQuery()
+	if !ok {
+		t.Fatalf("expected detail query to be built from active resource view")
+	}
+	if query.Resource != "replicasets" || query.Name != "api-222" {
+		t.Fatalf("expected detail refresh target replicasets/api-222, got %#v", query)
+	}
+	if query.ItemNamespace != "default" {
+		t.Fatalf("expected detail query item namespace default, got %q", query.ItemNamespace)
+	}
+}
+
+func TestSilentDetailFailureKeepsCurrentResourceView(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "deployments",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.resourceViewOpen = true
+	m.detailActiveSeq = 7
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "deployments",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Found:         true,
+		Item:          &protocol.ResourceItem{Name: "api", Namespace: "default", Status: "Available"},
+		Overview:      []protocol.DetailField{{Key: "spec.replicas", Value: "3"}},
+	}
+
+	updated, _ := m.Update(detailFailedMsg{
+		seq:      7,
+		err:      errors.New("temporary refresh error"),
+		announce: false,
+	})
+	next := updated.(model)
+	if !next.detail.Found || next.detail.Name != "api" {
+		t.Fatalf("expected existing detail view to remain, got %#v", next.detail)
+	}
+	if strings.TrimSpace(next.resourceViewErr) != "" {
+		t.Fatalf("expected no error overlay for silent detail refresh failure, got %q", next.resourceViewErr)
+	}
+}
+
+func TestDetailLoadedHighlightsChangedFields(t *testing.T) {
+	now := time.Date(2026, time.March, 20, 12, 0, 0, 0, time.UTC)
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "deployments",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.now = func() time.Time { return now }
+	m.resourceViewOpen = true
+	m.detailActiveSeq = 5
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "deployments",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Found:         true,
+		Item:          &protocol.ResourceItem{Name: "api", Namespace: "default", Status: "Available"},
+		Overview: []protocol.DetailField{
+			{Key: "status.readyReplicas", Value: "2"},
+		},
+		Children: []protocol.DetailChild{
+			{Resource: "replicasets", Namespace: "default", Name: "api-111", Status: "Ready"},
+		},
+		YAML: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  replicas: 3",
+	}
+
+	updated, _ := m.Update(detailLoadedMsg{
+		seq: 5,
+		payload: protocol.ResourceDetailPayload{
+			Resource:      "deployments",
+			Namespace:     "default",
+			ItemNamespace: "default",
+			Name:          "api",
+			Found:         true,
+			Item:          &protocol.ResourceItem{Name: "api", Namespace: "default", Status: "Available"},
+			Overview: []protocol.DetailField{
+				{Key: "status.readyReplicas", Value: "3"},
+			},
+			Children: []protocol.DetailChild{
+				{Resource: "replicasets", Namespace: "default", Name: "api-222", Status: "Ready"},
+			},
+			YAML: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  replicas: 4",
+		},
+		announce: false,
+	})
+	next := updated.(model)
+	if !next.isResourceFieldFlashing("field:status.readyReplicas") {
+		t.Fatalf("expected changed overview field to flash")
+	}
+	if !next.isResourceFieldFlashing("children") {
+		t.Fatalf("expected changed children block to flash")
+	}
+	if !next.isResourceFieldFlashing("yaml") {
+		t.Fatalf("expected changed yaml tab to flash")
 	}
 }
 

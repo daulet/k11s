@@ -257,6 +257,40 @@ func TestCacheUsesWatcherWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestCacheCancelsIdleWatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fetcher := &blockingWatchFetcher{}
+	cache := New(ctx, fetcher, nil)
+	cache.watchIdleAfter = time.Nanosecond
+
+	query := protocol.ResourceListQuery{Resource: "nodes", Namespace: "all"}
+	_ = cache.Get(query)
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if fetcher.watchCallCount() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if fetcher.watchCallCount() == 0 {
+		t.Fatalf("expected watcher to start")
+	}
+
+	cache.cancelIdleWatches(time.Now().Add(2 * time.Second))
+
+	deadline = time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if fetcher.cancelCount() > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected idle watcher to be canceled")
+}
+
 func TestCacheDetailColdStartIsCatchingUp(t *testing.T) {
 	fetcher := &queueFetcher{
 		responses: []fetchResponse{
@@ -393,6 +427,46 @@ type channelWatchFetcher struct {
 	updates   chan []protocol.ResourceItem
 	watchRuns int
 	listRuns  int
+}
+
+type blockingWatchFetcher struct {
+	mu      sync.Mutex
+	watches int
+	cancels int
+}
+
+func (f *blockingWatchFetcher) watchCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.watches
+}
+
+func (f *blockingWatchFetcher) cancelCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cancels
+}
+
+func (f *blockingWatchFetcher) List(context.Context, protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
+	return nil, errors.New("list should not be used when watcher is available")
+}
+
+func (f *blockingWatchFetcher) Watch(
+	ctx context.Context,
+	_ protocol.ResourceListQuery,
+	_ func(items []protocol.ResourceItem),
+	_ func(error),
+) error {
+	f.mu.Lock()
+	f.watches++
+	f.mu.Unlock()
+
+	<-ctx.Done()
+
+	f.mu.Lock()
+	f.cancels++
+	f.mu.Unlock()
+	return nil
 }
 
 func newChannelWatchFetcher() *channelWatchFetcher {

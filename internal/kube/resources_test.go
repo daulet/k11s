@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestDiscoveryLookupFromAPIResourceListsResolvesAliases(t *testing.T) {
@@ -138,8 +139,16 @@ func TestPodsToItems(t *testing.T) {
 	items := podsToItems([]corev1.Pod{
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "payments"},
-			Spec:       corev1.PodSpec{NodeName: "node-b"},
-			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+			Spec: corev1.PodSpec{
+				NodeName:   "node-b",
+				Containers: []corev1.Container{{Name: "worker"}},
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				ContainerStatuses: []corev1.ContainerStatus{
+					{Name: "worker", Ready: true},
+				},
+			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{
@@ -149,8 +158,16 @@ func TestPodsToItems(t *testing.T) {
 					{Kind: "ReplicaSet", Name: "api-67984d84", Controller: boolPtr(true)},
 				},
 			},
-			Spec:   corev1.PodSpec{NodeName: "node-a"},
-			Status: corev1.PodStatus{Phase: corev1.PodPending},
+			Spec: corev1.PodSpec{
+				NodeName:   "node-a",
+				Containers: []corev1.Container{{Name: "api"}},
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				ContainerStatuses: []corev1.ContainerStatus{
+					{Name: "api", Ready: false},
+				},
+			},
 		},
 	})
 
@@ -160,14 +177,66 @@ func TestPodsToItems(t *testing.T) {
 	if items[0].Name != "api" || items[0].Status != "Pending" {
 		t.Fatalf("unexpected first item: %#v", items[0])
 	}
+	if items[0].Ready != "0/1" {
+		t.Fatalf("expected first pod ready 0/1, got %#v", items[0])
+	}
 	if items[0].Node != "node-a" || items[0].OwnerKind != "ReplicaSet" || items[0].OwnerName != "api-67984d84" {
 		t.Fatalf("expected pod metadata on first item, got %#v", items[0])
 	}
 	if items[1].Name != "worker" || items[1].Status != "Running" {
 		t.Fatalf("unexpected second item: %#v", items[1])
 	}
+	if items[1].Ready != "1/1" {
+		t.Fatalf("expected second pod ready 1/1, got %#v", items[1])
+	}
 	if items[1].Node != "node-b" {
 		t.Fatalf("expected node metadata on second item, got %#v", items[1])
+	}
+}
+
+func TestUnstructuredToItemsForPodsIncludesReadyNodeAndOwner(t *testing.T) {
+	items := unstructuredToItemsForResource([]unstructured.Unstructured{
+		{
+			Object: map[string]any{
+				"kind": "Pod",
+				"metadata": map[string]any{
+					"name":      "api",
+					"namespace": "payments",
+					"ownerReferences": []any{
+						map[string]any{
+							"kind":       "ReplicaSet",
+							"name":       "api-7d9b",
+							"controller": true,
+						},
+					},
+				},
+				"spec": map[string]any{
+					"nodeName": "node-a",
+					"containers": []any{
+						map[string]any{"name": "api"},
+					},
+				},
+				"status": map[string]any{
+					"phase": "Running",
+					"containerStatuses": []any{
+						map[string]any{"name": "api", "ready": false},
+					},
+				},
+			},
+		},
+	}, "pods")
+
+	if len(items) != 1 {
+		t.Fatalf("expected one item, got %d", len(items))
+	}
+	if items[0].Ready != "0/1" {
+		t.Fatalf("expected ready 0/1, got %#v", items[0])
+	}
+	if items[0].Node != "node-a" {
+		t.Fatalf("expected node node-a, got %#v", items[0])
+	}
+	if items[0].OwnerKind != "ReplicaSet" || items[0].OwnerName != "api-7d9b" {
+		t.Fatalf("expected owner ReplicaSet/api-7d9b, got %#v", items[0])
 	}
 }
 

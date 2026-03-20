@@ -54,7 +54,9 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 	logger.Printf("listening on %s", cfg.SocketPath)
 	store := session.NewStore(cfg.SessionPath)
 	clientFactory := kube.NewClientFactory()
-	resourceCache := resourcecache.New(ctx, kube.NewResourceFetcher(clientFactory), logger)
+	resourceFetcher := kube.NewResourceFetcher(clientFactory)
+	resourceCache := resourcecache.New(ctx, resourceFetcher, logger)
+	resourceDetailEnricher := kube.NewResourceDetailEnricher(clientFactory, resourceFetcher)
 	namespaceCache := namespacecache.New(ctx, kube.NewNamespaceFetcher(clientFactory), logger)
 	actionExecutor := kube.NewActionExecutor(clientFactory)
 	logsFetcher := kube.NewLogsFetcher(clientFactory)
@@ -89,6 +91,7 @@ func Run(ctx context.Context, cfg config.Config, daemonVersion string) error {
 			shutdown,
 			store,
 			resourceCache,
+			resourceDetailEnricher,
 			namespaceCache,
 			actionExecutor,
 			logsFetcher,
@@ -104,6 +107,7 @@ func handleConn(
 	shutdown func(),
 	store *session.Store,
 	resourceCache *resourcecache.Cache,
+	resourceDetailEnricher *kube.ResourceDetailEnricher,
 	namespaceCache *namespacecache.Cache,
 	actionExecutor *kube.ActionExecutor,
 	logsFetcher *kube.LogsFetcher,
@@ -211,7 +215,7 @@ func handleConn(
 			return
 		}
 
-		query := *req.DetailQuery
+		query := normalizeDetailQuery(*req.DetailQuery)
 		resource := strings.ToLower(strings.TrimSpace(query.Resource))
 		if resource == "" {
 			resource = "pods"
@@ -219,6 +223,15 @@ func handleConn(
 		query.Resource = resource
 
 		payload := resourceCache.GetDetail(query)
+		if resourceDetailEnricher != nil {
+			enriched, err := resourceDetailEnricher.Enrich(context.Background(), query, payload)
+			if err != nil {
+				// Enrichment is best-effort: return cached detail payload without
+				// surfacing noisy daemon logs on RBAC-restricted clusters.
+			} else {
+				payload = enriched
+			}
+		}
 		resp := protocol.BuildResourceDetailResponse(req, daemonVersion, os.Getpid(), payload)
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
@@ -481,6 +494,31 @@ func mapActionError(err error) protocol.ActionResult {
 		Code:    code,
 		Message: err.Error(),
 	}
+}
+
+func normalizeDetailQuery(query protocol.ResourceDetailQuery) protocol.ResourceDetailQuery {
+	query.KubeContext = strings.TrimSpace(query.KubeContext)
+	query.Resource = strings.TrimSpace(strings.ToLower(query.Resource))
+	if query.Resource == "" {
+		query.Resource = "pods"
+	}
+	query.Namespace = strings.TrimSpace(query.Namespace)
+	if query.Namespace == "" {
+		query.Namespace = "default"
+	}
+	query.Filter = strings.TrimSpace(query.Filter)
+	query.ItemNamespace = strings.TrimSpace(query.ItemNamespace)
+	query.Name = strings.TrimSpace(query.Name)
+	if query.ItemNamespace == "" {
+		if ns, name, ok := strings.Cut(query.Name, "/"); ok {
+			query.ItemNamespace = strings.TrimSpace(ns)
+			query.Name = strings.TrimSpace(name)
+		}
+	}
+	if query.ItemNamespace == "" && !strings.EqualFold(query.Namespace, "all") {
+		query.ItemNamespace = query.Namespace
+	}
+	return query
 }
 
 func normalizeActionQuery(query protocol.ActionQuery) protocol.ActionQuery {

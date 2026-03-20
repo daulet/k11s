@@ -17,6 +17,8 @@ const (
 	defaultStaleAfter      = 12 * time.Second
 	defaultFetchTimeout    = 2 * time.Minute
 	defaultWatchRetryDelay = 2 * time.Second
+	defaultWatchIdleAfter  = 90 * time.Second
+	defaultWatchSweepEvery = 10 * time.Second
 )
 
 type Fetcher interface {
@@ -45,6 +47,8 @@ type Cache struct {
 	staleAfter      time.Duration
 	fetchTimeout    time.Duration
 	watchRetryDelay time.Duration
+	watchIdleAfter  time.Duration
+	watchSweepEvery time.Duration
 }
 
 type cacheKey struct {
@@ -55,11 +59,13 @@ type cacheKey struct {
 }
 
 type cacheEntry struct {
-	items      []protocol.ResourceItem
-	lastSync   time.Time
-	refreshing bool
-	lastErr    string
-	watching   bool
+	items       []protocol.ResourceItem
+	lastSync    time.Time
+	lastAccess  time.Time
+	refreshing  bool
+	lastErr     string
+	watching    bool
+	watchCancel context.CancelFunc
 }
 
 func New(ctx context.Context, fetcher Fetcher, logger *log.Logger) *Cache {
@@ -72,7 +78,7 @@ func New(ctx context.Context, fetcher Fetcher, logger *log.Logger) *Cache {
 		watcher = typedWatcher
 	}
 
-	return &Cache{
+	cache := &Cache{
 		ctx:             ctx,
 		entries:         map[cacheKey]*cacheEntry{},
 		fetcher:         fetcher,
@@ -83,7 +89,13 @@ func New(ctx context.Context, fetcher Fetcher, logger *log.Logger) *Cache {
 		staleAfter:      defaultStaleAfter,
 		fetchTimeout:    defaultFetchTimeout,
 		watchRetryDelay: defaultWatchRetryDelay,
+		watchIdleAfter:  defaultWatchIdleAfter,
+		watchSweepEvery: defaultWatchSweepEvery,
 	}
+	if cache.watcher != nil {
+		go cache.reapIdleWatches()
+	}
+	return cache
 }
 
 func (c *Cache) Get(query protocol.ResourceListQuery) protocol.ResourceListPayload {
@@ -102,11 +114,14 @@ func (c *Cache) Get(query protocol.ResourceListQuery) protocol.ResourceListPaylo
 		entry = &cacheEntry{}
 		c.entries[key] = entry
 	}
+	entry.lastAccess = now
 
 	if c.watcher != nil && !entry.watching {
 		entry.watching = true
 		entry.refreshing = true
-		go c.watch(key, query)
+		watchCtx, watchCancel := context.WithCancel(c.ctx)
+		entry.watchCancel = watchCancel
+		go c.watch(watchCtx, key, query)
 	} else if c.shouldRefresh(entry, now) {
 		entry.refreshing = true
 		go c.refresh(key, query)
@@ -141,11 +156,14 @@ func (c *Cache) GetDetail(query protocol.ResourceDetailQuery) protocol.ResourceD
 		entry = &cacheEntry{}
 		c.entries[key] = entry
 	}
+	entry.lastAccess = now
 
 	if c.watcher != nil && !entry.watching {
 		entry.watching = true
 		entry.refreshing = true
-		go c.watch(key, listQuery)
+		watchCtx, watchCancel := context.WithCancel(c.ctx)
+		entry.watchCancel = watchCancel
+		go c.watch(watchCtx, key, listQuery)
 	} else if c.shouldRefresh(entry, now) {
 		entry.refreshing = true
 		go c.refresh(key, listQuery)
@@ -224,10 +242,11 @@ func (c *Cache) refresh(key cacheKey, query protocol.ResourceListQuery) {
 	c.mu.Unlock()
 }
 
-func (c *Cache) watch(key cacheKey, query protocol.ResourceListQuery) {
+func (c *Cache) watch(watchCtx context.Context, key cacheKey, query protocol.ResourceListQuery) {
 	if c.watcher == nil {
 		return
 	}
+	defer c.markWatchStopped(key)
 
 	onUpdate := func(items []protocol.ResourceItem) {
 		c.mu.Lock()
@@ -269,30 +288,74 @@ func (c *Cache) watch(key cacheKey, query protocol.ResourceListQuery) {
 	}
 
 	for {
-		err := c.watcher.Watch(c.ctx, query, onUpdate, onError)
-		if err != nil && !errors.Is(err, context.Canceled) {
+		err := c.watcher.Watch(watchCtx, query, onUpdate, onError)
+		if err != nil && !errors.Is(err, context.Canceled) && watchCtx.Err() == nil {
 			onError(err)
 		}
 
-		if c.ctx.Err() != nil || errors.Is(err, context.Canceled) {
-			c.mu.Lock()
-			if entry, ok := c.entries[key]; ok {
-				entry.refreshing = false
-			}
-			c.mu.Unlock()
+		if watchCtx.Err() != nil || errors.Is(err, context.Canceled) {
 			return
 		}
 
 		select {
-		case <-c.ctx.Done():
-			c.mu.Lock()
-			if entry, ok := c.entries[key]; ok {
-				entry.refreshing = false
-			}
-			c.mu.Unlock()
+		case <-watchCtx.Done():
 			return
 		case <-time.After(c.watchRetryDelay):
 		}
+	}
+}
+
+func (c *Cache) markWatchStopped(key cacheKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok {
+		return
+	}
+	entry.refreshing = false
+	entry.watching = false
+	entry.watchCancel = nil
+}
+
+func (c *Cache) reapIdleWatches() {
+	if c.watchIdleAfter <= 0 || c.watchSweepEvery <= 0 {
+		return
+	}
+	ticker := time.NewTicker(c.watchSweepEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.cancelIdleWatches(c.now())
+		}
+	}
+}
+
+func (c *Cache) cancelIdleWatches(now time.Time) {
+	if c.watchIdleAfter <= 0 {
+		return
+	}
+
+	cancels := make([]context.CancelFunc, 0)
+	c.mu.Lock()
+	for _, entry := range c.entries {
+		if !entry.watching || entry.watchCancel == nil {
+			continue
+		}
+		if entry.lastAccess.IsZero() || now.Sub(entry.lastAccess) < c.watchIdleAfter {
+			continue
+		}
+		cancels = append(cancels, entry.watchCancel)
+		entry.watchCancel = nil
+		entry.refreshing = false
+	}
+	c.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
 	}
 }
 

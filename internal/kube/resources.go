@@ -546,7 +546,7 @@ func listCRItemsWithVersion(
 	if err != nil {
 		return nil, "", err
 	}
-	return unstructuredToItems(list.Items), list.GetResourceVersion(), nil
+	return unstructuredToItemsForResource(list.Items, selected.GVR.Resource), list.GetResourceVersion(), nil
 }
 
 func listDiscoveredItemsWithVersion(
@@ -559,7 +559,7 @@ func listDiscoveredItemsWithVersion(
 	if err != nil {
 		return nil, "", err
 	}
-	return unstructuredToItems(list.Items), list.GetResourceVersion(), nil
+	return unstructuredToItemsForResource(list.Items, target.GVR.Resource), list.GetResourceVersion(), nil
 }
 
 func watchCRList(
@@ -752,10 +752,16 @@ func podsToItems(pods []corev1.Pod) []protocol.ResourceItem {
 		if pod.Status.Phase != "" {
 			status = string(pod.Status.Phase)
 		}
+		readyCount, totalCount := podContainerReadyCounts(pod)
+		readyText := "-"
+		if totalCount > 0 {
+			readyText = fmt.Sprintf("%d/%d", readyCount, totalCount)
+		}
 		ownerKind, ownerName := podOwner(pod)
 		items = append(items, protocol.ResourceItem{
 			Name:      pod.Name,
 			Namespace: pod.Namespace,
+			Ready:     readyText,
 			Status:    status,
 			Node:      pod.Spec.NodeName,
 			OwnerKind: ownerKind,
@@ -776,6 +782,22 @@ func podOwner(pod corev1.Pod) (kind string, name string) {
 		}
 	}
 	return pod.OwnerReferences[0].Kind, pod.OwnerReferences[0].Name
+}
+
+func podContainerReadyCounts(pod corev1.Pod) (ready int, total int) {
+	if len(pod.Status.ContainerStatuses) > 0 {
+		total = len(pod.Status.ContainerStatuses)
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Ready {
+				ready++
+			}
+		}
+		return ready, total
+	}
+	if len(pod.Spec.Containers) > 0 {
+		return 0, len(pod.Spec.Containers)
+	}
+	return 0, 0
 }
 
 func servicesToItems(services []corev1.Service) []protocol.ResourceItem {
@@ -926,11 +948,36 @@ func crdAutocompleteAliases(crd apiextv1.CustomResourceDefinition) []string {
 }
 
 func unstructuredToItems(values []unstructured.Unstructured) []protocol.ResourceItem {
+	return unstructuredToItemsForResource(values, "")
+}
+
+func unstructuredToItemsForResource(values []unstructured.Unstructured, resource string) []protocol.ResourceItem {
+	resource = strings.ToLower(strings.TrimSpace(resource))
 	items := make([]protocol.ResourceItem, 0, len(values))
 	for _, value := range values {
 		namespace := strings.TrimSpace(value.GetNamespace())
 		if namespace == "" {
 			namespace = "-"
+		}
+
+		if resource == "pods" || strings.EqualFold(strings.TrimSpace(value.GetKind()), "pod") {
+			phase := "Unknown"
+			if v, ok, _ := unstructured.NestedString(value.Object, "status", "phase"); ok && strings.TrimSpace(v) != "" {
+				phase = strings.TrimSpace(v)
+			}
+			readyText := podReadyFromUnstructured(value.Object)
+			node, _, _ := unstructured.NestedString(value.Object, "spec", "nodeName")
+			ownerKind, ownerName := podOwnerFromUnstructured(value.Object)
+			items = append(items, protocol.ResourceItem{
+				Name:      value.GetName(),
+				Namespace: namespace,
+				Ready:     readyText,
+				Status:    phase,
+				Node:      strings.TrimSpace(node),
+				OwnerKind: ownerKind,
+				OwnerName: ownerName,
+			})
+			continue
 		}
 
 		status := "Unknown"
@@ -952,6 +999,63 @@ func unstructuredToItems(values []unstructured.Unstructured) []protocol.Resource
 	}
 	sortResourceItems(items)
 	return items
+}
+
+func podReadyFromUnstructured(object map[string]any) string {
+	statuses, ok, _ := unstructured.NestedSlice(object, "status", "containerStatuses")
+	if !ok || len(statuses) == 0 {
+		containers, hasContainers, _ := unstructured.NestedSlice(object, "spec", "containers")
+		if hasContainers && len(containers) > 0 {
+			return fmt.Sprintf("0/%d", len(containers))
+		}
+		return "-"
+	}
+
+	total := len(statuses)
+	ready := 0
+	for _, raw := range statuses {
+		value, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		flag, ok, _ := unstructured.NestedBool(value, "ready")
+		if ok && flag {
+			ready++
+		}
+	}
+	return fmt.Sprintf("%d/%d", ready, total)
+}
+
+func podOwnerFromUnstructured(object map[string]any) (kind string, name string) {
+	owners, ok, _ := unstructured.NestedSlice(object, "metadata", "ownerReferences")
+	if !ok || len(owners) == 0 {
+		return "", ""
+	}
+
+	fallbackKind := ""
+	fallbackName := ""
+	for _, raw := range owners {
+		owner, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind, _, _ := unstructured.NestedString(owner, "kind")
+		name, _, _ := unstructured.NestedString(owner, "name")
+		kind = strings.TrimSpace(kind)
+		name = strings.TrimSpace(name)
+		if kind == "" || name == "" {
+			continue
+		}
+		if fallbackKind == "" || fallbackName == "" {
+			fallbackKind = kind
+			fallbackName = name
+		}
+		controller, hasController, _ := unstructured.NestedBool(owner, "controller")
+		if hasController && controller {
+			return kind, name
+		}
+	}
+	return fallbackKind, fallbackName
 }
 
 func sortResourceItems(items []protocol.ResourceItem) {

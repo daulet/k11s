@@ -84,6 +84,7 @@ type ResourceListQuery struct {
 type ResourceItem struct {
 	Name      string `json:"name"`
 	Namespace string `json:"namespace"`
+	Ready     string `json:"ready,omitempty"`
 	Status    string `json:"status"`
 	Node      string `json:"node,omitempty"`
 	OwnerKind string `json:"ownerKind,omitempty"`
@@ -114,7 +115,22 @@ type ResourceDetailPayload struct {
 	Name          string        `json:"name"`
 	Found         bool          `json:"found"`
 	Item          *ResourceItem `json:"item,omitempty"`
+	Overview      []DetailField `json:"overview,omitempty"`
+	Children      []DetailChild `json:"children,omitempty"`
+	YAML          string        `json:"yaml,omitempty"`
 	Freshness     FreshnessMeta `json:"freshness"`
+}
+
+type DetailField struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type DetailChild struct {
+	Resource  string `json:"resource"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
+	Status    string `json:"status,omitempty"`
 }
 
 type PodViewQuery struct {
