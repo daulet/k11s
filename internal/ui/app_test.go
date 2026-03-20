@@ -90,6 +90,54 @@ func TestApplyCommandResourceAlias(t *testing.T) {
 	}
 }
 
+func TestApplyCommandIngressSingularAlias(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	updated, _, reload, err := m.applyCommand("ingress")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected command to update session and trigger reload")
+	}
+	if m.session.Resource != "ingresses" {
+		t.Fatalf("expected resource ingresses, got %q", m.session.Resource)
+	}
+}
+
+func TestApplyCommandReplicaSetShortAlias(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	updated, _, reload, err := m.applyCommand("rs")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected command to update session and trigger reload")
+	}
+	if m.session.Resource != "replicasets" {
+		t.Fatalf("expected resource replicasets, got %q", m.session.Resource)
+	}
+}
+
 func TestApplyCommandNodesAlias(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -210,6 +258,30 @@ func TestApplyCommandCustomResourceDefinitionsAliasSwitchesToCRDs(t *testing.T) 
 	}
 	if m.session.Resource != "crds" {
 		t.Fatalf("expected resource crds, got %q", m.session.Resource)
+	}
+}
+
+func TestApplyCommandResourceAcceptsArbitraryName(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	updated, _, reload, err := m.applyCommand("resource ingressclasses")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected command to update session and trigger reload")
+	}
+	if m.session.Resource != "ingressclasses" {
+		t.Fatalf("expected resource ingressclasses, got %q", m.session.Resource)
 	}
 }
 
@@ -1026,6 +1098,114 @@ func TestCRDSuggestionsUseDaemonValues(t *testing.T) {
 	}
 	if suggestions[0] != "widgets.example.com" {
 		t.Fatalf("expected widgets.example.com suggestion, got %q", suggestions[0])
+	}
+}
+
+func TestCRDSuggestionsExpandShortNameToCanonical(t *testing.T) {
+	fullName := "inferenceengineinstances.ml.example.com"
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		CRDSuggestions: []string{
+			fullName,
+			fullName + "|iei",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	suggestions := m.commandSuggestions("crs iei")
+	if len(suggestions) == 0 {
+		t.Fatalf("expected crd suggestions for short name")
+	}
+	if suggestions[0] != fullName {
+		t.Fatalf("expected short name to resolve to canonical crd name, got %q", suggestions[0])
+	}
+
+	options := m.autocompleteOptions("crs iei")
+	if len(options) == 0 {
+		t.Fatalf("expected autocomplete options for short name")
+	}
+	if options[0] != "crs "+fullName {
+		t.Fatalf("expected autocomplete to expand short name to canonical crd name, got %q", options[0])
+	}
+}
+
+func TestCRDSuggestionsFromCRDListShortNameAlias(t *testing.T) {
+	fullName := "inferenceengineinstances.ml.example.com"
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "crds",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "crds",
+			Namespace: "all",
+			Items: []protocol.ResourceItem{
+				{Name: fullName, Namespace: "-", Status: "Namespaced v1", OwnerName: "iei,ieis"},
+			},
+		},
+	})
+
+	suggestions := m.commandSuggestions("cr iei")
+	if len(suggestions) == 0 {
+		t.Fatalf("expected cr suggestions for crd short name alias")
+	}
+	if suggestions[0] != fullName {
+		t.Fatalf("expected alias to map to canonical crd name, got %q", suggestions[0])
+	}
+}
+
+func TestCRDSuggestionsAutocompleteShortNamePrefixes(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		CRDSuggestions: []string{
+			"inferenceengineinstances.ml.example.com|iei",
+			"inferenceenginedeployments.ml.example.com|ied",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	for _, command := range []string{"cr", "crs"} {
+		input := command + " ie"
+		suggestions := m.commandSuggestions(input)
+		if len(suggestions) < 2 {
+			t.Fatalf("expected alias suggestions for %q, got %#v", input, suggestions)
+		}
+		if suggestions[0] != "ied" && suggestions[1] != "iei" && suggestions[0] != "iei" && suggestions[1] != "ied" {
+			t.Fatalf("expected short-name suggestions to include iei and ied for %q, got %#v", input, suggestions)
+		}
+
+		options := m.autocompleteOptions(input)
+		if len(options) < 2 {
+			t.Fatalf("expected autocomplete options for %q, got %#v", input, options)
+		}
+		var hasIEI bool
+		var hasIED bool
+		for _, option := range options {
+			if option == command+" iei" {
+				hasIEI = true
+			}
+			if option == command+" ied" {
+				hasIED = true
+			}
+		}
+		if !hasIEI || !hasIED {
+			t.Fatalf("expected %q autocomplete options to include %q and %q, got %#v", input, command+" iei", command+" ied", options)
+		}
 	}
 }
 
@@ -3200,7 +3380,7 @@ func TestPodViewLogsTabLoadsSelectedContainer(t *testing.T) {
 	if nextLogsCmd == nil {
 		t.Fatalf("expected logs reload when switching container")
 	}
-	updated, _ = updated.(model).Update(nextLogsCmd())
+	_, _ = updated.(model).Update(nextLogsCmd())
 	if len(seen) < 2 {
 		t.Fatalf("expected second logs request for container switch")
 	}

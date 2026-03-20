@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -9,25 +10,63 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func TestIsCoreResource(t *testing.T) {
-	tests := []struct {
-		resource string
-		want     bool
-	}{
-		{resource: "pods", want: true},
-		{resource: "services", want: true},
-		{resource: "deployments", want: true},
-		{resource: "nodes", want: true},
-		{resource: "namespaces", want: true},
-		{resource: "crds", want: true},
-		{resource: "crs", want: true},
-		{resource: "jobs", want: false},
+func TestDiscoveryLookupFromAPIResourceListsResolvesAliases(t *testing.T) {
+	lookup := discoveryLookupFromAPIResourceLists([]*metav1.APIResourceList{
+		{
+			GroupVersion: "apps/v1",
+			APIResources: []metav1.APIResource{
+				{
+					Name:         "deployments",
+					SingularName: "deployment",
+					ShortNames:   []string{"deploy"},
+					Kind:         "Deployment",
+					Namespaced:   true,
+				},
+				{
+					Name:       "deployments/status",
+					Kind:       "Deployment",
+					Namespaced: true,
+				},
+			},
+		},
+		{
+			GroupVersion: "v1",
+			APIResources: []metav1.APIResource{
+				{
+					Name:         "pods",
+					SingularName: "pod",
+					ShortNames:   []string{"po"},
+					Kind:         "Pod",
+					Namespaced:   true,
+				},
+			},
+		},
+	})
+
+	assertResource := func(key, group, resource string, namespaced bool) {
+		t.Helper()
+		resolved, ok := lookup[key]
+		if !ok {
+			t.Fatalf("expected lookup key %q", key)
+		}
+		if resolved.GVR.Group != group || resolved.GVR.Resource != resource {
+			t.Fatalf("unexpected gvr for key %q: %#v", key, resolved.GVR)
+		}
+		if resolved.Namespaced != namespaced {
+			t.Fatalf("unexpected namespaced for key %q: %v", key, resolved.Namespaced)
+		}
 	}
 
-	for _, tc := range tests {
-		if got := IsCoreResource(tc.resource); got != tc.want {
-			t.Fatalf("resource=%q expected %v got %v", tc.resource, tc.want, got)
-		}
+	assertResource("deployments", "apps", "deployments", true)
+	assertResource("apps/deployments", "apps", "deployments", true)
+	assertResource("deployments.apps", "apps", "deployments", true)
+	assertResource("deploy", "apps", "deployments", true)
+	assertResource("deployment", "apps", "deployments", true)
+	assertResource("pods", "", "pods", true)
+	assertResource("po", "", "pods", true)
+
+	if _, ok := lookup["deployments/status"]; ok {
+		t.Fatalf("expected subresource deployments/status to be skipped")
 	}
 }
 
@@ -38,7 +77,11 @@ func TestSelectCRDByFilter(t *testing.T) {
 			Spec: apiextv1.CustomResourceDefinitionSpec{
 				Group: "example.com",
 				Names: apiextv1.CustomResourceDefinitionNames{
-					Plural: "widgets",
+					Plural:     "widgets",
+					Singular:   "widget",
+					Kind:       "Widget",
+					ListKind:   "WidgetList",
+					ShortNames: []string{"wdg", "wg"},
 				},
 				Scope: apiextv1.NamespaceScoped,
 				Versions: []apiextv1.CustomResourceDefinitionVersion{
@@ -59,6 +102,35 @@ func TestSelectCRDByFilter(t *testing.T) {
 	selected, ok = selectCRDByFilter(crds, "example.com/widgets")
 	if !ok || selected.Name != "widgets.example.com" {
 		t.Fatalf("expected crd match by group/plural")
+	}
+
+	selected, ok = selectCRDByFilter(crds, "wdg")
+	if !ok || selected.Name != "widgets.example.com" {
+		t.Fatalf("expected crd match by short name")
+	}
+
+	selected, ok = selectCRDByFilter(crds, "wdg.example.com")
+	if !ok || selected.Name != "widgets.example.com" {
+		t.Fatalf("expected crd match by shortname.group")
+	}
+
+	selected, ok = selectCRDByFilter(crds, "example.com/wdg")
+	if !ok || selected.Name != "widgets.example.com" {
+		t.Fatalf("expected crd match by group/shortname")
+	}
+
+	selected, ok = selectCRDByFilter(crds, "widget")
+	if !ok || selected.Name != "widgets.example.com" {
+		t.Fatalf("expected crd match by singular")
+	}
+
+	selected, ok = selectCRDByFilter(crds, "widgetlist")
+	if !ok || selected.Name != "widgets.example.com" {
+		t.Fatalf("expected crd match by list kind")
+	}
+
+	if _, ok := selectCRDByFilter(crds, "missing"); ok {
+		t.Fatalf("did not expect match for unknown filter")
 	}
 }
 
@@ -197,6 +269,38 @@ func TestNamespacesToItems(t *testing.T) {
 	}
 	if items[1].Name != "payments" || items[1].Namespace != "<cluster>" || items[1].Status != "Active" {
 		t.Fatalf("unexpected second item: %#v", items[1])
+	}
+}
+
+func TestCRDsToItemsExposeAutocompleteAliases(t *testing.T) {
+	items := crdsToItems([]apiextv1.CustomResourceDefinition{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "inferenceengineinstances.ml.example.com"},
+			Spec: apiextv1.CustomResourceDefinitionSpec{
+				Group: "ml.example.com",
+				Names: apiextv1.CustomResourceDefinitionNames{
+					Plural:     "inferenceengineinstances",
+					Singular:   "inferenceengineinstance",
+					Kind:       "InferenceEngineInstance",
+					ListKind:   "InferenceEngineInstanceList",
+					ShortNames: []string{"iei"},
+				},
+				Scope: apiextv1.NamespaceScoped,
+				Versions: []apiextv1.CustomResourceDefinitionVersion{
+					{Name: "v1", Served: true, Storage: true},
+				},
+			},
+		},
+	})
+
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if !strings.Contains(items[0].OwnerName, "iei") {
+		t.Fatalf("expected shortname alias in owner metadata, got %q", items[0].OwnerName)
+	}
+	if !strings.Contains(items[0].OwnerName, "inferenceengineinstance") {
+		t.Fatalf("expected singular alias in owner metadata, got %q", items[0].OwnerName)
 	}
 }
 

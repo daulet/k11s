@@ -133,10 +133,6 @@ func (f *ClientFactory) APIExtensionsForContext(kubeContext string) (*apiextensi
 	return client, nil
 }
 
-func restConfigForContext(kubeContext string) (*rest.Config, error) {
-	return configForContext(kubeContext)
-}
-
 func configForContext(kubeContext string) (*rest.Config, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	overrides := &clientcmd.ConfigOverrides{}

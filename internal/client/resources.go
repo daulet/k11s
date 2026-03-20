@@ -111,6 +111,13 @@ func ListCRDNames(
 			continue
 		}
 		names = append(names, name)
+		for _, rawAlias := range strings.Split(item.OwnerName, ",") {
+			alias := strings.TrimSpace(rawAlias)
+			if alias == "" {
+				continue
+			}
+			names = append(names, name+"|"+alias)
+		}
 	}
 	return names, nil
 }

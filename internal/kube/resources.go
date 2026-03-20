@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daulet/k11s/internal/protocol"
@@ -15,80 +16,75 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 )
 
+const discoveryRefreshInterval = 30 * time.Second
+
+type discoveredResource struct {
+	GVR        schema.GroupVersionResource
+	Namespaced bool
+}
+
+type discoverySnapshot struct {
+	lookup    map[string]discoveredResource
+	fetchedAt time.Time
+}
+
 type ResourceFetcher struct {
 	clients *ClientFactory
+
+	mu        sync.Mutex
+	discovery map[string]discoverySnapshot
+	now       func() time.Time
 }
 
 func NewResourceFetcher(clients *ClientFactory) *ResourceFetcher {
 	if clients == nil {
 		clients = NewClientFactory()
 	}
-	return &ResourceFetcher{clients: clients}
-}
-
-func IsCoreResource(resource string) bool {
-	switch strings.ToLower(strings.TrimSpace(resource)) {
-	case "pods", "services", "deployments", "nodes", "namespaces", "crds", "crs":
-		return true
-	default:
-		return false
+	return &ResourceFetcher{
+		clients:   clients,
+		discovery: map[string]discoverySnapshot{},
+		now:       time.Now,
 	}
 }
 
 func (f *ResourceFetcher) List(ctx context.Context, query protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
-	resource := strings.ToLower(strings.TrimSpace(query.Resource))
-	if !IsCoreResource(resource) {
-		return nil, fmt.Errorf("resource %q is not in supported cache-backed set", resource)
+	resource := normalizeResourceName(query.Resource)
+	query.Resource = resource
+
+	items, handled, err := f.listKnownResource(ctx, query, resource)
+	if handled {
+		return items, err
 	}
+	return f.listDiscovered(ctx, query, resource)
+}
 
-	apiNamespace, displayNamespace := resolveListNamespace(query.Namespace)
-
-	client, err := f.clients.ClientForContext(query.KubeContext)
-	if err != nil {
-		return nil, err
+func normalizeResourceName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "pods"
 	}
+	return value
+}
 
+func (f *ResourceFetcher) listKnownResource(
+	ctx context.Context,
+	query protocol.ResourceListQuery,
+	resource string,
+) ([]protocol.ResourceItem, bool, error) {
 	switch resource {
-	case "pods":
-		pods, err := client.CoreV1().Pods(apiNamespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("list pods for namespace %q: %w", displayNamespace, err)
-		}
-		return podsToItems(pods.Items), nil
-	case "services":
-		services, err := client.CoreV1().Services(apiNamespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("list services for namespace %q: %w", displayNamespace, err)
-		}
-		return servicesToItems(services.Items), nil
-	case "deployments":
-		deployments, err := client.AppsV1().Deployments(apiNamespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("list deployments for namespace %q: %w", displayNamespace, err)
-		}
-		return deploymentsToItems(deployments.Items), nil
-	case "nodes":
-		nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("list nodes: %w", err)
-		}
-		return nodesToItems(nodes.Items), nil
-	case "namespaces":
-		namespaces, err := client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("list namespaces: %w", err)
-		}
-		return namespacesToItems(namespaces.Items), nil
 	case "crds":
-		return f.listCRDs(ctx, query)
+		items, err := f.listCRDs(ctx, query)
+		return items, true, err
 	case "crs":
-		return f.listCRs(ctx, query)
+		items, err := f.listCRs(ctx, query)
+		return items, true, err
+	default:
+		return nil, false, nil
 	}
-
-	return nil, fmt.Errorf("unsupported resource %q", resource)
 }
 
 func (f *ResourceFetcher) Watch(
@@ -97,10 +93,9 @@ func (f *ResourceFetcher) Watch(
 	onUpdate func(items []protocol.ResourceItem),
 	onError func(error),
 ) error {
-	resource := strings.ToLower(strings.TrimSpace(query.Resource))
-	if !IsCoreResource(resource) {
-		return fmt.Errorf("resource %q is not in supported cache-backed set", resource)
-	}
+	resource := normalizeResourceName(query.Resource)
+	query.Resource = resource
+
 	if onUpdate == nil {
 		onUpdate = func([]protocol.ResourceItem) {}
 	}
@@ -108,116 +103,212 @@ func (f *ResourceFetcher) Watch(
 		onError = func(error) {}
 	}
 
-	apiNamespace, displayNamespace := resolveListNamespace(query.Namespace)
+	handled, err := f.watchKnownResource(ctx, query, resource, onUpdate, onError)
+	if handled {
+		return err
+	}
+	return f.watchDiscovered(ctx, query, resource, onUpdate, onError)
+}
 
-	client, err := f.clients.ClientForContext(query.KubeContext)
+func (f *ResourceFetcher) watchKnownResource(
+	ctx context.Context,
+	query protocol.ResourceListQuery,
+	resource string,
+	onUpdate func(items []protocol.ResourceItem),
+	onError func(error),
+) (bool, error) {
+	switch resource {
+	case "crds":
+		return true, f.watchCRDs(ctx, query, onUpdate, onError)
+	case "crs":
+		return true, f.watchCRs(ctx, query, onUpdate, onError)
+	default:
+		return false, nil
+	}
+}
+
+func (f *ResourceFetcher) listDiscovered(
+	ctx context.Context,
+	query protocol.ResourceListQuery,
+	resource string,
+) ([]protocol.ResourceItem, error) {
+	target, err := f.resolveDiscoveredResource(ctx, query.KubeContext, resource)
+	if err != nil {
+		return nil, err
+	}
+
+	dyn, err := f.clients.DynamicForContext(query.KubeContext)
+	if err != nil {
+		return nil, err
+	}
+
+	items, _, err := listDiscoveredItemsWithVersion(ctx, dyn, target, query.Namespace)
+	return items, err
+}
+
+func (f *ResourceFetcher) watchDiscovered(
+	ctx context.Context,
+	query protocol.ResourceListQuery,
+	resource string,
+	onUpdate func(items []protocol.ResourceItem),
+	onError func(error),
+) error {
+	target, err := f.resolveDiscoveredResource(ctx, query.KubeContext, resource)
 	if err != nil {
 		return err
 	}
 
-	switch resource {
-	case "pods":
-		return runListWatchLoop(
-			ctx,
-			func() ([]protocol.ResourceItem, string, error) {
-				pods, err := client.CoreV1().Pods(apiNamespace).List(ctx, metav1.ListOptions{})
-				if err != nil {
-					return nil, "", fmt.Errorf("list pods for namespace %q: %w", displayNamespace, err)
-				}
-				return podsToItems(pods.Items), pods.ResourceVersion, nil
-			},
-			func(resourceVersion string) (watch.Interface, error) {
-				return client.CoreV1().Pods(apiNamespace).Watch(ctx, metav1.ListOptions{
-					ResourceVersion:     resourceVersion,
-					AllowWatchBookmarks: true,
-				})
-			},
-			onUpdate,
-			onError,
-		)
-	case "services":
-		return runListWatchLoop(
-			ctx,
-			func() ([]protocol.ResourceItem, string, error) {
-				services, err := client.CoreV1().Services(apiNamespace).List(ctx, metav1.ListOptions{})
-				if err != nil {
-					return nil, "", fmt.Errorf("list services for namespace %q: %w", displayNamespace, err)
-				}
-				return servicesToItems(services.Items), services.ResourceVersion, nil
-			},
-			func(resourceVersion string) (watch.Interface, error) {
-				return client.CoreV1().Services(apiNamespace).Watch(ctx, metav1.ListOptions{
-					ResourceVersion:     resourceVersion,
-					AllowWatchBookmarks: true,
-				})
-			},
-			onUpdate,
-			onError,
-		)
-	case "deployments":
-		return runListWatchLoop(
-			ctx,
-			func() ([]protocol.ResourceItem, string, error) {
-				deployments, err := client.AppsV1().Deployments(apiNamespace).List(ctx, metav1.ListOptions{})
-				if err != nil {
-					return nil, "", fmt.Errorf("list deployments for namespace %q: %w", displayNamespace, err)
-				}
-				return deploymentsToItems(deployments.Items), deployments.ResourceVersion, nil
-			},
-			func(resourceVersion string) (watch.Interface, error) {
-				return client.AppsV1().Deployments(apiNamespace).Watch(ctx, metav1.ListOptions{
-					ResourceVersion:     resourceVersion,
-					AllowWatchBookmarks: true,
-				})
-			},
-			onUpdate,
-			onError,
-		)
-	case "nodes":
-		return runListWatchLoop(
-			ctx,
-			func() ([]protocol.ResourceItem, string, error) {
-				nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-				if err != nil {
-					return nil, "", fmt.Errorf("list nodes: %w", err)
-				}
-				return nodesToItems(nodes.Items), nodes.ResourceVersion, nil
-			},
-			func(resourceVersion string) (watch.Interface, error) {
-				return client.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
-					ResourceVersion:     resourceVersion,
-					AllowWatchBookmarks: true,
-				})
-			},
-			onUpdate,
-			onError,
-		)
-	case "namespaces":
-		return runListWatchLoop(
-			ctx,
-			func() ([]protocol.ResourceItem, string, error) {
-				namespaces, err := client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-				if err != nil {
-					return nil, "", fmt.Errorf("list namespaces: %w", err)
-				}
-				return namespacesToItems(namespaces.Items), namespaces.ResourceVersion, nil
-			},
-			func(resourceVersion string) (watch.Interface, error) {
-				return client.CoreV1().Namespaces().Watch(ctx, metav1.ListOptions{
-					ResourceVersion:     resourceVersion,
-					AllowWatchBookmarks: true,
-				})
-			},
-			onUpdate,
-			onError,
-		)
-	case "crds":
-		return f.watchCRDs(ctx, query, onUpdate, onError)
-	case "crs":
-		return f.watchCRs(ctx, query, onUpdate, onError)
-	default:
-		return fmt.Errorf("unsupported resource %q", resource)
+	dyn, err := f.clients.DynamicForContext(query.KubeContext)
+	if err != nil {
+		return err
 	}
+
+	return runListWatchLoop(
+		ctx,
+		func() ([]protocol.ResourceItem, string, error) {
+			items, rv, err := listDiscoveredItemsWithVersion(ctx, dyn, target, query.Namespace)
+			if err != nil {
+				return nil, "", err
+			}
+			return items, rv, nil
+		},
+		func(resourceVersion string) (watch.Interface, error) {
+			return watchDiscoveredList(ctx, dyn, target, query.Namespace, resourceVersion)
+		},
+		onUpdate,
+		onError,
+	)
+}
+
+func (f *ResourceFetcher) resolveDiscoveredResource(
+	ctx context.Context,
+	kubeContext string,
+	resource string,
+) (discoveredResource, error) {
+	resource = strings.ToLower(strings.TrimSpace(resource))
+	if resource == "" {
+		return discoveredResource{}, fmt.Errorf("resource is required")
+	}
+
+	snapshot, err := f.discoverySnapshot(ctx, kubeContext)
+	if err != nil {
+		return discoveredResource{}, err
+	}
+
+	target, ok := snapshot.lookup[resource]
+	if !ok {
+		return discoveredResource{}, fmt.Errorf("resource %q not found in API discovery", resource)
+	}
+	return target, nil
+}
+
+func (f *ResourceFetcher) discoverySnapshot(ctx context.Context, kubeContext string) (discoverySnapshot, error) {
+	contextKey := strings.TrimSpace(kubeContext)
+	now := f.now()
+
+	f.mu.Lock()
+	if cached, ok := f.discovery[contextKey]; ok && now.Sub(cached.fetchedAt) < discoveryRefreshInterval {
+		f.mu.Unlock()
+		return cached, nil
+	}
+	f.mu.Unlock()
+
+	client, err := f.clients.ClientForContext(contextKey)
+	if err != nil {
+		return discoverySnapshot{}, err
+	}
+
+	resourceLists, err := client.Discovery().ServerPreferredResources()
+	if err != nil {
+		if !discovery.IsGroupDiscoveryFailedError(err) || len(resourceLists) == 0 {
+			return discoverySnapshot{}, fmt.Errorf("discover resources for context %q: %w", contextKey, err)
+		}
+	}
+
+	snapshot := discoverySnapshot{
+		lookup:    discoveryLookupFromAPIResourceLists(resourceLists),
+		fetchedAt: now,
+	}
+
+	f.mu.Lock()
+	f.discovery[contextKey] = snapshot
+	f.mu.Unlock()
+	return snapshot, nil
+}
+
+type discoveryLookupEntry struct {
+	target   discoveredResource
+	priority int
+}
+
+func discoveryLookupFromAPIResourceLists(resourceLists []*metav1.APIResourceList) map[string]discoveredResource {
+	entries := map[string]discoveryLookupEntry{}
+	add := func(key string, target discoveredResource, priority int) {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" {
+			return
+		}
+		current, exists := entries[key]
+		if exists && current.priority <= priority {
+			return
+		}
+		entries[key] = discoveryLookupEntry{target: target, priority: priority}
+	}
+	addWithGroup := func(value string, group string, target discoveredResource, priority int) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		group = strings.ToLower(strings.TrimSpace(group))
+		if value == "" || group == "" {
+			return
+		}
+		add(value+"."+group, target, priority)
+		add(group+"/"+value, target, priority)
+	}
+
+	for _, resourceList := range resourceLists {
+		if resourceList == nil {
+			continue
+		}
+		groupVersion, err := schema.ParseGroupVersion(strings.TrimSpace(resourceList.GroupVersion))
+		if err != nil {
+			continue
+		}
+		group := strings.ToLower(strings.TrimSpace(groupVersion.Group))
+
+		for _, apiResource := range resourceList.APIResources {
+			if strings.Contains(apiResource.Name, "/") {
+				continue
+			}
+
+			target := discoveredResource{
+				GVR: schema.GroupVersionResource{
+					Group:    groupVersion.Group,
+					Version:  groupVersion.Version,
+					Resource: apiResource.Name,
+				},
+				Namespaced: apiResource.Namespaced,
+			}
+
+			add(apiResource.Name, target, 0)
+			addWithGroup(apiResource.Name, group, target, 1)
+
+			add(apiResource.SingularName, target, 2)
+			addWithGroup(apiResource.SingularName, group, target, 3)
+
+			for _, shortName := range apiResource.ShortNames {
+				add(shortName, target, 4)
+				addWithGroup(shortName, group, target, 5)
+			}
+
+			add(apiResource.Kind, target, 6)
+			addWithGroup(apiResource.Kind, group, target, 7)
+		}
+	}
+
+	lookup := make(map[string]discoveredResource, len(entries))
+	for key, entry := range entries {
+		lookup[key] = entry.target
+	}
+	return lookup
 }
 
 func (f *ResourceFetcher) listCRDs(ctx context.Context, query protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
@@ -366,20 +457,42 @@ func selectCRDByFilter(crds []apiextv1.CustomResourceDefinition, filter string) 
 }
 
 func crdMatchesFilter(crd apiextv1.CustomResourceDefinition, filter string) bool {
-	name := strings.ToLower(strings.TrimSpace(crd.Name))
-	plural := strings.ToLower(strings.TrimSpace(crd.Spec.Names.Plural))
 	group := strings.ToLower(strings.TrimSpace(crd.Spec.Group))
+	candidates := map[string]struct{}{}
+	add := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			return
+		}
+		candidates[value] = struct{}{}
+	}
+	addWithGroup := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" || group == "" {
+			return
+		}
+		candidates[value+"."+group] = struct{}{}
+		candidates[group+"/"+value] = struct{}{}
+	}
 
-	if filter == name {
-		return true
+	add(crd.Name)
+	add(crd.Spec.Names.Plural)
+	add(crd.Spec.Names.Singular)
+	add(crd.Spec.Names.Kind)
+	add(crd.Spec.Names.ListKind)
+
+	addWithGroup(crd.Spec.Names.Plural)
+	addWithGroup(crd.Spec.Names.Singular)
+	addWithGroup(crd.Spec.Names.Kind)
+	addWithGroup(crd.Spec.Names.ListKind)
+
+	for _, short := range crd.Spec.Names.ShortNames {
+		add(short)
+		addWithGroup(short)
 	}
-	if filter == plural+"."+group {
-		return true
-	}
-	if filter == group+"/"+plural {
-		return true
-	}
-	return false
+
+	_, ok := candidates[filter]
+	return ok
 }
 
 func resolveCRD(crd apiextv1.CustomResourceDefinition) (selectedCRD, bool) {
@@ -436,6 +549,19 @@ func listCRItemsWithVersion(
 	return unstructuredToItems(list.Items), list.GetResourceVersion(), nil
 }
 
+func listDiscoveredItemsWithVersion(
+	ctx context.Context,
+	client dynamic.Interface,
+	target discoveredResource,
+	namespace string,
+) ([]protocol.ResourceItem, string, error) {
+	list, err := listDiscoveredUnstructured(ctx, client, target, namespace, metav1.ListOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	return unstructuredToItems(list.Items), list.GetResourceVersion(), nil
+}
+
 func watchCRList(
 	ctx context.Context,
 	client dynamic.Interface,
@@ -449,6 +575,25 @@ func watchCRList(
 		AllowWatchBookmarks: true,
 	}
 	if selected.Namespaced {
+		apiNamespace, _ := resolveListNamespace(namespace)
+		return resource.Namespace(apiNamespace).Watch(ctx, listOptions)
+	}
+	return resource.Watch(ctx, listOptions)
+}
+
+func watchDiscoveredList(
+	ctx context.Context,
+	client dynamic.Interface,
+	target discoveredResource,
+	namespace string,
+	resourceVersion string,
+) (watch.Interface, error) {
+	resource := client.Resource(target.GVR)
+	listOptions := metav1.ListOptions{
+		ResourceVersion:     resourceVersion,
+		AllowWatchBookmarks: true,
+	}
+	if target.Namespaced {
 		apiNamespace, _ := resolveListNamespace(namespace)
 		return resource.Namespace(apiNamespace).Watch(ctx, listOptions)
 	}
@@ -480,6 +625,34 @@ func listCRUnstructured(
 	list, err := resource.List(ctx, opts)
 	if err != nil {
 		return nil, fmt.Errorf("list cluster-scoped %s: %w", selected.GVR.Resource+"."+selected.GVR.Group, err)
+	}
+	return list, nil
+}
+
+func listDiscoveredUnstructured(
+	ctx context.Context,
+	client dynamic.Interface,
+	target discoveredResource,
+	namespace string,
+	opts metav1.ListOptions,
+) (*unstructured.UnstructuredList, error) {
+	resource := client.Resource(target.GVR)
+	label := target.GVR.Resource
+	if strings.TrimSpace(target.GVR.Group) != "" {
+		label = target.GVR.Resource + "." + target.GVR.Group
+	}
+	if target.Namespaced {
+		apiNamespace, displayNamespace := resolveListNamespace(namespace)
+		list, err := resource.Namespace(apiNamespace).List(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list %s in namespace %q: %w", label, displayNamespace, err)
+		}
+		return list, nil
+	}
+
+	list, err := resource.List(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("list cluster-scoped %s: %w", label, err)
 	}
 	return list, nil
 }
@@ -716,14 +889,40 @@ func crdsToItems(crds []apiextv1.CustomResourceDefinition) []protocol.ResourceIt
 		if storageVersion != "" {
 			status = fmt.Sprintf("%s v%s", scope, storageVersion)
 		}
+		aliases := crdAutocompleteAliases(crd)
 		items = append(items, protocol.ResourceItem{
 			Name:      crd.Name,
 			Namespace: "-",
 			Status:    status,
+			OwnerName: strings.Join(aliases, ","),
 		})
 	}
 	sortResourceItems(items)
 	return items
+}
+
+func crdAutocompleteAliases(crd apiextv1.CustomResourceDefinition) []string {
+	seen := map[string]struct{}{}
+	aliases := make([]string, 0, len(crd.Spec.Names.ShortNames)+4)
+	appendUnique := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		aliases = append(aliases, value)
+	}
+
+	for _, short := range crd.Spec.Names.ShortNames {
+		appendUnique(short)
+	}
+	appendUnique(crd.Spec.Names.Singular)
+	appendUnique(crd.Spec.Names.Kind)
+	appendUnique(crd.Spec.Names.ListKind)
+	return aliases
 }
 
 func unstructuredToItems(values []unstructured.Unstructured) []protocol.ResourceItem {

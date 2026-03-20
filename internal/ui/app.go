@@ -17,20 +17,6 @@ import (
 	"github.com/daulet/k11s/internal/protocol"
 )
 
-var defaultResources = []string{
-	"pods",
-	"services",
-	"deployments",
-	"nodes",
-	"namespaces",
-	"statefulsets",
-	"daemonsets",
-	"jobs",
-	"cronjobs",
-	"crds",
-	"crs",
-}
-
 const (
 	defaultBackgroundRefreshInterval = 1200 * time.Millisecond
 	defaultNamespaceRefreshInterval  = 5 * time.Second
@@ -2030,7 +2016,10 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 		}
 		resource, ok := canonicalResourceName(fields[1])
 		if !ok {
-			return false, "", false, fmt.Errorf("unknown resource %q", fields[1])
+			resource = normalizeResourceInput(fields[1])
+			if resource == "" {
+				return false, "", false, fmt.Errorf("unknown resource %q", fields[1])
+			}
 		}
 		if resource == "crs" {
 			if len(fields) >= 3 {
@@ -4614,7 +4603,7 @@ func (m model) commandSuggestions(input string) []string {
 	case "ctx", "context":
 		return prefixMatches(m.contextCandidates(), valuePrefix)
 	case "cr", "crs", "crd", "filter", "customresource", "customresources":
-		return prefixMatches(m.crdCandidates(), valuePrefix)
+		return m.crdCandidates(valuePrefix)
 	case "delete", "del", "rm":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "logs":
@@ -4870,30 +4859,117 @@ func (m model) contextCandidates() []string {
 	return values
 }
 
-func (m model) crdCandidates() []string {
-	seen := map[string]struct{}{}
-	values := make([]string, 0, len(m.resourceList.Items)+1)
-	appendUnique := func(value string) {
+func (m model) crdCandidates(prefix string) []string {
+	index := m.crdCandidateIndex()
+	if len(index.names) == 0 {
+		return nil
+	}
+
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if prefix == "" {
+		return append([]string(nil), index.names...)
+	}
+
+	if exactNames, ok := index.aliasToNames[prefix]; ok && len(exactNames) > 0 {
+		// Exact short-name: expand to canonical CRD name when unambiguous.
+		return append([]string(nil), exactNames...)
+	}
+
+	aliasMatches := make([]string, 0, len(index.aliases))
+	for _, alias := range index.aliases {
+		if strings.HasPrefix(strings.ToLower(alias), prefix) {
+			aliasMatches = append(aliasMatches, alias)
+		}
+	}
+	if len(aliasMatches) > 0 {
+		return aliasMatches
+	}
+
+	return prefixMatches(index.names, prefix)
+}
+
+type crdCandidateIndex struct {
+	names        []string
+	aliases      []string
+	aliasToNames map[string][]string
+}
+
+func (m model) crdCandidateIndex() crdCandidateIndex {
+	names := make([]string, 0, len(m.resourceList.Items)+len(m.crdSuggestions)+1)
+	aliases := make([]string, 0, len(m.resourceList.Items))
+	aliasToNames := map[string][]string{}
+	nameSeen := map[string]struct{}{}
+	aliasSeen := map[string]struct{}{}
+	aliasNameSeen := map[string]map[string]struct{}{}
+
+	appendName := func(value string) {
 		value = strings.TrimSpace(value)
 		if value == "" {
 			return
 		}
-		if _, ok := seen[value]; ok {
+		if _, ok := nameSeen[value]; ok {
 			return
 		}
-		seen[value] = struct{}{}
-		values = append(values, value)
+		nameSeen[value] = struct{}{}
+		names = append(names, value)
 	}
-	appendUnique(m.session.Filter)
+	appendAlias := func(name string, alias string) {
+		name = strings.TrimSpace(name)
+		alias = strings.ToLower(strings.TrimSpace(alias))
+		if name == "" || alias == "" {
+			return
+		}
+		appendName(name)
+
+		if _, ok := aliasSeen[alias]; !ok {
+			aliasSeen[alias] = struct{}{}
+			aliases = append(aliases, alias)
+		}
+
+		perAlias, ok := aliasNameSeen[alias]
+		if !ok {
+			perAlias = map[string]struct{}{}
+			aliasNameSeen[alias] = perAlias
+		}
+		if _, ok := perAlias[name]; ok {
+			return
+		}
+		perAlias[name] = struct{}{}
+		aliasToNames[alias] = append(aliasToNames[alias], name)
+	}
+	appendEncoded := func(value string) {
+		name, alias, hasAlias := strings.Cut(strings.TrimSpace(value), "|")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		appendName(name)
+		if !hasAlias {
+			return
+		}
+		for _, candidate := range strings.Split(alias, ",") {
+			appendAlias(name, candidate)
+		}
+	}
+
+	appendEncoded(m.session.Filter)
 	for _, value := range m.crdSuggestions {
-		appendUnique(value)
+		appendEncoded(value)
 	}
 	if strings.EqualFold(m.resourceList.Resource, "crds") {
 		for _, item := range m.resourceList.Items {
-			appendUnique(item.Name)
+			appendName(item.Name)
+			for _, alias := range strings.Split(item.OwnerName, ",") {
+				appendAlias(item.Name, alias)
+			}
 		}
 	}
-	return values
+
+	return crdCandidateIndex{
+		names:        names,
+		aliases:      aliases,
+		aliasToNames: aliasToNames,
+	}
 }
 
 func (m model) deleteCandidates() []string {
@@ -4948,12 +5024,15 @@ func baseSuggestions() []string {
 		"pods",
 		"services",
 		"deployments",
-		"nodes",
-		"namespaces",
+		"replicasets",
 		"statefulsets",
 		"daemonsets",
 		"jobs",
 		"cronjobs",
+		"ingresses",
+		"podtemplates",
+		"nodes",
+		"namespaces",
 	}
 }
 
@@ -5037,25 +5116,43 @@ func deploymentNameFromReplicaSet(replicaSetName string) (string, bool) {
 	return replicaSetName[:idx], true
 }
 
-func isKnownResource(value string) bool {
-	_, ok := canonicalResourceName(value)
-	return ok
-}
-
 func canonicalResourceName(value string) (string, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(value))
 	switch normalized {
+	case "pod", "pods", "po":
+		return "pods", true
+	case "service", "services", "svc":
+		return "services", true
+	case "deployment", "deployments", "deploy":
+		return "deployments", true
+	case "replicaset", "replicasets", "rs":
+		return "replicasets", true
+	case "statefulset", "statefulsets", "sts":
+		return "statefulsets", true
+	case "daemonset", "daemonsets", "ds":
+		return "daemonsets", true
+	case "job", "jobs":
+		return "jobs", true
+	case "cronjob", "cronjobs", "cj":
+		return "cronjobs", true
+	case "ingress", "ingresses", "ing":
+		return "ingresses", true
+	case "podtemplate", "podtemplates":
+		return "podtemplates", true
+	case "node", "nodes", "no":
+		return "nodes", true
+	case "namespace", "namespaces", "ns":
+		return "namespaces", true
 	case "cr", "crs", "customresource", "customresources":
 		return "crs", true
 	case "crd", "crds", "customresourcedefinition", "customresourcedefinitions":
 		return "crds", true
 	}
-	for _, resource := range defaultResources {
-		if normalized == resource {
-			return resource, true
-		}
-	}
 	return "", false
+}
+
+func normalizeResourceInput(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func resourceSuggestions() []string {
@@ -5063,12 +5160,15 @@ func resourceSuggestions() []string {
 		"pods",
 		"services",
 		"deployments",
-		"nodes",
-		"namespaces",
+		"replicasets",
 		"statefulsets",
 		"daemonsets",
 		"jobs",
 		"cronjobs",
+		"ingresses",
+		"podtemplates",
+		"nodes",
+		"namespaces",
 		"cr",
 		"crd",
 		"crds",
