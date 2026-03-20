@@ -459,6 +459,9 @@ func executeAction(
 		target = query.ItemNamespace + "/" + query.Name
 	}
 	successMessage := fmt.Sprintf("deleted %s %s", query.Resource, target)
+	if query.Action == protocol.ActionDelete && query.Force {
+		successMessage = fmt.Sprintf("deleted %s %s (force)", query.Resource, target)
+	}
 	if query.Action == protocol.ActionScale {
 		replicas := int32(0)
 		if query.Replicas != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -328,15 +329,27 @@ func TestDeleteCommandRunsActionAndReloadsList(t *testing.T) {
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	afterApply := updated.(model)
-	if !afterApply.actionLoading {
-		t.Fatalf("expected action to start loading")
+	if cmd != nil {
+		t.Fatalf("expected confirmation step before delete action")
+	}
+	if !afterApply.deleteConfirmOpen {
+		t.Fatalf("expected delete confirmation prompt after delete command")
+	}
+	if !strings.Contains(strings.ToLower(afterApply.commandMessage), "confirm delete") {
+		t.Fatalf("expected confirmation message, got %q", afterApply.commandMessage)
+	}
+
+	updated, cmd = afterApply.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	afterConfirm := updated.(model)
+	if !afterConfirm.actionLoading {
+		t.Fatalf("expected action to start loading after confirmation")
 	}
 	if cmd == nil {
 		t.Fatalf("expected action command")
 	}
 
 	msg := cmd()
-	updated, nextCmd := afterApply.Update(msg)
+	updated, nextCmd := afterConfirm.Update(msg)
 	afterAction := updated.(model)
 	if nextCmd == nil {
 		t.Fatalf("expected list reload after successful action")
@@ -356,6 +369,412 @@ func TestDeleteCommandRunsActionAndReloadsList(t *testing.T) {
 	}
 	if final.commandMessage != "deleted pods default/api" {
 		t.Fatalf("expected action message to remain after silent reload, got %q", final.commandMessage)
+	}
+}
+
+func TestDeleteCommandSupportsForceAndYesFlags(t *testing.T) {
+	var actionSeen protocol.ActionQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadAction: func(_ context.Context, query protocol.ActionQuery) (protocol.ActionResult, error) {
+			actionSeen = query
+			return protocol.ActionResult{
+				Success: true,
+				Code:    protocol.ActionCodeOK,
+				Message: "deleted pods default/api (force)",
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("delete --force --yes")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updated.(model)
+	if next.deleteConfirmOpen {
+		t.Fatalf("expected --yes delete to skip confirmation prompt")
+	}
+	if !next.actionLoading {
+		t.Fatalf("expected action to start loading for --yes delete")
+	}
+	if cmd == nil {
+		t.Fatalf("expected action command")
+	}
+	_, _ = next.Update(cmd())
+	if !actionSeen.Force {
+		t.Fatalf("expected force flag to be forwarded in delete action query")
+	}
+}
+
+func TestDeleteShortcutUsesDetailTargetInResourceView(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.resourceViewOpen = true
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "deployments",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Found:         true,
+		Item: &protocol.ResourceItem{
+			Name:      "api",
+			Namespace: "default",
+			Status:    "Available",
+		},
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected delete shortcut to open confirmation without running action")
+	}
+	if !next.deleteConfirmOpen {
+		t.Fatalf("expected delete confirmation to open")
+	}
+	if next.deleteConfirmQuery.Resource != "deployments" || next.deleteConfirmQuery.Name != "api" {
+		t.Fatalf("unexpected delete confirmation target: %#v", next.deleteConfirmQuery)
+	}
+	if next.deleteConfirmQuery.ItemNamespace != "default" {
+		t.Fatalf("expected detail namespace to be used for delete, got %q", next.deleteConfirmQuery.ItemNamespace)
+	}
+}
+
+func TestDeleteConfirmationRendersPopup(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	next := updated.(model)
+	if !next.deleteConfirmOpen {
+		t.Fatalf("expected delete confirmation to open")
+	}
+	if next.deleteConfirmAccept {
+		t.Fatalf("expected default confirmation selection to be no")
+	}
+	if next.deleteConfirmFocus != deleteConfirmFocusDecision {
+		t.Fatalf("expected default focus on yes/no switch")
+	}
+
+	mainPane := strings.ToLower(next.renderMainPane(90, 12))
+	if !strings.Contains(mainPane, "delete resource") {
+		t.Fatalf("expected popup title in main pane, got %q", mainPane)
+	}
+	if !strings.Contains(mainPane, "target: pods default/api") {
+		t.Fatalf("expected popup target in main pane, got %q", mainPane)
+	}
+	if !strings.Contains(mainPane, "[y]es") || !strings.Contains(mainPane, "[n]o") {
+		t.Fatalf("expected yes/no button labels in popup, got %q", mainPane)
+	}
+	if !strings.Contains(mainPane, "[ ] force") {
+		t.Fatalf("expected separate force checkbox in popup, got %q", mainPane)
+	}
+
+	inputPane := strings.ToLower(next.renderInputBox(90))
+	if strings.Contains(inputPane, "confirm delete") {
+		t.Fatalf("expected confirmation copy to move into popup, got %q", inputPane)
+	}
+	if !strings.Contains(inputPane, "delete confirmation active") {
+		t.Fatalf("expected popup status hint in input pane, got %q", inputPane)
+	}
+}
+
+func TestDeleteConfirmationEnterCancelsWhenNoRadioSelected(t *testing.T) {
+	actionCalled := false
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadAction: func(_ context.Context, query protocol.ActionQuery) (protocol.ActionResult, error) {
+			actionCalled = true
+			return protocol.ActionResult{
+				Success: true,
+				Code:    protocol.ActionCodeOK,
+				Message: "deleted pods default/api",
+			}, nil
+		},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	withNo := updated.(model)
+	if !withNo.deleteConfirmOpen {
+		t.Fatalf("expected delete confirmation to open")
+	}
+	if withNo.deleteConfirmAccept {
+		t.Fatalf("expected default selection to be no")
+	}
+
+	updated, cmd := withNo.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	final := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected no action command when no radio is selected")
+	}
+	if final.deleteConfirmOpen {
+		t.Fatalf("expected confirmation modal to close")
+	}
+	if actionCalled {
+		t.Fatalf("expected delete action not to run when no radio is selected")
+	}
+	if !strings.Contains(strings.ToLower(final.commandMessage), "delete canceled") {
+		t.Fatalf("expected cancel feedback, got %q", final.commandMessage)
+	}
+}
+
+func TestDeleteConfirmationSpaceTogglesForceCheckbox(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	withConfirm := updated.(model)
+	if !withConfirm.deleteConfirmOpen {
+		t.Fatalf("expected delete confirmation to open")
+	}
+	if withConfirm.deleteConfirmQuery.Force {
+		t.Fatalf("expected force checkbox to default unchecked")
+	}
+	if withConfirm.deleteConfirmFocus != deleteConfirmFocusDecision {
+		t.Fatalf("expected default focus on yes/no switch")
+	}
+
+	updated, _ = withConfirm.Update(tea.KeyMsg{Type: tea.KeySpace})
+	withoutForceFocus := updated.(model)
+	if withoutForceFocus.deleteConfirmQuery.Force {
+		t.Fatalf("expected space to do nothing while focus is on yes/no switch")
+	}
+
+	updated, _ = withoutForceFocus.Update(tea.KeyMsg{Type: tea.KeyDown})
+	withForceFocus := updated.(model)
+	if withForceFocus.deleteConfirmFocus != deleteConfirmFocusForce {
+		t.Fatalf("expected down key to focus force option")
+	}
+
+	updated, _ = withForceFocus.Update(tea.KeyMsg{Type: tea.KeySpace})
+	withForce := updated.(model)
+	if !withForce.deleteConfirmQuery.Force {
+		t.Fatalf("expected space to toggle force checkbox on")
+	}
+	mainPane := strings.ToLower(withForce.renderMainPane(90, 12))
+	if !strings.Contains(mainPane, "[x] force") {
+		t.Fatalf("expected checked force checkbox in popup, got %q", mainPane)
+	}
+}
+
+func TestDeleteConfirmationFocusKeepsControlColumnsAligned(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	withConfirm := updated.(model)
+	ansiRE := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	findColumn := func(pane string, needle string) (int, bool) {
+		for _, line := range strings.Split(pane, "\n") {
+			plain := ansiRE.ReplaceAllString(line, "")
+			if strings.Contains(plain, needle) {
+				return strings.Index(plain, needle), true
+			}
+		}
+		return 0, false
+	}
+
+	beforePane := withConfirm.renderMainPane(90, 12)
+	beforeCol, ok := findColumn(beforePane, "[Y]es")
+	if !ok {
+		t.Fatalf("expected yes/no controls before focus change, got %q", beforePane)
+	}
+
+	updated, _ = withConfirm.Update(tea.KeyMsg{Type: tea.KeyDown})
+	withForceFocus := updated.(model)
+	afterPane := withForceFocus.renderMainPane(90, 12)
+	afterCol, ok := findColumn(afterPane, "[Y]es")
+	if !ok {
+		t.Fatalf("expected yes/no controls after focus change, got %q", afterPane)
+	}
+
+	if beforeCol != afterCol {
+		t.Fatalf("expected yes/no controls to stay aligned, before=%d after=%d", beforeCol, afterCol)
+	}
+}
+
+func TestDeletePopupOverlayPreservesUnderlyingRowSides(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.deleteConfirmQuery = protocol.ActionQuery{
+		Resource:      "pods",
+		ItemNamespace: "default",
+		Name:          "api",
+	}
+
+	contentWidth := 140
+	contentHeight := 12
+	lines := make([]string, contentHeight)
+	for i := 0; i < contentHeight; i++ {
+		leftToken := fmt.Sprintf("L%02d", i)
+		rightToken := fmt.Sprintf("R%02d", i)
+		fillWidth := maxInt(0, contentWidth-len(leftToken)-len(rightToken))
+		lines[i] = leftToken + strings.Repeat(".", fillWidth) + rightToken
+	}
+
+	overlaid := m.overlayDeleteConfirmPopup(append([]string(nil), lines...), 0, contentWidth, contentHeight)
+	ansiRE := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	foundPopupRow := false
+	for i, line := range overlaid {
+		plain := ansiRE.ReplaceAllString(line, "")
+		if strings.Contains(strings.ToLower(plain), "target:") {
+			foundPopupRow = true
+			leftToken := fmt.Sprintf("L%02d", i)
+			rightToken := fmt.Sprintf("R%02d", i)
+			if !strings.Contains(plain, leftToken) {
+				t.Fatalf("expected left side token %q to remain on popup row, got %q", leftToken, plain)
+			}
+			if !strings.Contains(plain, rightToken) {
+				t.Fatalf("expected right side token %q to remain on popup row, got %q", rightToken, plain)
+			}
+		}
+	}
+	if !foundPopupRow {
+		t.Fatalf("expected popup row with target content in overlaid output")
+	}
+}
+
+func TestEditShortcutRunsKubectlEdit(t *testing.T) {
+	var seenArgs []string
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.execProcess = func(cmd *exec.Cmd, callback tea.ExecCallback) tea.Cmd {
+		seenArgs = append([]string(nil), cmd.Args...)
+		return func() tea.Msg {
+			return callback(nil)
+		}
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	withEdit := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected edit shortcut to run external edit command")
+	}
+	if !strings.Contains(strings.ToLower(withEdit.commandMessage), "opening editor") {
+		t.Fatalf("expected opening-editor message, got %q", withEdit.commandMessage)
+	}
+	if len(seenArgs) == 0 {
+		t.Fatalf("expected kubectl args to be captured")
+	}
+	if seenArgs[0] != "kubectl" {
+		t.Fatalf("expected kubectl command, got %#v", seenArgs)
+	}
+	joined := strings.Join(seenArgs, " ")
+	if !strings.Contains(joined, "edit deployments api") {
+		t.Fatalf("expected kubectl edit args, got %q", joined)
+	}
+	if !strings.Contains(joined, "--context dev-cluster") {
+		t.Fatalf("expected context flag in kubectl edit args, got %q", joined)
+	}
+
+	updated, _ = withEdit.Update(cmd())
+	final := updated.(model)
+	if !strings.Contains(strings.ToLower(final.commandMessage), "edited deployments default/api") {
+		t.Fatalf("expected edit completion feedback, got %q", final.commandMessage)
 	}
 }
 

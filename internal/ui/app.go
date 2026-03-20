@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/daulet/k11s/internal/protocol"
 )
@@ -26,6 +29,11 @@ const (
 	maxNavigationHistoryEntries      = 128
 	annotationPreviewRunes           = 96
 	maxFollowLogLines                = 4000
+)
+
+const (
+	deleteConfirmFocusDecision = iota
+	deleteConfirmFocusForce
 )
 
 type LoadResourceListFunc func(ctx context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error)
@@ -101,6 +109,11 @@ type actionLoadedMsg struct {
 type actionFailedMsg struct {
 	seq int
 	err error
+}
+
+type editCompletedMsg struct {
+	target string
+	err    error
 }
 
 type logsLoadedMsg struct {
@@ -180,6 +193,9 @@ type keyMap struct {
 	Down          key.Binding
 	JumpUp        key.Binding
 	JumpDown      key.Binding
+	Delete        key.Binding
+	DeleteForce   key.Binding
+	Edit          key.Binding
 	OpenNamespace key.Binding
 	OpenNode      key.Binding
 	OpenOwner     key.Binding
@@ -214,6 +230,18 @@ func defaultKeyMap() keyMap {
 		JumpDown: key.NewBinding(
 			key.WithKeys("pgdown", "ctrl+d"),
 			key.WithHelp("pgdn/ctrl+d", "jump down"),
+		),
+		Delete: key.NewBinding(
+			key.WithKeys("d"),
+			key.WithHelp("d", "delete"),
+		),
+		DeleteForce: key.NewBinding(
+			key.WithKeys("D"),
+			key.WithHelp("D", "force delete"),
+		),
+		Edit: key.NewBinding(
+			key.WithKeys("e"),
+			key.WithHelp("e", "edit"),
 		),
 		OpenNamespace: key.NewBinding(
 			key.WithKeys("s"),
@@ -282,6 +310,8 @@ func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{
 		k.Up,
 		k.JumpDown,
+		k.Delete,
+		k.Edit,
 		k.OpenNamespace,
 		k.OpenNode,
 		k.OpenOwner,
@@ -305,6 +335,9 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		k.Down,
 		k.JumpUp,
 		k.JumpDown,
+		k.Delete,
+		k.DeleteForce,
+		k.Edit,
 		k.OpenNamespace,
 		k.OpenNode,
 		k.OpenOwner,
@@ -329,6 +362,13 @@ type styles struct {
 	CommandSuggest lipgloss.Style
 	InputPane      lipgloss.Style
 	MainPane       lipgloss.Style
+	DeleteModal    lipgloss.Style
+	DeleteTitle    lipgloss.Style
+	DeleteDanger   lipgloss.Style
+	DeleteHint     lipgloss.Style
+	DeleteOption   lipgloss.Style
+	DeleteKey      lipgloss.Style
+	DeleteSelected lipgloss.Style
 	Title          lipgloss.Style
 	TabActive      lipgloss.Style
 	TabInactive    lipgloss.Style
@@ -358,6 +398,13 @@ func newStyles(useColor bool) styles {
 			CommandSuggest: lipgloss.NewStyle().Bold(true),
 			InputPane:      lipgloss.NewStyle().Padding(0, 1).Border(lipgloss.NormalBorder()),
 			MainPane:       lipgloss.NewStyle().Padding(0, 1).Border(lipgloss.NormalBorder()),
+			DeleteModal:    lipgloss.NewStyle().Padding(1, 2).Border(lipgloss.RoundedBorder()),
+			DeleteTitle:    lipgloss.NewStyle().Bold(true),
+			DeleteDanger:   lipgloss.NewStyle().Bold(true),
+			DeleteHint:     lipgloss.NewStyle().Faint(true),
+			DeleteOption:   lipgloss.NewStyle(),
+			DeleteKey:      lipgloss.NewStyle().Bold(true),
+			DeleteSelected: lipgloss.NewStyle().Bold(true),
 			Title:          lipgloss.NewStyle().Bold(true),
 			TabActive: lipgloss.NewStyle().
 				Bold(true).
@@ -396,7 +443,18 @@ func newStyles(useColor bool) styles {
 			Padding(0, 1).
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("240")),
-		Title: lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true),
+		DeleteModal: lipgloss.NewStyle().
+			Padding(1, 2).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("203")).
+			Background(lipgloss.Color("235")),
+		DeleteTitle:    lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
+		DeleteDanger:   lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
+		DeleteHint:     lipgloss.NewStyle().Foreground(lipgloss.Color("246")),
+		DeleteOption:   lipgloss.NewStyle().Foreground(lipgloss.Color("246")).Background(lipgloss.Color("235")),
+		DeleteKey:      lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Background(lipgloss.Color("235")).Bold(true),
+		DeleteSelected: lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Background(lipgloss.Color("235")).Bold(true),
+		Title:          lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true),
 		TabActive: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("16")).
 			Background(lipgloss.Color("45")).
@@ -480,6 +538,10 @@ type model struct {
 	actionLoading          bool
 	actionRequestSeq       int
 	actionActiveSeq        int
+	deleteConfirmOpen      bool
+	deleteConfirmQuery     protocol.ActionQuery
+	deleteConfirmAccept    bool
+	deleteConfirmFocus     int
 	logs                   protocol.LogsPayload
 	logsLoading            bool
 	logsRequestSeq         int
@@ -505,6 +567,7 @@ type model struct {
 	pollEvery              time.Duration
 	namespacePollEvery     time.Duration
 	crdPollEvery           time.Duration
+	execProcess            func(*exec.Cmd, tea.ExecCallback) tea.Cmd
 
 	width  int
 	height int
@@ -575,6 +638,7 @@ func newModel(opts Options) model {
 		namespacePollEvery:     defaultNamespaceRefreshInterval,
 		crdPollEvery:           defaultCRDRefreshInterval,
 		logsPollEvery:          defaultLogsFollowInterval,
+		execProcess:            tea.ExecProcess,
 	}
 	m.selectFromSession()
 	return m
@@ -809,6 +873,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.actionLoading = false
 		m.commandMessage = fmt.Sprintf("action request failed: %v", msg.err)
 		return m, nil
+	case editCompletedMsg:
+		if msg.err != nil {
+			m.commandMessage = fmt.Sprintf("edit failed: %v", msg.err)
+			return m, nil
+		}
+		target := strings.TrimSpace(msg.target)
+		if target == "" {
+			target = "resource"
+		}
+		m.commandMessage = fmt.Sprintf("edited %s", target)
+		if m.loadResourceList == nil {
+			return m, nil
+		}
+		updatedModel, listCmd := m.startListReloadWithAnnouncement(false)
+		return updatedModel, listCmd
 	case logsLoadedMsg:
 		if msg.seq != m.logsActiveSeq {
 			return m, nil
@@ -894,6 +973,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.searchMode {
 			return m.updateSearchMode(msg)
 		}
+		if m.deleteConfirmOpen {
+			return m.updateDeleteConfirmMode(msg)
+		}
 		return m.updateNormalMode(msg)
 	case tea.MouseMsg:
 		return m.updateMouseMode(msg)
@@ -956,6 +1038,12 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case key.Matches(msg, m.keys.Delete):
+		return m.startDeleteConfirmationForActive(false, "shortcut")
+	case key.Matches(msg, m.keys.DeleteForce):
+		return m.startDeleteConfirmationForActive(true, "shortcut")
+	case key.Matches(msg, m.keys.Edit):
+		return m.startEditForActive("shortcut")
 	case key.Matches(msg, m.keys.Detail):
 		if len(m.resourceList.Items) == 0 {
 			m.commandMessage = "no selected item for detail"
@@ -1004,6 +1092,12 @@ func (m model) updatePodViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case key.Matches(msg, m.keys.Delete):
+		return m.startDeleteConfirmationForActive(false, "shortcut")
+	case key.Matches(msg, m.keys.DeleteForce):
+		return m.startDeleteConfirmationForActive(true, "shortcut")
+	case key.Matches(msg, m.keys.Edit):
+		return m.startEditForActive("shortcut")
 	case msg.String() == "esc":
 		m.clearPodView()
 		m.commandMessage = "closed pod view"
@@ -1096,6 +1190,12 @@ func (m model) updateResourceViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case key.Matches(msg, m.keys.Delete):
+		return m.startDeleteConfirmationForActive(false, "shortcut")
+	case key.Matches(msg, m.keys.DeleteForce):
+		return m.startDeleteConfirmationForActive(true, "shortcut")
+	case key.Matches(msg, m.keys.Edit):
+		return m.startEditForActive("shortcut")
 	case msg.String() == "esc":
 		m.clearDetail()
 		m.commandMessage = "closed resource view"
@@ -1178,8 +1278,70 @@ func (m model) updateSearchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) updateDeleteConfirmMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, m.keys.Quit):
+		return m, tea.Quit
+	case msg.Type == tea.KeyUp:
+		m.deleteConfirmFocus = deleteConfirmFocusDecision
+		return m, nil
+	case msg.Type == tea.KeyDown:
+		m.deleteConfirmFocus = deleteConfirmFocusForce
+		return m, nil
+	case msg.Type == tea.KeyLeft:
+		if m.deleteConfirmFocus != deleteConfirmFocusDecision {
+			return m, nil
+		}
+		m.deleteConfirmAccept = true
+		return m, nil
+	case msg.Type == tea.KeyRight:
+		if m.deleteConfirmFocus != deleteConfirmFocusDecision {
+			return m, nil
+		}
+		m.deleteConfirmAccept = false
+		return m, nil
+	case msg.Type == tea.KeyTab || msg.Type == tea.KeyShiftTab:
+		if m.deleteConfirmFocus == deleteConfirmFocusDecision {
+			m.deleteConfirmFocus = deleteConfirmFocusForce
+		} else {
+			m.deleteConfirmFocus = deleteConfirmFocusDecision
+		}
+		return m, nil
+	case msg.String() == "esc" || strings.EqualFold(msg.String(), "n"):
+		m.deleteConfirmOpen = false
+		m.commandMessage = "delete canceled"
+		return m, nil
+	case msg.String() == "!" || strings.EqualFold(msg.String(), "f"):
+		m.deleteConfirmQuery.Force = !m.deleteConfirmQuery.Force
+		m.commandMessage = m.deleteConfirmationMessage()
+		return m, nil
+	case msg.Type == tea.KeySpace:
+		if m.deleteConfirmFocus != deleteConfirmFocusForce {
+			return m, nil
+		}
+		m.deleteConfirmQuery.Force = !m.deleteConfirmQuery.Force
+		m.commandMessage = m.deleteConfirmationMessage()
+		return m, nil
+	case strings.EqualFold(msg.String(), "y"):
+		query := m.deleteConfirmQuery
+		m.deleteConfirmOpen = false
+		return m.startAction(query)
+	case msg.Type == tea.KeyEnter:
+		if m.deleteConfirmAccept {
+			query := m.deleteConfirmQuery
+			m.deleteConfirmOpen = false
+			return m.startAction(query)
+		}
+		m.deleteConfirmOpen = false
+		m.commandMessage = "delete canceled"
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
 func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if m.commandMode || m.searchMode {
+	if m.commandMode || m.searchMode || m.deleteConfirmOpen {
 		return m, nil
 	}
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
@@ -1876,6 +2038,29 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m.startLogs(logsQuery)
 		}
+		if deleteQuery, executeNow, isDelete, deleteErr := m.deleteQueryFromCommand(commandText); isDelete {
+			if deleteErr != nil {
+				m.enterCommandMode()
+				m.input.SetValue(commandText)
+				m.commandMessage = deleteErr.Error()
+				m.suggestions = m.commandSuggestions(m.input.Value())
+				return m, nil
+			}
+			if executeNow {
+				return m.startAction(deleteQuery)
+			}
+			return m.startDeleteConfirmation(deleteQuery, "command")
+		}
+		if editInvocation, isEdit, editErr := m.editInvocationFromCommand(commandText); isEdit {
+			if editErr != nil {
+				m.enterCommandMode()
+				m.input.SetValue(commandText)
+				m.commandMessage = editErr.Error()
+				m.suggestions = m.commandSuggestions(m.input.Value())
+				return m, nil
+			}
+			return m.startEditWithInvocation(editInvocation, "command")
+		}
 		if actionQuery, isAction, actionErr := m.actionQueryFromCommand(commandText); isAction {
 			if actionErr != nil {
 				m.enterCommandMode()
@@ -2564,6 +2749,136 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 	}
 }
 
+type editInvocation struct {
+	resourceArg   string
+	resourceLabel string
+	name          string
+	namespace     string
+}
+
+func (m model) deleteQueryFromCommand(input string) (query protocol.ActionQuery, executeNow bool, handled bool, err error) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return protocol.ActionQuery{}, false, false, nil
+	}
+	command := strings.ToLower(strings.TrimSpace(fields[0]))
+	switch command {
+	case "delete", "del", "rm":
+	default:
+		return protocol.ActionQuery{}, false, false, nil
+	}
+
+	name, itemNamespace, force, confirmed, parseErr := m.parseDeleteCommandArgs(fields[1:])
+	if parseErr != nil {
+		return protocol.ActionQuery{}, false, true, parseErr
+	}
+	resource := strings.TrimSpace(m.session.Resource)
+	if activeResource, _, _, ok := m.activeActionTarget(); ok && strings.TrimSpace(activeResource) != "" {
+		resource = activeResource
+	}
+	query = protocol.ActionQuery{
+		Action:        protocol.ActionDelete,
+		KubeContext:   m.session.KubeContext,
+		Resource:      resource,
+		Namespace:     m.session.Namespace,
+		Filter:        m.session.Filter,
+		ItemNamespace: itemNamespace,
+		Name:          name,
+		Force:         force,
+	}
+	return query, confirmed, true, nil
+}
+
+func (m model) parseDeleteCommandArgs(args []string) (name string, itemNamespace string, force bool, confirmed bool, err error) {
+	target := ""
+	for _, raw := range args {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		switch strings.ToLower(value) {
+		case "--force", "-f", "force":
+			force = true
+			continue
+		case "--yes", "-y", "yes":
+			confirmed = true
+			continue
+		}
+		if strings.HasPrefix(value, "-") {
+			return "", "", false, false, fmt.Errorf("unsupported delete option %q", raw)
+		}
+		if target != "" {
+			return "", "", false, false, fmt.Errorf("delete accepts at most one target: try `:delete <name>`")
+		}
+		target = value
+	}
+	if target != "" {
+		if ns, itemName, ok := strings.Cut(target, "/"); ok {
+			itemNamespace = strings.TrimSpace(ns)
+			name = strings.TrimSpace(itemName)
+		} else {
+			name = target
+		}
+		if name == "" {
+			return "", "", false, false, fmt.Errorf("action target name is required")
+		}
+	} else {
+		resource, resolvedName, resolvedNamespace, ok := m.activeActionTarget()
+		if !ok {
+			return "", "", false, false, fmt.Errorf("action target required: select an item or pass `<name>`")
+		}
+		if resource == "" || resolvedName == "" {
+			return "", "", false, false, fmt.Errorf("action target name is required")
+		}
+		name = resolvedName
+		itemNamespace = resolvedNamespace
+	}
+	if itemNamespace == "-" || strings.EqualFold(itemNamespace, "<cluster>") || strings.EqualFold(itemNamespace, "all") {
+		itemNamespace = ""
+	}
+	return name, itemNamespace, force, confirmed, nil
+}
+
+func (m model) editInvocationFromCommand(input string) (editInvocation, bool, error) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return editInvocation{}, false, nil
+	}
+	command := strings.ToLower(strings.TrimSpace(fields[0]))
+	if command != "edit" {
+		return editInvocation{}, false, nil
+	}
+	if len(fields) > 2 {
+		return editInvocation{}, true, fmt.Errorf("edit accepts at most one target: try `:edit <name>`")
+	}
+
+	resource, name, itemNamespace, ok := m.activeActionTarget()
+	if !ok {
+		return editInvocation{}, true, fmt.Errorf("edit target required: select an item or pass `<name>`")
+	}
+	if len(fields) == 2 {
+		target := strings.TrimSpace(fields[1])
+		if target == "" {
+			return editInvocation{}, true, fmt.Errorf("edit target name is required")
+		}
+		if ns, itemName, hasSlash := strings.Cut(target, "/"); hasSlash {
+			itemNamespace = strings.TrimSpace(ns)
+			name = strings.TrimSpace(itemName)
+		} else {
+			name = target
+		}
+	}
+	if name == "" {
+		return editInvocation{}, true, fmt.Errorf("edit target name is required")
+	}
+
+	invocation, err := m.editInvocation(resource, name, itemNamespace)
+	if err != nil {
+		return editInvocation{}, true, err
+	}
+	return invocation, true, nil
+}
+
 func (m model) actionQueryFromCommand(input string) (protocol.ActionQuery, bool, error) {
 	fields := strings.Fields(input)
 	if len(fields) == 0 {
@@ -2572,20 +2887,6 @@ func (m model) actionQueryFromCommand(input string) (protocol.ActionQuery, bool,
 
 	command := strings.ToLower(strings.TrimSpace(fields[0]))
 	switch command {
-	case "delete", "del", "rm":
-		name, itemNamespace, err := m.actionTargetFromFields(fields[1:])
-		if err != nil {
-			return protocol.ActionQuery{}, true, err
-		}
-		return protocol.ActionQuery{
-			Action:        protocol.ActionDelete,
-			KubeContext:   m.session.KubeContext,
-			Resource:      m.session.Resource,
-			Namespace:     m.session.Namespace,
-			Filter:        m.session.Filter,
-			ItemNamespace: itemNamespace,
-			Name:          name,
-		}, true, nil
 	case "scale":
 		if len(fields) < 2 {
 			return protocol.ActionQuery{}, true, fmt.Errorf("scale requires replicas: try `:scale 3`")
@@ -2662,12 +2963,12 @@ func (m model) actionTargetFromFields(args []string) (name string, itemNamespace
 			name = target
 		}
 	} else {
-		item, ok := m.currentItem()
+		_, resolvedName, resolvedNamespace, ok := m.activeActionTarget()
 		if !ok {
 			return "", "", fmt.Errorf("action target required: select an item or pass `<name>`")
 		}
-		name = strings.TrimSpace(item.Name)
-		itemNamespace = strings.TrimSpace(item.Namespace)
+		name = strings.TrimSpace(resolvedName)
+		itemNamespace = strings.TrimSpace(resolvedNamespace)
 	}
 
 	if name == "" {
@@ -2677,6 +2978,205 @@ func (m model) actionTargetFromFields(args []string) (name string, itemNamespace
 		itemNamespace = ""
 	}
 	return name, itemNamespace, nil
+}
+
+func sanitizeActionNamespace(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "-" || strings.EqualFold(value, "<cluster>") || strings.EqualFold(value, "all") {
+		return ""
+	}
+	return value
+}
+
+func (m model) activeActionTarget() (resource string, name string, itemNamespace string, ok bool) {
+	if m.podViewOpen {
+		name = strings.TrimSpace(m.podView.Name)
+		if name == "" {
+			return "", "", "", false
+		}
+		itemNamespace = strings.TrimSpace(m.podView.Namespace)
+		if itemNamespace == "" {
+			itemNamespace = strings.TrimSpace(m.session.Namespace)
+		}
+		return "pods", name, sanitizeActionNamespace(itemNamespace), true
+	}
+
+	if m.resourceViewOpen {
+		resource = strings.TrimSpace(m.detail.Resource)
+		if resource == "" {
+			resource = strings.TrimSpace(m.session.Resource)
+		}
+		resource = normalizeResourceInput(resource)
+		if resource == "" {
+			resource = "pods"
+		}
+		name = strings.TrimSpace(m.detail.Name)
+		if name == "" && m.detail.Item != nil {
+			name = strings.TrimSpace(m.detail.Item.Name)
+		}
+		if name == "" {
+			return "", "", "", false
+		}
+		itemNamespace = strings.TrimSpace(m.detail.ItemNamespace)
+		if itemNamespace == "" && m.detail.Item != nil {
+			itemNamespace = strings.TrimSpace(m.detail.Item.Namespace)
+		}
+		return resource, name, sanitizeActionNamespace(itemNamespace), true
+	}
+
+	item, ok := m.currentItem()
+	if !ok {
+		return "", "", "", false
+	}
+	resource = normalizeResourceInput(m.session.Resource)
+	if resource == "" {
+		resource = "pods"
+	}
+	return resource, strings.TrimSpace(item.Name), sanitizeActionNamespace(item.Namespace), true
+}
+
+func deleteTargetLabel(query protocol.ActionQuery) string {
+	name := strings.TrimSpace(query.Name)
+	itemNamespace := sanitizeActionNamespace(query.ItemNamespace)
+	if itemNamespace != "" {
+		return itemNamespace + "/" + name
+	}
+	return name
+}
+
+func (m model) deleteConfirmationMessage() string {
+	query := m.deleteConfirmQuery
+	target := deleteTargetLabel(query)
+	resource := strings.TrimSpace(query.Resource)
+	if resource == "" {
+		resource = strings.TrimSpace(m.session.Resource)
+	}
+	if query.Force {
+		return fmt.Sprintf("confirm force delete %s %s? (enter/y confirm, n/esc cancel, ! toggle force)", resource, target)
+	}
+	return fmt.Sprintf("confirm delete %s %s? (enter/y confirm, n/esc cancel, ! toggle force)", resource, target)
+}
+
+func (m model) startDeleteConfirmationForActive(force bool, via string) (tea.Model, tea.Cmd) {
+	resource, name, itemNamespace, ok := m.activeActionTarget()
+	if !ok {
+		m.commandMessage = "delete target required: select an item first"
+		return m, nil
+	}
+	query := protocol.ActionQuery{
+		Action:        protocol.ActionDelete,
+		KubeContext:   m.session.KubeContext,
+		Resource:      resource,
+		Namespace:     m.session.Namespace,
+		Filter:        m.session.Filter,
+		ItemNamespace: itemNamespace,
+		Name:          name,
+		Force:         force,
+	}
+	return m.startDeleteConfirmation(query, via)
+}
+
+func (m model) startDeleteConfirmation(query protocol.ActionQuery, via string) (tea.Model, tea.Cmd) {
+	query.Action = protocol.ActionDelete
+	query.Resource = normalizeResourceInput(query.Resource)
+	if query.Resource == "" {
+		query.Resource = "pods"
+	}
+	query.Name = strings.TrimSpace(query.Name)
+	query.ItemNamespace = sanitizeActionNamespace(query.ItemNamespace)
+	if query.Name == "" {
+		m.commandMessage = "delete target name is required"
+		return m, nil
+	}
+	m.deleteConfirmOpen = true
+	m.deleteConfirmQuery = query
+	m.deleteConfirmAccept = false
+	m.deleteConfirmFocus = deleteConfirmFocusDecision
+	m.commandMessage = m.deleteConfirmationMessage()
+	if strings.TrimSpace(via) != "" {
+		m.commandMessage = m.commandMessage + fmt.Sprintf(" [%s]", strings.TrimSpace(via))
+	}
+	return m, nil
+}
+
+func (m model) editInvocation(resource string, name string, itemNamespace string) (editInvocation, error) {
+	resource = normalizeResourceInput(resource)
+	if resource == "" {
+		resource = "pods"
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return editInvocation{}, fmt.Errorf("edit target name is required")
+	}
+
+	resourceArg := resource
+	if resource == "crs" {
+		filter := strings.TrimSpace(m.session.Filter)
+		if filter == "" {
+			return editInvocation{}, fmt.Errorf("cr edit requires selected crd filter")
+		}
+		resourceArg = filter
+	}
+	if resourceArg == "" {
+		return editInvocation{}, fmt.Errorf("edit target resource is required")
+	}
+
+	return editInvocation{
+		resourceArg:   resourceArg,
+		resourceLabel: resource,
+		name:          name,
+		namespace:     sanitizeActionNamespace(itemNamespace),
+	}, nil
+}
+
+func (m model) startEditForActive(via string) (tea.Model, tea.Cmd) {
+	resource, name, itemNamespace, ok := m.activeActionTarget()
+	if !ok {
+		m.commandMessage = "edit target required: select an item first"
+		return m, nil
+	}
+	invocation, err := m.editInvocation(resource, name, itemNamespace)
+	if err != nil {
+		m.commandMessage = err.Error()
+		return m, nil
+	}
+	return m.startEditWithInvocation(invocation, via)
+}
+
+func (m model) startEditWithInvocation(invocation editInvocation, via string) (tea.Model, tea.Cmd) {
+	if m.execProcess == nil {
+		m.commandMessage = "edit is unavailable in this build"
+		return m, nil
+	}
+
+	args := []string{"edit", invocation.resourceArg, invocation.name}
+	if invocation.namespace != "" {
+		args = append(args, "-n", invocation.namespace)
+	}
+	if kubeContext := strings.TrimSpace(m.session.KubeContext); kubeContext != "" {
+		args = append(args, "--context", kubeContext)
+	}
+
+	target := invocation.resourceLabel + " " + deleteTargetLabel(protocol.ActionQuery{
+		Resource:      invocation.resourceLabel,
+		ItemNamespace: invocation.namespace,
+		Name:          invocation.name,
+	})
+	if strings.TrimSpace(via) == "" {
+		m.commandMessage = fmt.Sprintf("opening editor for %s...", target)
+	} else {
+		m.commandMessage = fmt.Sprintf("opening editor for %s via %s...", target, strings.TrimSpace(via))
+	}
+
+	cmd := exec.Command("kubectl", args...)
+	// kubectl edit launches another interactive editor process; using the real
+	// terminal fds avoids nested-tty hangs when returning from the editor.
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return m, m.execProcess(cmd, func(err error) tea.Msg {
+		return editCompletedMsg{target: target, err: err}
+	})
 }
 
 func (m model) logsQueryFromCommand(input string) (protocol.LogsQuery, bool, error) {
@@ -3209,6 +3709,8 @@ func (m model) renderInputBox(width int) string {
 		secondary = m.renderAutocompleteStatus()
 	} else if m.commandMode && len(m.suggestions) > 0 {
 		secondary = m.styles.CommandHint.Render("autocomplete: " + strings.Join(limitSuggestions(m.suggestions, 5), "  "))
+	} else if m.deleteConfirmOpen {
+		secondary = m.styles.CommandHint.Render("delete confirmation active")
 	} else if m.commandMessage != "" {
 		secondary = m.styles.CommandMsg.Render(m.commandMessage)
 	}
@@ -3229,53 +3731,234 @@ func (m model) renderMainPane(width int, innerHeight int) string {
 	}
 
 	lines := []string{m.styles.Title.Render(m.mainPaneTitle()), ""}
-
 	if m.podViewOpen {
 		lines = append(lines, m.renderPodTabBar(), "")
+	} else if m.resourceViewOpen {
+		lines = append(lines, m.renderDetailTabBar(), "")
+	}
 
-		contentHeight := innerHeight - len(lines)
-		if contentHeight < 1 {
-			contentHeight = 1
-		}
+	contentStart := len(lines)
+	contentHeight := innerHeight - contentStart
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+
+	var body []string
+	if m.podViewOpen {
 		contentLines := m.podViewContentLines(contentWidth, contentHeight)
 		contentLines = m.highlightPodSearchMatches(contentLines)
 		scroll := m.normalizedPodScroll(len(contentLines), contentHeight)
-		lines = append(lines, viewportLines(contentLines, scroll, contentHeight)...)
+		body = viewportLines(contentLines, scroll, contentHeight)
 	} else if m.resourceViewOpen {
-		lines = append(lines, m.renderDetailTabBar(), "")
-
-		contentHeight := innerHeight - len(lines)
-		if contentHeight < 1 {
-			contentHeight = 1
-		}
 		contentLines := m.resourceViewContentLines(contentWidth, contentHeight)
 		contentLines = m.highlightDetailSearchMatches(contentLines)
 		scroll := m.normalizedResourceScroll(len(contentLines), contentHeight)
-		lines = append(lines, viewportLines(contentLines, scroll, contentHeight)...)
+		body = viewportLines(contentLines, scroll, contentHeight)
 	} else if len(m.resourceList.Items) == 0 {
-		contentHeight := innerHeight - len(lines)
-		if contentHeight < 1 {
-			contentHeight = 1
-		}
-		var body []string
 		if errText := m.mainPaneError(); errText != "" {
 			body = m.centeredStyledLines("error: "+errText, contentWidth, contentHeight, m.styles.MainError)
 		} else {
 			label, style := m.emptyPaneState()
 			body = m.centeredStyledLines(label, contentWidth, contentHeight, style)
 		}
-		lines = append(lines, body...)
 	} else {
-		contentHeight := innerHeight - len(lines)
-		if contentHeight < 1 {
-			contentHeight = 1
-		}
-		body := m.listLines()
-		scroll := m.normalizedListScroll(len(body), contentHeight)
-		lines = append(lines, viewportLines(body, scroll, contentHeight)...)
+		listBody := m.listLines()
+		scroll := m.normalizedListScroll(len(listBody), contentHeight)
+		body = viewportLines(listBody, scroll, contentHeight)
+	}
+	lines = append(lines, body...)
+	for len(lines) < contentStart+contentHeight {
+		lines = append(lines, "")
+	}
+	if m.deleteConfirmOpen {
+		lines = m.overlayDeleteConfirmPopup(lines, contentStart, contentWidth, contentHeight)
 	}
 
 	return renderPane(width, innerHeight, lines, m.styles.MainPane)
+}
+
+func (m model) overlayDeleteConfirmPopup(lines []string, contentStart int, contentWidth int, contentHeight int) []string {
+	if len(lines) == 0 || contentWidth < 1 || contentHeight < 1 {
+		return lines
+	}
+	popup := m.renderDeleteConfirmPopupBody(contentWidth)
+	if len(popup) == 0 {
+		return lines
+	}
+	if len(popup) > contentHeight {
+		popup = popup[:contentHeight]
+	}
+	top := contentStart + maxInt(0, (contentHeight-len(popup))/2)
+	left := maxInt(0, (contentWidth-maxDisplayWidth(popup))/2)
+	for i, popupLine := range popup {
+		idx := top + i
+		if idx < 0 || idx >= len(lines) {
+			continue
+		}
+		baseLine := fitDisplayWidth(lines[idx], contentWidth)
+		popupSegment := popupLine
+		maxPopupWidth := maxInt(0, contentWidth-left)
+		if lipgloss.Width(popupSegment) > maxPopupWidth {
+			popupSegment = ansi.Truncate(popupSegment, maxPopupWidth, "")
+		}
+		popupWidth := lipgloss.Width(popupSegment)
+		leftPart := ansi.Cut(baseLine, 0, left)
+		rightPart := ansi.Cut(baseLine, left+popupWidth, contentWidth)
+		lines[idx] = fitDisplayWidth(leftPart+popupSegment+rightPart, contentWidth)
+	}
+	return lines
+}
+
+func maxDisplayWidth(lines []string) int {
+	maxWidth := 0
+	for _, line := range lines {
+		if w := lipgloss.Width(line); w > maxWidth {
+			maxWidth = w
+		}
+	}
+	return maxWidth
+}
+
+func (m model) renderDeleteConfirmPopupBody(contentWidth int) []string {
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+
+	frameSize := m.styles.DeleteModal.GetHorizontalFrameSize()
+	maxModalWidth := contentWidth - frameSize - 4
+	if maxModalWidth < 20 {
+		return []string{m.styles.MainError.Render(fitToWidth(m.deleteConfirmationMessage(), contentWidth))}
+	}
+	modalWidth := maxModalWidth
+	if modalWidth > 72 {
+		modalWidth = 72
+	}
+
+	query := m.deleteConfirmQuery
+	resource := strings.TrimSpace(query.Resource)
+	if resource == "" {
+		resource = strings.TrimSpace(m.session.Resource)
+	}
+	target := deleteTargetLabel(query)
+	title := "Delete Resource"
+	if query.Force {
+		title = "Force Delete Resource"
+	}
+
+	yesNoMarker := " "
+	if m.deleteConfirmFocus == deleteConfirmFocusDecision {
+		yesNoMarker = ">"
+	}
+	yesNoLine := renderDeleteDecisionLine(
+		yesNoMarker,
+		m.deleteConfirmAccept,
+		modalWidth,
+		m.styles.DeleteKey,
+		m.styles.DeleteOption,
+		m.styles.DeleteSelected,
+	)
+
+	forceToken := "[ ] Force"
+	forceStyle := m.styles.DeleteHint
+	if query.Force {
+		forceToken = "[x] Force"
+		forceStyle = m.styles.DeleteDanger
+	} else if m.deleteConfirmFocus == deleteConfirmFocusForce {
+		forceStyle = m.styles.DeleteTitle
+	}
+	forceMarker := " "
+	if m.deleteConfirmFocus == deleteConfirmFocusForce {
+		forceMarker = ">"
+	}
+
+	bodyLines := make([]string, 0, 16)
+	bodyLines = append(bodyLines, renderStyledWrappedLines(title, modalWidth, m.styles.DeleteTitle, false)...)
+	bodyLines = append(bodyLines, "")
+	bodyLines = append(bodyLines, renderStyledWrappedLines(fmt.Sprintf("Target: %s %s", resource, target), modalWidth, lipgloss.NewStyle(), false)...)
+	bodyLines = append(bodyLines, "")
+	bodyLines = append(bodyLines, yesNoLine)
+	bodyLines = append(bodyLines, "")
+	bodyLines = append(bodyLines, renderDeleteControlLine(forceMarker, forceToken, modalWidth, m.styles.DeleteKey, forceStyle))
+	bodyLines = append(bodyLines, "")
+	hintLine := m.styles.DeleteKey.Render("Enter") +
+		m.styles.DeleteOption.Render(" Confirm ") +
+		m.styles.DeleteOption.Render("│") +
+		m.styles.DeleteKey.Render("Esc") +
+		m.styles.DeleteOption.Render(" Cancel")
+	bodyLines = append(bodyLines, renderStyledLine(hintLine, modalWidth, lipgloss.NewStyle(), false))
+
+	popup := m.styles.DeleteModal.Width(modalWidth).Render(strings.Join(bodyLines, "\n"))
+	return strings.Split(popup, "\n")
+}
+
+func renderDeleteControlLine(marker string, content string, width int, markerStyle lipgloss.Style, contentStyle lipgloss.Style) string {
+	if marker == "" {
+		marker = " "
+	}
+	markerCol := renderStyledSegment(marker+" ", 2, markerStyle)
+	contentCol := renderStyledSegment(content, maxInt(1, width-2), contentStyle)
+	return renderStyledLine(markerCol+contentCol, width, lipgloss.NewStyle(), false)
+}
+
+func renderDeleteDecisionLine(marker string, yesSelected bool, width int, keyStyle lipgloss.Style, optionStyle lipgloss.Style, selectedStyle lipgloss.Style) string {
+	if marker == "" {
+		marker = " "
+	}
+	markerStyle := optionStyle
+	if strings.TrimSpace(marker) != "" {
+		markerStyle = keyStyle
+	}
+	markerCol := renderStyledSegment(marker+" ", 2, markerStyle)
+
+	yesStyle := optionStyle
+	noStyle := optionStyle
+	if yesSelected {
+		yesStyle = selectedStyle
+	} else {
+		noStyle = selectedStyle
+	}
+
+	yesCol := renderStyledSegment("[Y]es", 14, yesStyle)
+	noCol := renderStyledSegment("[N]o", 8, noStyle)
+	row := markerCol + yesCol + noCol
+	return renderStyledLine(row, width, lipgloss.NewStyle(), false)
+}
+
+func renderStyledSegment(value string, width int, style lipgloss.Style) string {
+	if width <= 0 {
+		return ""
+	}
+	text := fitToWidth(value, width)
+	if pad := width - lipgloss.Width(text); pad > 0 {
+		text += strings.Repeat(" ", pad)
+	}
+	return style.Render(text)
+}
+
+func renderStyledWrappedLines(value string, width int, style lipgloss.Style, center bool) []string {
+	wrapped := wrapText(value, width)
+	lines := make([]string, 0, len(wrapped))
+	for _, line := range wrapped {
+		lines = append(lines, renderStyledLine(line, width, style, center))
+	}
+	return lines
+}
+
+func renderStyledLine(value string, width int, style lipgloss.Style, center bool) string {
+	if width <= 0 {
+		width = 1
+	}
+
+	text := value
+	if center {
+		text = centerHorizontally(text, width)
+	} else {
+		text = fitToWidth(text, width)
+	}
+	if pad := width - lipgloss.Width(text); pad > 0 {
+		text += strings.Repeat(" ", pad)
+	}
+	return style.Render(fitToWidth(text, width))
 }
 
 func (m model) mainPaneTitle() string {
@@ -4660,6 +5343,17 @@ func (m model) legendHints() []string {
 			"q quit",
 		}
 	}
+	if m.deleteConfirmOpen {
+		return []string{
+			"up/down focus",
+			"left/right choose",
+			"enter apply",
+			"y yes",
+			"n/esc cancel",
+			"space/! force",
+			"q quit",
+		}
+	}
 	if m.podViewOpen {
 		hints := []string{
 			"tab next",
@@ -4668,6 +5362,8 @@ func (m model) legendHints() []string {
 			"g/G top/bot",
 			"/ search",
 			"n/N next/prev",
+			"d delete",
+			"e edit",
 		}
 		if m.isPodLogsTabActive() && len(m.podLogContainers()) > 1 {
 			hints = append(hints, "[/ ] container")
@@ -4694,6 +5390,8 @@ func (m model) legendHints() []string {
 			"g/G top/bot",
 			"/ search",
 			"n/N next/prev",
+			"d delete",
+			"e edit",
 			"esc back",
 			": cmd",
 			"q quit",
@@ -4720,6 +5418,8 @@ func (m model) legendHints() []string {
 	}
 	hints = append(hints,
 		enterHint,
+		"d delete",
+		"e edit",
 		": cmd",
 		"/ search",
 		"C-o back",
@@ -4876,6 +5576,19 @@ func fitToWidth(value string, width int) string {
 		return value
 	}
 	return lipgloss.NewStyle().MaxWidth(width).Render(value)
+}
+
+func fitDisplayWidth(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(value) > width {
+		value = ansi.Truncate(value, width, "")
+	}
+	if pad := width - lipgloss.Width(value); pad > 0 {
+		value += strings.Repeat(" ", pad)
+	}
+	return value
 }
 
 func maxInt(a int, b int) int {
@@ -5617,6 +6330,8 @@ func (m model) commandSuggestions(input string) []string {
 		return m.crdCandidates(valuePrefix)
 	case "delete", "del", "rm":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
+	case "edit":
+		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "logs":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "scale":
@@ -6024,6 +6739,7 @@ func baseSuggestions() []string {
 		"delete",
 		"del",
 		"rm",
+		"edit",
 		"logs",
 		"restart",
 		"rollout",
@@ -6316,7 +7032,7 @@ func isLogsFollowToken(value string) bool {
 
 func commandSupportsArgument(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
-	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm", "logs", "scale", "restart", "rollout":
+	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm", "edit", "logs", "scale", "restart", "rollout":
 		return true
 	default:
 		return false

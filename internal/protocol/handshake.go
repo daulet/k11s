@@ -232,6 +232,7 @@ type ActionQuery struct {
 	Filter        string `json:"filter,omitempty"`
 	ItemNamespace string `json:"itemNamespace,omitempty"`
 	Name          string `json:"name"`
+	Force         bool   `json:"force,omitempty"`
 	Replicas      *int32 `json:"replicas,omitempty"`
 }
 

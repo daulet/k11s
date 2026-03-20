@@ -29,53 +29,41 @@ func NewActionExecutor(clients *ClientFactory) *ActionExecutor {
 }
 
 func (e *ActionExecutor) Delete(ctx context.Context, query protocol.ActionQuery) error {
-	resource := strings.ToLower(strings.TrimSpace(query.Resource))
+	resource := normalizeResourceName(query.Resource)
 	name := strings.TrimSpace(query.Name)
 	if name == "" {
 		return fmt.Errorf("%w: item name is required", ErrActionValidation)
 	}
+	deleteOptions := deleteOptionsForAction(query.Force)
 
 	switch resource {
-	case "pods":
-		client, err := e.clients.ClientForContext(query.KubeContext)
-		if err != nil {
-			return err
-		}
-		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
-		if err != nil {
-			return err
-		}
-		return client.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
-	case "services":
-		client, err := e.clients.ClientForContext(query.KubeContext)
-		if err != nil {
-			return err
-		}
-		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
-		if err != nil {
-			return err
-		}
-		return client.CoreV1().Services(ns).Delete(ctx, name, metav1.DeleteOptions{})
-	case "deployments":
-		client, err := e.clients.ClientForContext(query.KubeContext)
-		if err != nil {
-			return err
-		}
-		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
-		if err != nil {
-			return err
-		}
-		return client.AppsV1().Deployments(ns).Delete(ctx, name, metav1.DeleteOptions{})
 	case "crds":
 		client, err := e.clients.APIExtensionsForContext(query.KubeContext)
 		if err != nil {
 			return err
 		}
-		return client.ApiextensionsV1().CustomResourceDefinitions().Delete(ctx, name, metav1.DeleteOptions{})
+		return client.ApiextensionsV1().CustomResourceDefinitions().Delete(ctx, name, deleteOptions)
 	case "crs":
-		return e.deleteCR(ctx, query)
+		return e.deleteCR(ctx, query, deleteOptions)
 	default:
-		return fmt.Errorf("%w: %s", ErrUnsupportedActionResource, resource)
+		fetcher := NewResourceFetcher(e.clients)
+		target, err := fetcher.resolveDiscoveredResource(ctx, query.KubeContext, resource)
+		if err != nil {
+			return err
+		}
+		dyn, err := e.clients.DynamicForContext(query.KubeContext)
+		if err != nil {
+			return err
+		}
+		handle := dyn.Resource(target.GVR)
+		if target.Namespaced {
+			ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
+			if err != nil {
+				return err
+			}
+			return handle.Namespace(ns).Delete(ctx, name, deleteOptions)
+		}
+		return handle.Delete(ctx, name, deleteOptions)
 	}
 }
 
@@ -201,7 +189,7 @@ func (e *ActionExecutor) RolloutRestart(ctx context.Context, query protocol.Acti
 	}
 }
 
-func (e *ActionExecutor) deleteCR(ctx context.Context, query protocol.ActionQuery) error {
+func (e *ActionExecutor) deleteCR(ctx context.Context, query protocol.ActionQuery, deleteOptions metav1.DeleteOptions) error {
 	if strings.TrimSpace(query.Filter) == "" {
 		return fmt.Errorf("%w: crd filter is required for cr delete", ErrActionValidation)
 	}
@@ -235,9 +223,21 @@ func (e *ActionExecutor) deleteCR(ctx context.Context, query protocol.ActionQuer
 		if err != nil {
 			return err
 		}
-		return resource.Namespace(ns).Delete(ctx, name, metav1.DeleteOptions{})
+		return resource.Namespace(ns).Delete(ctx, name, deleteOptions)
 	}
-	return resource.Delete(ctx, name, metav1.DeleteOptions{})
+	return resource.Delete(ctx, name, deleteOptions)
+}
+
+func deleteOptionsForAction(force bool) metav1.DeleteOptions {
+	if !force {
+		return metav1.DeleteOptions{}
+	}
+	zero := int64(0)
+	policy := metav1.DeletePropagationForeground
+	return metav1.DeleteOptions{
+		GracePeriodSeconds: &zero,
+		PropagationPolicy:  &policy,
+	}
 }
 
 func resolveActionNamespace(viewNamespace string, itemNamespace string) (string, error) {
