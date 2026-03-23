@@ -116,6 +116,7 @@ type ResourceDetailPayload struct {
 	Found         bool          `json:"found"`
 	Item          *ResourceItem `json:"item,omitempty"`
 	Overview      []DetailField `json:"overview,omitempty"`
+	NodePods      []DetailChild `json:"nodePods,omitempty"`
 	Children      []DetailChild `json:"children,omitempty"`
 	YAML          string        `json:"yaml,omitempty"`
 	Freshness     FreshnessMeta `json:"freshness"`

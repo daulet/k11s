@@ -1,14 +1,18 @@
 package kube
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/daulet/k11s/internal/protocol"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/watch"
 )
 
 func TestDiscoveryLookupFromAPIResourceListsResolvesAliases(t *testing.T) {
@@ -390,6 +394,128 @@ func TestResolveListNamespace(t *testing.T) {
 		if apiNS != tc.wantAPI || displayNS != tc.wantDisplay {
 			t.Fatalf("input=%q expected (%q,%q) got (%q,%q)", tc.in, tc.wantAPI, tc.wantDisplay, apiNS, displayNS)
 		}
+	}
+}
+
+func TestRunListWatchLoopWatchOpenErrorFallsBackToRelistWithoutOnError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	listCalls := 0
+	updateCalls := 0
+	onErrorCalls := 0
+
+	err := runListWatchLoop(
+		ctx,
+		func() ([]protocol.ResourceItem, string, error) {
+			listCalls++
+			if listCalls == 2 {
+				cancel()
+			}
+			return []protocol.ResourceItem{{Name: "node-a"}}, "1", nil
+		},
+		func(resourceVersion string) (watch.Interface, error) {
+			return nil, errors.New("unknown")
+		},
+		func(items []protocol.ResourceItem) {
+			updateCalls++
+		},
+		func(err error) {
+			onErrorCalls++
+		},
+	)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected relist on watch open failure, listCalls=%d", listCalls)
+	}
+	if updateCalls < 2 {
+		t.Fatalf("expected update after relist fallback, updateCalls=%d", updateCalls)
+	}
+	if onErrorCalls != 0 {
+		t.Fatalf("expected no onError callbacks when relist succeeds, got %d", onErrorCalls)
+	}
+}
+
+func TestRunListWatchLoopWatchErrorEventFallsBackToRelistWithoutOnError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fakeWatcher := watch.NewFake()
+	listCalls := 0
+	watchCalls := 0
+	onErrorCalls := 0
+
+	err := runListWatchLoop(
+		ctx,
+		func() ([]protocol.ResourceItem, string, error) {
+			listCalls++
+			if listCalls == 2 {
+				cancel()
+			}
+			return []protocol.ResourceItem{{Name: "node-a"}}, "1", nil
+		},
+		func(resourceVersion string) (watch.Interface, error) {
+			watchCalls++
+			go func() {
+				fakeWatcher.Error(&metav1.Status{
+					Status: metav1.StatusFailure,
+					Reason: metav1.StatusReasonUnknown,
+				})
+			}()
+			return fakeWatcher, nil
+		},
+		func(items []protocol.ResourceItem) {},
+		func(err error) {
+			onErrorCalls++
+		},
+	)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if watchCalls != 1 {
+		t.Fatalf("expected single watch attempt, got %d", watchCalls)
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected relist after watch error event, listCalls=%d", listCalls)
+	}
+	if onErrorCalls != 0 {
+		t.Fatalf("expected no onError callbacks when relist succeeds, got %d", onErrorCalls)
+	}
+}
+
+func TestRunListWatchLoopWatchOpenErrorReportsRelistFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	expectedListErr := errors.New("list failed")
+	var reportedErr error
+	listCalls := 0
+
+	err := runListWatchLoop(
+		ctx,
+		func() ([]protocol.ResourceItem, string, error) {
+			listCalls++
+			if listCalls == 1 {
+				return []protocol.ResourceItem{{Name: "node-a"}}, "1", nil
+			}
+			cancel()
+			return nil, "", expectedListErr
+		},
+		func(resourceVersion string) (watch.Interface, error) {
+			return nil, errors.New("unknown")
+		},
+		func(items []protocol.ResourceItem) {},
+		func(err error) {
+			reportedErr = err
+		},
+	)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if !errors.Is(reportedErr, expectedListErr) {
+		t.Fatalf("expected relist error to be reported, got %v", reportedErr)
 	}
 }
 

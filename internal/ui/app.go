@@ -179,6 +179,7 @@ type detailTabKind string
 
 const (
 	detailTabOverview detailTabKind = "overview"
+	detailTabNodePods detailTabKind = "pods"
 	detailTabOwned    detailTabKind = "owned"
 	detailTabYAML     detailTabKind = "yaml"
 )
@@ -526,6 +527,7 @@ type model struct {
 	podViewRequestSeq      int
 	podViewActiveSeq       int
 	detail                 protocol.ResourceDetailPayload
+	detailKubeContext      string
 	detailLoading          bool
 	detailRequestSeq       int
 	detailActiveSeq        int
@@ -535,6 +537,7 @@ type model struct {
 	resourceViewTab        int
 	resourceScroll         int
 	resourceChildIndex     int
+	resourceNodePodIndex   int
 	actionLoading          bool
 	actionRequestSeq       int
 	actionActiveSeq        int
@@ -779,6 +782,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detail = msg.payload
 		m.resourceViewErr = ""
 		m.ensureDetailOwnedSelection()
+		m.ensureDetailNodePodsSelection()
 		m.updateResourceFlashing(previousDetail, msg.payload)
 		if msg.announce {
 			if m.resourceViewOpen {
@@ -826,7 +830,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.payload.Found {
 				m.commandMessage = fmt.Sprintf("pod view loaded: %s/%s", msg.payload.Namespace, msg.payload.Name)
 			} else {
-				m.commandMessage = fmt.Sprintf("pod not found: %s/%s", msg.payload.Namespace, msg.payload.Name)
+				m.commandMessage = fmt.Sprintf(
+					"pod not found in %s: %s/%s",
+					defaultDash(msg.payload.KubeContext),
+					msg.payload.Namespace,
+					msg.payload.Name,
+				)
 			}
 		}
 		if m.isPodLogsTabActive() && msg.announce {
@@ -1171,6 +1180,8 @@ func (m model) updatePodViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) updateResourceViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	tab, _ := m.activeDetailTab()
+	ownedTab := tab.kind == detailTabOwned
+	nodePodsTab := tab.kind == detailTabNodePods
 	switch {
 	case key.Matches(msg, m.keys.SearchNext):
 		if !m.jumpToSearchMatch(1) {
@@ -1207,48 +1218,75 @@ func (m model) updateResourceViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.stepResourceViewTab(-1)
 		return m, nil
 	case key.Matches(msg, m.keys.Detail):
-		if tab.kind == detailTabOwned {
+		if ownedTab {
 			return m.selectOwnedResourceFromDetail("enter")
+		}
+		if nodePodsTab {
+			return m.selectNodePodFromDetail("enter")
 		}
 		return m.startDetailReload(true)
 	case key.Matches(msg, m.keys.JumpUp):
-		if tab.kind == detailTabOwned {
+		if ownedTab {
 			m.stepDetailOwnedSelection(-10)
+			return m, nil
+		}
+		if nodePodsTab {
+			m.stepDetailNodePodSelection(-10)
 			return m, nil
 		}
 		m.scrollResourceContent(-m.resourceScrollJumpDelta())
 		return m, nil
 	case key.Matches(msg, m.keys.JumpDown):
-		if tab.kind == detailTabOwned {
+		if ownedTab {
 			m.stepDetailOwnedSelection(10)
+			return m, nil
+		}
+		if nodePodsTab {
+			m.stepDetailNodePodSelection(10)
 			return m, nil
 		}
 		m.scrollResourceContent(m.resourceScrollJumpDelta())
 		return m, nil
 	case key.Matches(msg, m.keys.Up):
-		if tab.kind == detailTabOwned {
+		if ownedTab {
 			m.stepDetailOwnedSelection(-1)
+			return m, nil
+		}
+		if nodePodsTab {
+			m.stepDetailNodePodSelection(-1)
 			return m, nil
 		}
 		m.scrollResourceContent(-1)
 		return m, nil
 	case key.Matches(msg, m.keys.Down):
-		if tab.kind == detailTabOwned {
+		if ownedTab {
 			m.stepDetailOwnedSelection(1)
+			return m, nil
+		}
+		if nodePodsTab {
+			m.stepDetailNodePodSelection(1)
 			return m, nil
 		}
 		m.scrollResourceContent(1)
 		return m, nil
 	case msg.String() == "g" || msg.String() == "home":
-		if tab.kind == detailTabOwned {
+		if ownedTab {
 			m.selectDetailOwnedAt(0)
+			return m, nil
+		}
+		if nodePodsTab {
+			m.selectDetailNodePodAt(0)
 			return m, nil
 		}
 		m.scrollResourceToTop()
 		return m, nil
 	case msg.String() == "G" || msg.String() == "end":
-		if tab.kind == detailTabOwned {
+		if ownedTab {
 			m.selectDetailOwnedAt(len(m.detail.Children) - 1)
+			return m, nil
+		}
+		if nodePodsTab {
+			m.selectDetailNodePodAt(len(m.detail.NodePods) - 1)
 			return m, nil
 		}
 		m.scrollResourceToBottom()
@@ -1549,16 +1587,35 @@ func (m model) selectOwnedResourceFromDetail(via string) (tea.Model, tea.Cmd) {
 		m.commandMessage = "no owned resource selected"
 		return m, nil
 	}
+	return m.openDetailChildFromDetail(child, via, "owned")
+}
 
+func (m model) selectNodePodFromDetail(via string) (tea.Model, tea.Cmd) {
+	child, ok := m.activeDetailNodePod()
+	if !ok {
+		m.commandMessage = "no pod selected on node"
+		return m, nil
+	}
+	if strings.TrimSpace(child.Resource) == "" {
+		child.Resource = "pods"
+	}
+	return m.openDetailChildFromDetail(child, via, "node pod")
+}
+
+func (m model) openDetailChildFromDetail(child protocol.DetailChild, via string, source string) (tea.Model, tea.Cmd) {
 	previousSession := m.session
+	kubeContext := strings.TrimSpace(m.detailKubeContext)
+	if kubeContext == "" {
+		kubeContext = strings.TrimSpace(m.session.KubeContext)
+	}
 	resource := strings.ToLower(strings.TrimSpace(child.Resource))
 	if resource == "" {
-		m.commandMessage = "selected owned resource has no type"
+		m.commandMessage = "selected " + source + " has no type"
 		return m, nil
 	}
 	name := strings.TrimSpace(child.Name)
 	if name == "" {
-		m.commandMessage = "selected owned resource has no name"
+		m.commandMessage = "selected " + source + " has no name"
 		return m, nil
 	}
 
@@ -1583,22 +1640,29 @@ func (m model) selectOwnedResourceFromDetail(via string) (tea.Model, tea.Cmd) {
 
 	if resource == "pods" && m.loadPodView != nil {
 		if strings.TrimSpace(itemNamespace) == "" {
-			m.commandMessage = "pod view requires a concrete namespace for owned pod"
+			m.commandMessage = "pod view requires a concrete namespace for selected pod"
 			return m, nil
 		}
 		m.clearDetail()
-		m.commandMessage = fmt.Sprintf("opening owned pod %s/%s via %s...", itemNamespace, name, via)
+		m.commandMessage = fmt.Sprintf(
+			"opening %s pod %s/%s in %s via %s...",
+			source,
+			itemNamespace,
+			name,
+			defaultDash(kubeContext),
+			via,
+		)
 		return m.startPodViewReloadWithQuery(protocol.PodViewQuery{
-			KubeContext: m.session.KubeContext,
+			KubeContext: kubeContext,
 			Namespace:   itemNamespace,
 			Name:        name,
 		}, true)
 	}
 
-	m.commandMessage = fmt.Sprintf("opening owned %s/%s via %s...", resource, name, via)
+	m.commandMessage = fmt.Sprintf("opening %s %s/%s via %s...", source, resource, name, via)
 
 	query := protocol.ResourceDetailQuery{
-		KubeContext:   m.session.KubeContext,
+		KubeContext:   kubeContext,
 		Resource:      m.session.Resource,
 		Namespace:     effectiveNamespace(m.session.Resource, m.session.Namespace),
 		Filter:        m.session.Filter,
@@ -1647,8 +1711,13 @@ func (m *model) stepResourceViewTab(step int) {
 	}
 	m.resourceViewTab = normalizedAutocompleteIndex(m.resourceViewTab+step, len(tabs))
 	m.resourceScroll = 0
-	if tab, ok := m.activeDetailTab(); ok && tab.kind == detailTabOwned {
-		m.ensureDetailOwnedSelection()
+	if tab, ok := m.activeDetailTab(); ok {
+		switch tab.kind {
+		case detailTabOwned:
+			m.ensureDetailOwnedSelection()
+		case detailTabNodePods:
+			m.ensureDetailNodePodsSelection()
+		}
 	}
 }
 
@@ -1659,6 +1728,16 @@ func (m *model) ensureDetailOwnedSelection() {
 	}
 	if m.resourceChildIndex < 0 || m.resourceChildIndex >= len(m.detail.Children) {
 		m.resourceChildIndex = 0
+	}
+}
+
+func (m *model) ensureDetailNodePodsSelection() {
+	if len(m.detail.NodePods) == 0 {
+		m.resourceNodePodIndex = 0
+		return
+	}
+	if m.resourceNodePodIndex < 0 || m.resourceNodePodIndex >= len(m.detail.NodePods) {
+		m.resourceNodePodIndex = 0
 	}
 }
 
@@ -1678,7 +1757,7 @@ func (m *model) stepDetailOwnedSelection(step int) {
 		next = len(m.detail.Children) - 1
 	}
 	m.resourceChildIndex = next
-	m.adjustResourceScrollForOwnedSelection()
+	m.adjustResourceScrollForDetailSelection()
 }
 
 func (m *model) selectDetailOwnedAt(index int) {
@@ -1693,7 +1772,7 @@ func (m *model) selectDetailOwnedAt(index int) {
 		index = len(m.detail.Children) - 1
 	}
 	m.resourceChildIndex = index
-	m.adjustResourceScrollForOwnedSelection()
+	m.adjustResourceScrollForDetailSelection()
 }
 
 func (m *model) activeDetailOwnedResource() (protocol.DetailChild, bool) {
@@ -1704,8 +1783,50 @@ func (m *model) activeDetailOwnedResource() (protocol.DetailChild, bool) {
 	return m.detail.Children[m.resourceChildIndex], true
 }
 
-func (m *model) adjustResourceScrollForOwnedSelection() {
-	rowLine, ok := m.detailOwnedSelectionLine()
+func (m *model) stepDetailNodePodSelection(step int) {
+	if step == 0 {
+		return
+	}
+	m.ensureDetailNodePodsSelection()
+	if len(m.detail.NodePods) == 0 {
+		return
+	}
+	next := m.resourceNodePodIndex + step
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(m.detail.NodePods) {
+		next = len(m.detail.NodePods) - 1
+	}
+	m.resourceNodePodIndex = next
+	m.adjustResourceScrollForDetailSelection()
+}
+
+func (m *model) selectDetailNodePodAt(index int) {
+	if len(m.detail.NodePods) == 0 {
+		m.resourceNodePodIndex = 0
+		return
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(m.detail.NodePods) {
+		index = len(m.detail.NodePods) - 1
+	}
+	m.resourceNodePodIndex = index
+	m.adjustResourceScrollForDetailSelection()
+}
+
+func (m *model) activeDetailNodePod() (protocol.DetailChild, bool) {
+	m.ensureDetailNodePodsSelection()
+	if len(m.detail.NodePods) == 0 {
+		return protocol.DetailChild{}, false
+	}
+	return m.detail.NodePods[m.resourceNodePodIndex], true
+}
+
+func (m *model) adjustResourceScrollForDetailSelection() {
+	rowLine, ok := m.detailSelectionLine()
 	if !ok {
 		return
 	}
@@ -1735,6 +1856,13 @@ func (m *model) adjustResourceScrollForOwnedSelection() {
 	if m.resourceScroll > maxScroll {
 		m.resourceScroll = maxScroll
 	}
+}
+
+func (m model) detailSelectionLine() (int, bool) {
+	if line, ok := m.detailOwnedSelectionLine(); ok {
+		return line, true
+	}
+	return m.detailNodePodsSelectionLine()
 }
 
 func (m *model) ensurePodViewLogSelection() {
@@ -1985,12 +2113,23 @@ func (m model) podTabs() []podTabEntry {
 func (m model) detailTabs() []detailTabEntry {
 	tabs := []detailTabEntry{
 		{kind: detailTabOverview, label: "overview"},
-		{kind: detailTabOwned, label: "owned"},
 	}
+	if m.isNodeDetailResource() {
+		tabs = append(tabs, detailTabEntry{kind: detailTabNodePods, label: "pods"})
+	}
+	tabs = append(tabs, detailTabEntry{kind: detailTabOwned, label: "owned"})
 	if strings.TrimSpace(m.detail.YAML) != "" {
 		tabs = append(tabs, detailTabEntry{kind: detailTabYAML, label: "yaml"})
 	}
 	return tabs
+}
+
+func (m model) isNodeDetailResource() bool {
+	resource := normalizeResourceInput(m.detail.Resource)
+	if resource == "" {
+		resource = normalizeResourceInput(m.session.Resource)
+	}
+	return resource == "nodes"
 }
 
 func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2070,6 +2209,16 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m.startAction(actionQuery)
+		}
+		if invocation, handled, openErr := m.directOpenInvocationFromCommand(commandText); handled {
+			if openErr != nil {
+				m.enterCommandMode()
+				m.input.SetValue(commandText)
+				m.commandMessage = openErr.Error()
+				m.suggestions = m.commandSuggestions(m.input.Value())
+				return m, nil
+			}
+			return m.startDirectOpen(invocation, "command")
 		}
 
 		previousContext := m.session.KubeContext
@@ -2756,6 +2905,153 @@ type editInvocation struct {
 	namespace     string
 }
 
+type directOpenInvocation struct {
+	resource      string
+	name          string
+	itemNamespace string
+	scopeKnown    bool
+	usesNamespace bool
+}
+
+func (m model) directOpenInvocationFromCommand(input string) (directOpenInvocation, bool, error) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return directOpenInvocation{}, false, nil
+	}
+
+	command := strings.ToLower(strings.TrimSpace(fields[0]))
+	resource := ""
+	targetToken := ""
+	scopeKnown := false
+
+	switch command {
+	case "resource":
+		if len(fields) < 3 {
+			return directOpenInvocation{}, false, nil
+		}
+		resolved, ok := canonicalResourceName(fields[1])
+		if !ok {
+			resolved = normalizeResourceInput(fields[1])
+			if resolved == "" {
+				return directOpenInvocation{}, true, fmt.Errorf("unknown resource %q", fields[1])
+			}
+		} else {
+			scopeKnown = true
+		}
+		resource = resolved
+		targetToken = strings.TrimSpace(fields[2])
+		if len(fields) > 3 {
+			return directOpenInvocation{}, true, fmt.Errorf("resource open accepts one target: try `:resource %s <name>`", resource)
+		}
+	default:
+		resolved, ok := canonicalResourceName(command)
+		if !ok || len(fields) < 2 {
+			return directOpenInvocation{}, false, nil
+		}
+		if resolved == "crs" || resolved == "crds" {
+			return directOpenInvocation{}, false, nil
+		}
+		scopeKnown = true
+		resource = resolved
+		targetToken = strings.TrimSpace(fields[1])
+		if len(fields) > 2 {
+			return directOpenInvocation{}, true, fmt.Errorf("%s open accepts one target: try `:%s <name>`", command, command)
+		}
+	}
+
+	if targetToken == "" {
+		return directOpenInvocation{}, true, fmt.Errorf("target name is required")
+	}
+	name, itemNamespace, err := m.actionTargetFromFields([]string{targetToken})
+	if err != nil {
+		return directOpenInvocation{}, true, err
+	}
+
+	usesNamespace := resourceUsesNamespace(resource)
+	if scopeKnown && usesNamespace {
+		if itemNamespace == "" {
+			namespace := strings.TrimSpace(m.session.Namespace)
+			if namespace != "" && !strings.EqualFold(namespace, "all") {
+				itemNamespace = namespace
+			}
+		}
+	}
+	if scopeKnown && !usesNamespace {
+		itemNamespace = ""
+	}
+
+	if resource == "pods" && itemNamespace == "" {
+		return directOpenInvocation{}, true, fmt.Errorf("pod target requires namespace: use `:pod <namespace>/<name>` when namespace is all")
+	}
+
+	return directOpenInvocation{
+		resource:      resource,
+		name:          name,
+		itemNamespace: itemNamespace,
+		scopeKnown:    scopeKnown,
+		usesNamespace: usesNamespace,
+	}, true, nil
+}
+
+func (m model) startDirectOpen(invocation directOpenInvocation, via string) (tea.Model, tea.Cmd) {
+	previousSession := m.session
+	resource := normalizeResourceInput(invocation.resource)
+	if resource == "" {
+		resource = "pods"
+	}
+	name := strings.TrimSpace(invocation.name)
+	itemNamespace := normalizeItemNamespace(invocation.itemNamespace)
+
+	m.session.Resource = resource
+	if invocation.scopeKnown && invocation.usesNamespace && itemNamespace != "" {
+		m.session.Namespace = itemNamespace
+	}
+	m.session.Selection = name
+	m.pushNavigationHistory(previousSession)
+	m.clearPodView()
+	m.clearDetail()
+	m.clearFlashingItems()
+
+	target := name
+	if itemNamespace != "" {
+		target = itemNamespace + "/" + name
+	}
+
+	if resource == "pods" && m.loadPodView != nil {
+		if itemNamespace == "" {
+			m.commandMessage = "pod target requires namespace"
+			return m, nil
+		}
+		m.commandMessage = fmt.Sprintf("opening pod %s via %s...", target, via)
+		return m.startPodViewReloadWithQuery(protocol.PodViewQuery{
+			KubeContext: m.session.KubeContext,
+			Namespace:   itemNamespace,
+			Name:        name,
+		}, true)
+	}
+
+	m.commandMessage = fmt.Sprintf("opening %s %s via %s...", resource, target, via)
+	queryNamespace := effectiveNamespace(resource, m.session.Namespace)
+	if itemNamespace != "" {
+		queryNamespace = itemNamespace
+	}
+	if invocation.scopeKnown && !invocation.usesNamespace {
+		queryNamespace = "all"
+	}
+	if !invocation.scopeKnown && itemNamespace == "" {
+		queryNamespace = "all"
+	}
+	return m.startDetailReloadWithQuery(protocol.ResourceDetailQuery{
+		KubeContext:   m.session.KubeContext,
+		Resource:      resource,
+		Namespace:     queryNamespace,
+		Filter:        m.session.Filter,
+		ItemNamespace: itemNamespace,
+		Name:          name,
+		SimulateStale: m.simulateStale,
+	}, true)
+}
+
 func (m model) deleteQueryFromCommand(input string) (query protocol.ActionQuery, executeNow bool, handled bool, err error) {
 	fields := strings.Fields(input)
 	if len(fields) == 0 {
@@ -3308,6 +3604,7 @@ func (m model) startDetailReload(announce bool) (tea.Model, tea.Cmd) {
 func (m model) startDetailReloadWithQuery(query protocol.ResourceDetailQuery, announce bool) (tea.Model, tea.Cmd) {
 	m.detailRequestSeq++
 	m.detailActiveSeq = m.detailRequestSeq
+	m.detailKubeContext = strings.TrimSpace(query.KubeContext)
 	m.resourceViewOpen = true
 	m.resourceViewErr = ""
 	sameResource := strings.EqualFold(strings.TrimSpace(m.detail.Resource), strings.TrimSpace(query.Resource)) &&
@@ -3318,9 +3615,11 @@ func (m model) startDetailReloadWithQuery(query protocol.ResourceDetailQuery, an
 		m.resourceViewTab = 0
 		m.resourceScroll = 0
 		m.resourceChildIndex = 0
+		m.resourceNodePodIndex = 0
 		m.resourceFlashingFields = map[string]time.Time{}
 	} else {
 		m.ensureDetailOwnedSelection()
+		m.ensureDetailNodePodsSelection()
 	}
 	m.detailLoading = true
 	m.resourceViewLoading = showLoading
@@ -4141,6 +4440,8 @@ func (m model) resourceViewContentLines(innerWidth int, innerHeight int) []strin
 	switch tab.kind {
 	case detailTabOverview:
 		return m.detailOverviewLines(contentWidth)
+	case detailTabNodePods:
+		return m.detailNodePodsLines(contentWidth)
 	case detailTabOwned:
 		return m.detailOwnedLines(contentWidth)
 	case detailTabYAML:
@@ -4220,6 +4521,51 @@ func (m model) detailOwnedLines(width int) []string {
 	return lines
 }
 
+func (m model) detailNodePodsLines(width int) []string {
+	lines := make([]string, 0, len(m.detail.NodePods)+4)
+	if len(m.detail.NodePods) == 0 {
+		lines = append(lines, m.renderDetailFieldLine("nodePods", "pods on node: -"))
+		return lines
+	}
+
+	contextLabel := defaultDash(strings.TrimSpace(m.detailKubeContext))
+	lines = append(
+		lines,
+		m.renderDetailFieldLine("nodePods", fmt.Sprintf("pods on node in %s (%d):", contextLabel, len(m.detail.NodePods))),
+	)
+	const (
+		podNamespaceWidth = 20
+		podStatusWidth    = 16
+	)
+	header := fmt.Sprintf(
+		"  %-*s %-*s %s",
+		podNamespaceWidth,
+		"namespace",
+		podStatusWidth,
+		"status",
+		"name",
+	)
+	lines = append(lines, m.styles.ColumnHeader.Render(fitToWidth(header, width)))
+	for idx, pod := range m.detail.NodePods {
+		row := fmt.Sprintf(
+			"  %-*s %-*s %s",
+			podNamespaceWidth,
+			defaultDash(pod.Namespace),
+			podStatusWidth,
+			defaultDash(pod.Status),
+			defaultDash(pod.Name),
+		)
+		row = fitToWidth(row, width)
+		if idx == m.resourceNodePodIndex {
+			row = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(row, "  "))
+		} else if m.isResourceFieldFlashing("nodePods") {
+			row = m.styles.ChangedRow.Render(row)
+		}
+		lines = append(lines, row)
+	}
+	return lines
+}
+
 func (m model) detailOwnedSelectionLine() (int, bool) {
 	tab, ok := m.activeDetailTab()
 	if !ok || tab.kind != detailTabOwned {
@@ -4233,6 +4579,24 @@ func (m model) detailOwnedSelectionLine() (int, bool) {
 		return 0, false
 	}
 	// 0: "owned resources (n):"
+	// 1: table header
+	// 2..: rows
+	return 2 + idx, true
+}
+
+func (m model) detailNodePodsSelectionLine() (int, bool) {
+	tab, ok := m.activeDetailTab()
+	if !ok || tab.kind != detailTabNodePods {
+		return 0, false
+	}
+	if len(m.detail.NodePods) == 0 {
+		return 0, false
+	}
+	idx := m.resourceNodePodIndex
+	if idx < 0 || idx >= len(m.detail.NodePods) {
+		return 0, false
+	}
+	// 0: "pods on node (n):"
 	// 1: table header
 	// 2..: rows
 	return 2 + idx, true
@@ -5392,7 +5756,7 @@ func (m model) legendHints() []string {
 			": cmd",
 			"q quit",
 		}
-		if tab, ok := m.activeDetailTab(); ok && tab.kind == detailTabOwned {
+		if tab, ok := m.activeDetailTab(); ok && (tab.kind == detailTabOwned || tab.kind == detailTabNodePods) {
 			hints = append(hints, "enter select")
 		}
 		return hints
@@ -5511,12 +5875,10 @@ func renderPane(width int, innerHeight int, lines []string, paneStyle lipgloss.S
 		if i < len(lines) {
 			content = lines[i]
 		}
-		content = fitToWidth(content, contentWidth)
-		padding := maxInt(0, contentWidth-lipgloss.Width(content))
-		body = append(body, content+strings.Repeat(" ", padding))
+		body = append(body, fitDisplayWidth(content, contentWidth))
 	}
 
-	return paneStyle.Width(contentWidth).Render(strings.Join(body, "\n"))
+	return paneStyle.Width(width).Render(strings.Join(body, "\n"))
 }
 
 func viewportLines(lines []string, offset int, height int) []string {
@@ -5578,6 +5940,9 @@ func fitDisplayWidth(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\n", " ")
+	value = strings.ReplaceAll(value, "\t", " ")
 	if lipgloss.Width(value) > width {
 		value = ansi.Truncate(value, width, "")
 	}
@@ -5781,11 +6146,13 @@ func (m *model) clearDetail() {
 	m.detailLoading = false
 	m.resourceViewLoading = false
 	m.detail = protocol.ResourceDetailPayload{}
+	m.detailKubeContext = ""
 	m.resourceViewOpen = false
 	m.resourceViewErr = ""
 	m.resourceViewTab = 0
 	m.resourceScroll = 0
 	m.resourceChildIndex = 0
+	m.resourceNodePodIndex = 0
 	m.resourceFlashingFields = map[string]time.Time{}
 	m.clearLogs()
 }
@@ -6022,6 +6389,9 @@ func (m *model) updateResourceFlashing(previous protocol.ResourceDetailPayload, 
 
 	if !detailChildrenEqual(previous.Children, next.Children) {
 		mark("children")
+	}
+	if !detailChildrenEqual(previous.NodePods, next.NodePods) {
+		mark("nodePods")
 	}
 	if strings.TrimSpace(previous.YAML) != strings.TrimSpace(next.YAML) {
 		mark("yaml")
@@ -6363,8 +6733,18 @@ func (m model) commandSuggestions(input string) []string {
 		}
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "resource":
-		return prefixMatches(resourceSuggestions(), valuePrefix)
+		if len(fields) <= 1 || (len(fields) == 2 && !hasTrailingSpace) {
+			return prefixMatches(resourceSuggestions(), valuePrefix)
+		}
+		resolved, ok := canonicalResourceName(fields[1])
+		if !ok {
+			resolved = normalizeResourceInput(fields[1])
+		}
+		return prefixMatches(m.directOpenCandidates(resolved), valuePrefix)
 	default:
+		if resolved, ok := canonicalResourceName(command); ok {
+			return prefixMatches(m.directOpenCandidates(resolved), valuePrefix)
+		}
 		return nil
 	}
 }
@@ -6734,6 +7114,21 @@ func (m model) deleteCandidates() []string {
 	return values
 }
 
+func (m model) directOpenCandidates(resource string) []string {
+	resource = normalizeResourceInput(resource)
+	if resource == "" {
+		return nil
+	}
+	current := normalizeResourceInput(m.resourceList.Resource)
+	if current == "" {
+		current = normalizeResourceInput(m.session.Resource)
+	}
+	if !strings.EqualFold(resource, current) {
+		return nil
+	}
+	return m.deleteCandidates()
+}
+
 func baseSuggestions() []string {
 	return []string{
 		"ctx",
@@ -7041,8 +7436,15 @@ func isLogsFollowToken(value string) bool {
 }
 
 func commandSupportsArgument(token string) bool {
-	switch strings.ToLower(strings.TrimSpace(token)) {
-	case "ns", "namespace", "ctx", "context", "resource", "cr", "crs", "crd", "filter", "customresource", "customresources", "delete", "del", "rm", "edit", "logs", "scale", "restart", "rollout":
+	token = strings.ToLower(strings.TrimSpace(token))
+	if token == "" {
+		return false
+	}
+	if _, ok := canonicalResourceName(token); ok {
+		return true
+	}
+	switch token {
+	case "ctx", "context", "resource", "filter", "delete", "del", "rm", "edit", "logs", "scale", "restart", "rollout":
 		return true
 	default:
 		return false

@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -64,6 +65,7 @@ func (f *ResourceDetailEnricher) Enrich(
 			base.Name = strings.TrimSpace(query.Name)
 			base.Item = nil
 			base.Overview = nil
+			base.NodePods = nil
 			base.Children = nil
 			base.YAML = ""
 			if namespaced {
@@ -106,6 +108,7 @@ func (f *ResourceDetailEnricher) Enrich(
 	}
 
 	base.Overview = buildDetailOverviewFields(obj, f.now())
+	base.NodePods = f.fetchNodePods(ctx, query.KubeContext, canonicalResource, strings.TrimSpace(obj.GetName()))
 	base.Children = f.fetchOwnedChildren(ctx, query.KubeContext, canonicalResource, namespaced, itemNamespace, obj.GetUID())
 	base.YAML = buildDetailYAML(obj)
 	return base, nil
@@ -413,6 +416,66 @@ func truncateRunes(value string, maxRunes int) string {
 		return "…"
 	}
 	return string(runes[:maxRunes-1]) + "…"
+}
+
+func (f *ResourceDetailEnricher) fetchNodePods(
+	ctx context.Context,
+	kubeContext string,
+	resource string,
+	nodeName string,
+) []protocol.DetailChild {
+	if !strings.EqualFold(strings.TrimSpace(resource), "nodes") {
+		return nil
+	}
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeName == "" {
+		return nil
+	}
+
+	target, err := f.resources.resolveDiscoveredResource(ctx, kubeContext, "pods")
+	if err != nil {
+		return nil
+	}
+
+	dyn, err := f.clients.DynamicForContext(kubeContext)
+	if err != nil {
+		return nil
+	}
+
+	list, err := listDiscoveredUnstructured(
+		ctx,
+		dyn,
+		target,
+		"all",
+		metav1.ListOptions{
+			FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
+		},
+	)
+	if err != nil {
+		return nil
+	}
+
+	pods := make([]protocol.DetailChild, 0, len(list.Items))
+	for _, item := range list.Items {
+		itemNamespace := strings.TrimSpace(item.GetNamespace())
+		if itemNamespace == "" {
+			itemNamespace = "<cluster>"
+		}
+		pods = append(pods, protocol.DetailChild{
+			Resource:  "pods",
+			Namespace: itemNamespace,
+			Name:      strings.TrimSpace(item.GetName()),
+			Status:    detailStatusFromUnstructured(item),
+		})
+	}
+
+	sort.SliceStable(pods, func(i, j int) bool {
+		if pods[i].Namespace != pods[j].Namespace {
+			return pods[i].Namespace < pods[j].Namespace
+		}
+		return pods[i].Name < pods[j].Name
+	})
+	return pods
 }
 
 func (f *ResourceDetailEnricher) fetchOwnedChildren(

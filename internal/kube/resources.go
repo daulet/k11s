@@ -670,7 +670,37 @@ func runListWatchLoop(
 	}
 	onUpdate(items)
 
-	retryDelay := 500 * time.Millisecond
+	relistAndUpdate := func() error {
+		nextItems, nextResourceVersion, err := listFn()
+		if err != nil {
+			return err
+		}
+		resourceVersion = nextResourceVersion
+		onUpdate(nextItems)
+		return nil
+	}
+
+	baseRetryDelay := 500 * time.Millisecond
+	maxRetryDelay := 5 * time.Second
+	retryDelay := baseRetryDelay
+	waitRetry := func() bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(retryDelay):
+		}
+		if retryDelay < maxRetryDelay {
+			retryDelay *= 2
+			if retryDelay > maxRetryDelay {
+				retryDelay = maxRetryDelay
+			}
+		}
+		return true
+	}
+	resetRetry := func() {
+		retryDelay = baseRetryDelay
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -678,14 +708,18 @@ func runListWatchLoop(
 
 		stream, err := watchFn(resourceVersion)
 		if err != nil {
-			onError(err)
-			select {
-			case <-ctx.Done():
+			// Some API servers intermittently reject watch calls with generic
+			// errors (for example, "unknown"). Fall back to relist and only
+			// surface an error if relist itself fails.
+			if relistErr := relistAndUpdate(); relistErr != nil {
+				onError(relistErr)
+			}
+			if !waitRetry() {
 				return nil
-			case <-time.After(retryDelay):
 			}
 			continue
 		}
+		resetRetry()
 
 		relist := false
 		for !relist {
@@ -708,7 +742,6 @@ func runListWatchLoop(
 					}
 					continue
 				case watch.Error:
-					onError(fmt.Errorf("watch stream returned error event"))
 					relist = true
 					continue
 				default:
@@ -717,31 +750,25 @@ func runListWatchLoop(
 							resourceVersion = rv
 						}
 					}
-					nextItems, nextResourceVersion, err := listFn()
-					if err != nil {
+					if err := relistAndUpdate(); err != nil {
 						onError(err)
 						relist = true
 						continue
 					}
-					resourceVersion = nextResourceVersion
-					onUpdate(nextItems)
+					resetRetry()
 				}
 			}
 		}
 
 		stream.Stop()
-		nextItems, nextResourceVersion, err := listFn()
-		if err != nil {
+		if err := relistAndUpdate(); err != nil {
 			onError(err)
-			select {
-			case <-ctx.Done():
+			if !waitRetry() {
 				return nil
-			case <-time.After(retryDelay):
 			}
 			continue
 		}
-		resourceVersion = nextResourceVersion
-		onUpdate(nextItems)
+		resetRetry()
 	}
 }
 

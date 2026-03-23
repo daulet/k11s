@@ -12,6 +12,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/daulet/k11s/internal/protocol"
 )
@@ -1910,6 +1911,69 @@ func TestRenderMainPaneCentersNoItemsState(t *testing.T) {
 	}
 }
 
+func TestRenderPaneDoesNotWrapLongLines(t *testing.T) {
+	const (
+		width       = 12
+		innerHeight = 2
+	)
+	output := renderPane(width, innerHeight, []string{"this-is-a-very-long-row\nthat-must-not-wrap"}, lipgloss.NewStyle())
+	lines := strings.Split(output, "\n")
+	if len(lines) != innerHeight {
+		t.Fatalf("expected exactly %d rendered lines, got %d: %q", innerHeight, len(lines), output)
+	}
+	for i, line := range lines {
+		if w := lipgloss.Width(line); w != width {
+			t.Fatalf("expected line %d width %d, got %d: %q", i, width, w, line)
+		}
+	}
+}
+
+func TestViewHeightRemainsBoundedWithLargePodList(t *testing.T) {
+	items := make([]protocol.ResourceItem, 0, 200)
+	for i := 0; i < 200; i++ {
+		items = append(items, protocol.ResourceItem{
+			Name:      fmt.Sprintf("very-long-pod-name-%03d-with-extra-suffix-for-truncation-check", i),
+			Namespace: "inference-engine",
+			Status:    "Running",
+			Ready:     "1/1",
+			Node:      "hou1-prod1-node-01",
+			OwnerKind: "ReplicaSet",
+			OwnerName: fmt.Sprintf("some-really-long-owner-name-%03d-with-more-text", i),
+		})
+	}
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "hou1-prod1",
+			Namespace:   "inference-engine",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "inference-engine",
+			Items:     items,
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	next := updated.(model)
+	view := next.View()
+	lines := strings.Split(view, "\n")
+	if len(lines) > 30 {
+		width, _, mainInnerHeight := next.normalizedDimensions()
+		input := next.renderInputBox(width)
+		main := next.renderMainPane(width, mainInnerHeight)
+		footer := next.renderFooter(width)
+		t.Fatalf(
+			"expected view to stay within 30 lines, got %d (input=%d main=%d footer=%d)",
+			len(lines),
+			len(strings.Split(input, "\n")),
+			len(strings.Split(main, "\n")),
+			len(strings.Split(footer, "\n")),
+		)
+	}
+}
+
 func TestListLoadedFlashesChangedItems(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	m := newModel(Options{
@@ -2422,6 +2486,276 @@ func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 	}
 	if final.session.Selection != "svc-a" {
 		t.Fatalf("expected selection svc-a, got %q", final.session.Selection)
+	}
+}
+
+func TestEnterDirectNodeCommandOpensDetailWithoutListReload(t *testing.T) {
+	var detailSeen protocol.ResourceDetailQuery
+	listCalls := 0
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+			}, nil
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			detailSeen = query
+			return protocol.ResourceDetailPayload{
+				Resource:      query.Resource,
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Found:         true,
+				Item: &protocol.ResourceItem{
+					Name:      query.Name,
+					Namespace: "<cluster>",
+					Status:    "Ready",
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("node c1r4-lpu1")
+
+	updatedModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updatedModel.(model)
+	if next.loading {
+		t.Fatalf("did not expect list loading for direct node command")
+	}
+	if !next.resourceViewOpen || !next.detailLoading {
+		t.Fatalf("expected resource detail view loading, got open=%v loading=%v", next.resourceViewOpen, next.detailLoading)
+	}
+	if next.session.Resource != "nodes" || next.session.Selection != "c1r4-lpu1" {
+		t.Fatalf("expected nodes selection to be set, got resource=%q selection=%q", next.session.Resource, next.session.Selection)
+	}
+	if cmd == nil {
+		t.Fatalf("expected detail load command")
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list reload for direct node open, got %d calls", listCalls)
+	}
+
+	updatedModel, _ = next.Update(cmd())
+	final := updatedModel.(model)
+	if !final.resourceViewOpen || final.detailLoading {
+		t.Fatalf("expected loaded resource view, got open=%v loading=%v", final.resourceViewOpen, final.detailLoading)
+	}
+	if !final.detail.Found {
+		t.Fatalf("expected found detail payload")
+	}
+	if detailSeen.Resource != "nodes" || detailSeen.Name != "c1r4-lpu1" {
+		t.Fatalf("unexpected detail query: %#v", detailSeen)
+	}
+	if detailSeen.Namespace != "all" || detailSeen.ItemNamespace != "" {
+		t.Fatalf("expected cluster-scoped node query, got %#v", detailSeen)
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list reload after detail fetch, got %d calls", listCalls)
+	}
+}
+
+func TestEnterDirectPodCommandOpensPodViewWithoutListReload(t *testing.T) {
+	var podSeen protocol.PodViewQuery
+	listCalls := 0
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "all",
+			Resource:    "nodes",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "nodes",
+			Namespace: "all",
+			Items: []protocol.ResourceItem{
+				{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+			},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+			}, nil
+		},
+		LoadPodView: func(_ context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			podSeen = query
+			return protocol.PodViewPayload{
+				KubeContext: query.KubeContext,
+				Namespace:   query.Namespace,
+				Name:        query.Name,
+				Found:       true,
+				Overview:    protocol.PodOverview{Phase: "Running"},
+				Freshness:   protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("pod inference-engine/cyborg-conductor")
+
+	updatedModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updatedModel.(model)
+	if next.loading {
+		t.Fatalf("did not expect list loading for direct pod command")
+	}
+	if !next.podViewOpen || !next.podViewLoading {
+		t.Fatalf("expected pod view loading, got open=%v loading=%v", next.podViewOpen, next.podViewLoading)
+	}
+	if next.session.Resource != "pods" || next.session.Selection != "cyborg-conductor" {
+		t.Fatalf("expected pod selection to be set, got resource=%q selection=%q", next.session.Resource, next.session.Selection)
+	}
+	if next.session.Namespace != "inference-engine" {
+		t.Fatalf("expected namespace to follow direct pod target, got %q", next.session.Namespace)
+	}
+	if cmd == nil {
+		t.Fatalf("expected pod view load command")
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list reload for direct pod open, got %d calls", listCalls)
+	}
+
+	updatedModel, _ = next.Update(cmd())
+	final := updatedModel.(model)
+	if !final.podViewOpen || final.podViewLoading {
+		t.Fatalf("expected loaded pod view, got open=%v loading=%v", final.podViewOpen, final.podViewLoading)
+	}
+	if !final.podView.Found {
+		t.Fatalf("expected found pod view payload")
+	}
+	if podSeen.Name != "cyborg-conductor" || podSeen.Namespace != "inference-engine" {
+		t.Fatalf("unexpected pod query: %#v", podSeen)
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list reload after pod fetch, got %d calls", listCalls)
+	}
+}
+
+func TestEnterDirectPodCommandRequiresNamespaceWhenAll(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "all",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "all",
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("pod cyborg-conductor")
+
+	updatedModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updatedModel.(model)
+	if cmd != nil {
+		t.Fatalf("expected no async command on validation failure")
+	}
+	if !next.commandMode {
+		t.Fatalf("expected command mode to remain open")
+	}
+	if !strings.Contains(strings.ToLower(next.commandMessage), "requires namespace") {
+		t.Fatalf("expected namespace validation message, got %q", next.commandMessage)
+	}
+}
+
+func TestEnterDirectGenericResourceCommandUsesAllNamespace(t *testing.T) {
+	var detailSeen protocol.ResourceDetailQuery
+	listCalls := 0
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+			}, nil
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			detailSeen = query
+			return protocol.ResourceDetailPayload{
+				Resource:      query.Resource,
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Found:         true,
+				Item: &protocol.ResourceItem{
+					Name:      query.Name,
+					Namespace: "<cluster>",
+					Status:    "Ready",
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("resource ingressclasses public")
+
+	updatedModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updatedModel.(model)
+	if next.loading {
+		t.Fatalf("did not expect list loading for direct generic resource command")
+	}
+	if !next.resourceViewOpen || !next.detailLoading {
+		t.Fatalf("expected resource view loading, got open=%v loading=%v", next.resourceViewOpen, next.detailLoading)
+	}
+	if next.session.Resource != "ingressclasses" || next.session.Selection != "public" {
+		t.Fatalf("expected generic resource selection set, got resource=%q selection=%q", next.session.Resource, next.session.Selection)
+	}
+	if cmd == nil {
+		t.Fatalf("expected detail load command")
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list reload for direct generic open, got %d calls", listCalls)
+	}
+
+	updatedModel, _ = next.Update(cmd())
+	final := updatedModel.(model)
+	if !final.resourceViewOpen || final.detailLoading {
+		t.Fatalf("expected loaded resource view, got open=%v loading=%v", final.resourceViewOpen, final.detailLoading)
+	}
+	if !final.detail.Found {
+		t.Fatalf("expected found detail payload")
+	}
+	if detailSeen.Resource != "ingressclasses" || detailSeen.Name != "public" {
+		t.Fatalf("unexpected detail query: %#v", detailSeen)
+	}
+	if detailSeen.Namespace != "all" || detailSeen.ItemNamespace != "" {
+		t.Fatalf("expected generic direct-open query namespace=all without item namespace, got %#v", detailSeen)
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list reload after detail fetch, got %d calls", listCalls)
 	}
 }
 
@@ -3140,6 +3474,205 @@ func TestEnterInNonPodViewOpensResourceExplorer(t *testing.T) {
 	closed := updated.(model)
 	if closed.resourceViewOpen {
 		t.Fatalf("expected resource view closed on esc")
+	}
+}
+
+func TestNodeResourceViewAddsPodsTabAsSecondTab(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "all",
+			Resource:    "nodes",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "nodes",
+			Namespace: "all",
+			Items: []protocol.ResourceItem{
+				{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.resourceViewOpen = true
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "nodes",
+		Namespace:     "all",
+		ItemNamespace: "<cluster>",
+		Name:          "node-a",
+		Found:         true,
+		Item: &protocol.ResourceItem{
+			Name:      "node-a",
+			Namespace: "<cluster>",
+			Status:    "Ready",
+		},
+		NodePods: []protocol.DetailChild{
+			{Resource: "pods", Namespace: "default", Name: "api-0", Status: "Running"},
+		},
+		YAML:      "apiVersion: v1\nkind: Node\nmetadata:\n  name: node-a",
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+
+	tabs := m.detailTabs()
+	if len(tabs) < 4 {
+		t.Fatalf("expected overview/pods/owned/yaml tabs, got %#v", tabs)
+	}
+	if tabs[0].kind != detailTabOverview || tabs[1].kind != detailTabNodePods || tabs[2].kind != detailTabOwned {
+		t.Fatalf("unexpected tab order: %#v", tabs)
+	}
+}
+
+func TestEnterInNodePodsTabOpensPodView(t *testing.T) {
+	var podSeen []protocol.PodViewQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "all",
+			Resource:    "nodes",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "nodes",
+			Namespace: "all",
+			Items: []protocol.ResourceItem{
+				{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadPodView: func(_ context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			podSeen = append(podSeen, query)
+			return protocol.PodViewPayload{
+				KubeContext: query.KubeContext,
+				Namespace:   query.Namespace,
+				Name:        query.Name,
+				Found:       true,
+				Overview:    protocol.PodOverview{Phase: "Running"},
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 11,
+					Source:             "watch-cache",
+				},
+			}, nil
+		},
+	})
+	m.resourceViewOpen = true
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "nodes",
+		Namespace:     "all",
+		ItemNamespace: "<cluster>",
+		Name:          "node-a",
+		Found:         true,
+		Item: &protocol.ResourceItem{
+			Name:      "node-a",
+			Namespace: "<cluster>",
+			Status:    "Ready",
+		},
+		NodePods: []protocol.DetailChild{
+			{Resource: "pods", Namespace: "default", Name: "api-0", Status: "Running"},
+			{Resource: "pods", Namespace: "payments", Name: "worker-0", Status: "Pending"},
+		},
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	withPodsTab := updated.(model)
+	tab, ok := withPodsTab.activeDetailTab()
+	if !ok || tab.kind != detailTabNodePods {
+		t.Fatalf("expected node pods tab active, got %#v", tab)
+	}
+
+	updated, _ = withPodsTab.Update(tea.KeyMsg{Type: tea.KeyDown})
+	withSecondPod := updated.(model)
+	if withSecondPod.resourceNodePodIndex != 1 {
+		t.Fatalf("expected second node pod selected, index=%d", withSecondPod.resourceNodePodIndex)
+	}
+
+	updated, podCmd := withSecondPod.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	afterSelect := updated.(model)
+	if podCmd == nil {
+		t.Fatalf("expected pod view load command from node pods tab")
+	}
+	if !afterSelect.podViewOpen || !afterSelect.podViewLoading {
+		t.Fatalf("expected pod view open/loading, got open=%v loading=%v", afterSelect.podViewOpen, afterSelect.podViewLoading)
+	}
+	if afterSelect.resourceViewOpen {
+		t.Fatalf("expected resource view closed when opening pod from node pods tab")
+	}
+	if afterSelect.session.Resource != "pods" || afterSelect.session.Selection != "worker-0" {
+		t.Fatalf("expected session switched to pod target, got resource=%q selection=%q", afterSelect.session.Resource, afterSelect.session.Selection)
+	}
+
+	updated, _ = afterSelect.Update(podCmd())
+	final := updated.(model)
+	if !final.podViewOpen || final.podViewLoading {
+		t.Fatalf("expected loaded pod view, got open=%v loading=%v", final.podViewOpen, final.podViewLoading)
+	}
+	if len(podSeen) != 1 {
+		t.Fatalf("expected exactly one pod-view request, got %d", len(podSeen))
+	}
+	if podSeen[0].Namespace != "payments" || podSeen[0].Name != "worker-0" {
+		t.Fatalf("unexpected pod-view query: %#v", podSeen[0])
+	}
+}
+
+func TestEnterInNodePodsTabUsesDetailContextForPodView(t *testing.T) {
+	var seen protocol.PodViewQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "ctx-session",
+			Namespace:   "all",
+			Resource:    "nodes",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "nodes",
+			Namespace: "all",
+			Items: []protocol.ResourceItem{
+				{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadPodView: func(_ context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			seen = query
+			return protocol.PodViewPayload{
+				KubeContext: query.KubeContext,
+				Namespace:   query.Namespace,
+				Name:        query.Name,
+				Found:       true,
+				Overview:    protocol.PodOverview{Phase: "Running"},
+				Freshness:   protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.resourceViewOpen = true
+	m.detailKubeContext = "ctx-detail"
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "nodes",
+		Namespace:     "all",
+		ItemNamespace: "<cluster>",
+		Name:          "node-a",
+		Found:         true,
+		Item: &protocol.ResourceItem{
+			Name:      "node-a",
+			Namespace: "<cluster>",
+			Status:    "Ready",
+		},
+		NodePods: []protocol.DetailChild{
+			{Resource: "pods", Namespace: "default", Name: "api-0", Status: "Running"},
+		},
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	withPodsTab := updated.(model)
+	updated, podCmd := withPodsTab.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if podCmd == nil {
+		t.Fatalf("expected pod-view command")
+	}
+	updated, _ = updated.(model).Update(podCmd())
+	_ = updated
+
+	if seen.KubeContext != "ctx-detail" {
+		t.Fatalf("expected pod view to use detail context, got %q", seen.KubeContext)
 	}
 }
 
