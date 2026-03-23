@@ -4876,6 +4876,85 @@ func TestPollTickRefreshesResourceViewWithoutLoadingPlaceholder(t *testing.T) {
 	}
 }
 
+func TestPollTickRefreshesClusterScopedResourceViewWithoutLoadingPlaceholder(t *testing.T) {
+	var detailCalls int
+	var listCalls int
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "all",
+			Resource:    "nodes",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "nodes",
+			Namespace: "all",
+			Items: []protocol.ResourceItem{
+				{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			detailCalls++
+			return protocol.ResourceDetailPayload{
+				Resource:      query.Resource,
+				Namespace:     query.Namespace,
+				ItemNamespace: "<cluster>",
+				Name:          query.Name,
+				Found:         true,
+				Item:          &protocol.ResourceItem{Name: query.Name, Namespace: "<cluster>", Status: "Ready"},
+				Overview: []protocol.DetailField{
+					{Key: "roles", Value: "worker"},
+				},
+				Freshness: protocol.FreshnessMeta{
+					State:              protocol.FreshnessStateLive,
+					SnapshotTimeUnixMs: 1,
+					Source:             "watch-cache",
+				},
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.resourceViewOpen = true
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "nodes",
+		Namespace:     "all",
+		ItemNamespace: "<cluster>",
+		Name:          "node-a",
+		Found:         true,
+		Item:          &protocol.ResourceItem{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+		Overview:      []protocol.DetailField{{Key: "roles", Value: "worker"}},
+		Freshness: protocol.FreshnessMeta{
+			State:              protocol.FreshnessStateLive,
+			SnapshotTimeUnixMs: 1,
+			Source:             "watch-cache",
+		},
+	}
+
+	updated, cmd := m.Update(pollTickMsg{})
+	next := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected detail refresh command on poll tick")
+	}
+	if next.resourceViewLoading {
+		t.Fatalf("expected in-place cluster-scoped detail refresh without loading placeholder")
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list refresh while resource view is open, got %d", listCalls)
+	}
+	if detailCalls != 0 {
+		t.Fatalf("expected detail load command to defer execution until cmd() is run")
+	}
+}
+
 func TestPollTickRefreshesOwnedSelectionDetailTargetWithoutListReload(t *testing.T) {
 	var listCalls int
 

@@ -2981,11 +2981,7 @@ func (m model) actionTargetFromFields(args []string) (name string, itemNamespace
 }
 
 func sanitizeActionNamespace(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" || value == "-" || strings.EqualFold(value, "<cluster>") || strings.EqualFold(value, "all") {
-		return ""
-	}
-	return value
+	return normalizeItemNamespace(value)
 }
 
 func (m model) activeActionTarget() (resource string, name string, itemNamespace string, ok bool) {
@@ -3316,7 +3312,7 @@ func (m model) startDetailReloadWithQuery(query protocol.ResourceDetailQuery, an
 	m.resourceViewErr = ""
 	sameResource := strings.EqualFold(strings.TrimSpace(m.detail.Resource), strings.TrimSpace(query.Resource)) &&
 		strings.EqualFold(strings.TrimSpace(m.detail.Name), strings.TrimSpace(query.Name)) &&
-		strings.EqualFold(strings.TrimSpace(m.detail.ItemNamespace), strings.TrimSpace(query.ItemNamespace))
+		strings.EqualFold(detailItemNamespace(m.detail), normalizeItemNamespace(query.ItemNamespace))
 	showLoading := announce || !sameResource || !m.detail.Found
 	if !sameResource {
 		m.resourceViewTab = 0
@@ -5686,9 +5682,7 @@ func (m model) buildSelectedDetailQuery() (protocol.ResourceDetailQuery, bool) {
 		itemNamespace = strings.TrimSpace(item.Namespace)
 	}
 
-	if itemNamespace == "-" || strings.EqualFold(itemNamespace, "<cluster>") {
-		itemNamespace = ""
-	}
+	itemNamespace = normalizeItemNamespace(itemNamespace)
 	if resourceUsesNamespace(resource) && itemNamespace == "" {
 		namespace := strings.TrimSpace(m.session.Namespace)
 		if namespace != "" && !strings.EqualFold(namespace, "all") {
@@ -5985,7 +5979,7 @@ func (m *model) updateResourceFlashing(previous protocol.ResourceDetailPayload, 
 		return
 	}
 	if !strings.EqualFold(strings.TrimSpace(previous.Name), strings.TrimSpace(next.Name)) ||
-		!strings.EqualFold(strings.TrimSpace(previous.ItemNamespace), strings.TrimSpace(next.ItemNamespace)) {
+		!strings.EqualFold(detailItemNamespace(previous), detailItemNamespace(next)) {
 		m.resourceFlashingFields = map[string]time.Time{}
 		return
 	}
@@ -6131,6 +6125,22 @@ func detailChildrenEqual(left []protocol.DetailChild, right []protocol.DetailChi
 		}
 	}
 	return true
+}
+
+func normalizeItemNamespace(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "-" || strings.EqualFold(value, "<cluster>") || strings.EqualFold(value, "all") {
+		return ""
+	}
+	return value
+}
+
+func detailItemNamespace(payload protocol.ResourceDetailPayload) string {
+	itemNamespace := strings.TrimSpace(payload.ItemNamespace)
+	if itemNamespace == "" && payload.Item != nil {
+		itemNamespace = strings.TrimSpace(payload.Item.Namespace)
+	}
+	return normalizeItemNamespace(itemNamespace)
 }
 
 func (m *model) setListCancel(cancel context.CancelFunc) {

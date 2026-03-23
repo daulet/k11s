@@ -223,7 +223,7 @@ func handleConn(
 		query.Resource = resource
 
 		payload := resourceCache.GetDetail(query)
-		if resourceDetailEnricher != nil {
+		if resourceDetailEnricher != nil && shouldEnrichResourceDetail(resource) {
 			enriched, err := resourceDetailEnricher.Enrich(context.Background(), query, payload)
 			if err != nil {
 				// Enrichment is best-effort: return cached detail payload without
@@ -569,6 +569,16 @@ func normalizePodViewQuery(query protocol.PodViewQuery) protocol.PodViewQuery {
 	}
 	query.Name = strings.TrimSpace(query.Name)
 	return query
+}
+
+func shouldEnrichResourceDetail(resource string) bool {
+	switch strings.TrimSpace(strings.ToLower(resource)) {
+	case "pods", "services", "deployments":
+		// Phase-1 core resources keep detail strictly cache-backed.
+		return false
+	default:
+		return true
+	}
 }
 
 func removeStaleSocket(socketPath string, timeout time.Duration) error {

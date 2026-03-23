@@ -221,6 +221,57 @@ func TestCacheKeysIncludeFilter(t *testing.T) {
 	}
 }
 
+func TestCoreResourceTabSwitchUsesWarmCacheWithoutRefetch(t *testing.T) {
+	fetcher := &countingCoreFetcher{}
+	cache := New(context.Background(), fetcher, nil)
+	queries := []protocol.ResourceListQuery{
+		{Resource: "pods", Namespace: "default"},
+		{Resource: "services", Namespace: "default"},
+		{Resource: "deployments", Namespace: "default"},
+	}
+
+	for _, query := range queries {
+		_ = cache.Get(query)
+		payload := waitForCondition(t, 250*time.Millisecond, func() (protocol.ResourceListPayload, bool) {
+			next := cache.Get(query)
+			return next, next.Freshness.State == protocol.FreshnessStateLive && len(next.Items) == 1
+		})
+		expectedName := query.Resource + "-item"
+		if payload.Items[0].Name != expectedName {
+			t.Fatalf("expected warm item %q, got %q", expectedName, payload.Items[0].Name)
+		}
+	}
+
+	initialCalls := fetcher.callCount()
+	if initialCalls < len(queries) {
+		t.Fatalf("expected at least %d initial fetch calls, got %d", len(queries), initialCalls)
+	}
+
+	cache.mu.Lock()
+	cache.refreshInterval = time.Hour
+	cache.mu.Unlock()
+
+	start := time.Now()
+	for i := 0; i < 300; i++ {
+		for _, query := range queries {
+			payload := cache.Get(query)
+			if payload.Freshness.State != protocol.FreshnessStateLive {
+				t.Fatalf("expected LIVE cache payload for %q, got %s", query.Resource, payload.Freshness.State)
+			}
+			if len(payload.Items) != 1 {
+				t.Fatalf("expected cached item for %q, got %d", query.Resource, len(payload.Items))
+			}
+		}
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected warm tab-switch cache path to stay fast, took %s", elapsed)
+	}
+
+	if got := fetcher.callCount(); got != initialCalls {
+		t.Fatalf("expected no refetch during warm tab switches, initial=%d got=%d", initialCalls, got)
+	}
+}
+
 func TestCacheUsesWatcherWhenAvailable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -419,6 +470,36 @@ func (f *filterAwareFetcher) List(ctx context.Context, query protocol.ResourceLi
 	}
 	return []protocol.ResourceItem{
 		{Name: name + "-item", Namespace: query.Namespace, Status: "Running"},
+	}, nil
+}
+
+type countingCoreFetcher struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *countingCoreFetcher) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *countingCoreFetcher) List(_ context.Context, query protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+
+	resource := strings.ToLower(strings.TrimSpace(query.Resource))
+	if resource == "" {
+		resource = "pods"
+	}
+
+	return []protocol.ResourceItem{
+		{
+			Name:      resource + "-item",
+			Namespace: query.Namespace,
+			Status:    "Running",
+		},
 	}, nil
 }
 
