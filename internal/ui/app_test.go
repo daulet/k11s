@@ -1692,6 +1692,110 @@ func TestListLinesIncludeColumnHeaders(t *testing.T) {
 	}
 }
 
+func TestListDefaultSortByName(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "services",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "services",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "worker", Namespace: "default", Status: "ClusterIP", Age: "1m"},
+				{Name: "api", Namespace: "default", Status: "ClusterIP", Age: "1m"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	if len(m.resourceList.Items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(m.resourceList.Items))
+	}
+	if m.resourceList.Items[0].Name != "api" {
+		t.Fatalf("expected name-sorted list by default, got %#v", m.resourceList.Items)
+	}
+	if m.sortColumn != "name" || m.sortDescending {
+		t.Fatalf("expected default sort to be name asc, got column=%q desc=%v", m.sortColumn, m.sortDescending)
+	}
+}
+
+func TestListSortShortcutChangesColumnAndTogglesDirection(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Ready: "1/1", Status: "Running", Age: "1m"},
+				{Name: "job", Namespace: "default", Ready: "0/1", Status: "Succeeded", Age: "3m"},
+				{Name: "worker", Namespace: "default", Ready: "0/1", Status: "Pending", Age: "2m"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}}) // status column in pod list
+	byStatusAsc := updated.(model)
+	if byStatusAsc.sortColumn != "status" || byStatusAsc.sortDescending {
+		t.Fatalf("expected status asc after first shortcut, got column=%q desc=%v", byStatusAsc.sortColumn, byStatusAsc.sortDescending)
+	}
+	if byStatusAsc.resourceList.Items[0].Status != "Pending" {
+		t.Fatalf("expected ascending status sort, got %#v", byStatusAsc.resourceList.Items)
+	}
+
+	updated, _ = byStatusAsc.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}})
+	byStatusDesc := updated.(model)
+	if byStatusDesc.sortColumn != "status" || !byStatusDesc.sortDescending {
+		t.Fatalf("expected status desc after second shortcut, got column=%q desc=%v", byStatusDesc.sortColumn, byStatusDesc.sortDescending)
+	}
+	if byStatusDesc.resourceList.Items[0].Status != "Succeeded" {
+		t.Fatalf("expected descending status sort, got %#v", byStatusDesc.resourceList.Items)
+	}
+}
+
+func TestSortCommandByAgeDescending(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "services",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "services",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "ClusterIP", Age: "10s"},
+				{Name: "worker", Namespace: "default", Status: "ClusterIP", Age: "2h"},
+				{Name: "cache", Namespace: "default", Status: "ClusterIP", Age: "1m"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	m.commandMode = true
+	m.input.SetValue("sort age desc")
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatalf("did not expect reload command for local list sort")
+	}
+	if next.sortColumn != "age" || !next.sortDescending {
+		t.Fatalf("expected sort age desc, got column=%q desc=%v", next.sortColumn, next.sortDescending)
+	}
+	if len(next.resourceList.Items) < 1 || next.resourceList.Items[0].Age != "2h" {
+		t.Fatalf("expected descending age order, got %#v", next.resourceList.Items)
+	}
+	if !strings.Contains(next.commandMessage, "sorted by age (desc)") {
+		t.Fatalf("expected sort command message, got %q", next.commandMessage)
+	}
+}
+
 func TestPodListColumnHeadersIncludeNodeAndOwner(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -2935,8 +3039,8 @@ func TestMouseClickNamespaceInPodRowSwitchesNamespace(t *testing.T) {
 	}
 }
 
-func TestMouseClickNodeInPodRowOpensNodesView(t *testing.T) {
-	var seen protocol.ResourceListQuery
+func TestMouseClickNodeInPodRowOpensNodeDetail(t *testing.T) {
+	var seen protocol.ResourceDetailQuery
 
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -2952,14 +3056,14 @@ func TestMouseClickNodeInPodRowOpensNodesView(t *testing.T) {
 			},
 			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 		},
-		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
 			seen = query
-			return protocol.ResourceListPayload{
+			return protocol.ResourceDetailPayload{
 				Resource:  query.Resource,
 				Namespace: query.Namespace,
-				Items: []protocol.ResourceItem{
-					{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
-				},
+				Name:      query.Name,
+				Found:     true,
+				Item:      &protocol.ResourceItem{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
 				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 			}, nil
 		},
@@ -2973,8 +3077,8 @@ func TestMouseClickNodeInPodRowOpensNodesView(t *testing.T) {
 	}
 	updated, cmd := m.Update(msg)
 	next := updated.(model)
-	if !next.loading {
-		t.Fatalf("expected loading after node click")
+	if !next.detailLoading {
+		t.Fatalf("expected detail loading after node click")
 	}
 	if next.session.Resource != "nodes" {
 		t.Fatalf("expected resource to switch to nodes via click, got %q", next.session.Resource)
@@ -2983,17 +3087,20 @@ func TestMouseClickNodeInPodRowOpensNodesView(t *testing.T) {
 		t.Fatalf("expected selection node-a via click, got %q", next.session.Selection)
 	}
 	if cmd == nil {
-		t.Fatalf("expected reload command after node click")
+		t.Fatalf("expected detail load command after node click")
 	}
 
 	msgOut := cmd()
 	updated, _ = next.Update(msgOut)
 	final := updated.(model)
-	if seen.Resource != "nodes" || seen.Namespace != "all" {
-		t.Fatalf("expected nodes/all query after click, got %#v", seen)
+	if seen.Resource != "nodes" || seen.Namespace != "all" || seen.Name != "node-a" {
+		t.Fatalf("expected node detail query after click, got %#v", seen)
 	}
-	if final.resourceList.Resource != "nodes" {
-		t.Fatalf("expected nodes payload after click navigation, got %q", final.resourceList.Resource)
+	if !final.resourceViewOpen {
+		t.Fatalf("expected node detail view open after click")
+	}
+	if final.detail.Resource != "nodes" || final.detail.Name != "node-a" {
+		t.Fatalf("expected node detail payload after click, got %#v", final.detail)
 	}
 }
 
@@ -3115,8 +3222,8 @@ func TestShortcutNamespaceInPodRowSwitchesNamespace(t *testing.T) {
 	}
 }
 
-func TestShortcutNodeInPodRowOpensNodesView(t *testing.T) {
-	var seen protocol.ResourceListQuery
+func TestShortcutNodeInPodRowOpensNodeDetail(t *testing.T) {
+	var seen protocol.ResourceDetailQuery
 
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -3132,14 +3239,14 @@ func TestShortcutNodeInPodRowOpensNodesView(t *testing.T) {
 			},
 			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 		},
-		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
 			seen = query
-			return protocol.ResourceListPayload{
+			return protocol.ResourceDetailPayload{
 				Resource:  query.Resource,
 				Namespace: query.Namespace,
-				Items: []protocol.ResourceItem{
-					{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
-				},
+				Name:      query.Name,
+				Found:     true,
+				Item:      &protocol.ResourceItem{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
 				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 			}, nil
 		},
@@ -3147,8 +3254,8 @@ func TestShortcutNodeInPodRowOpensNodesView(t *testing.T) {
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
 	next := updated.(model)
-	if !next.loading {
-		t.Fatalf("expected loading after node shortcut")
+	if !next.detailLoading {
+		t.Fatalf("expected detail loading after node shortcut")
 	}
 	if next.session.Resource != "nodes" {
 		t.Fatalf("expected resource to switch to nodes via shortcut, got %q", next.session.Resource)
@@ -3157,17 +3264,20 @@ func TestShortcutNodeInPodRowOpensNodesView(t *testing.T) {
 		t.Fatalf("expected selection node-a via shortcut, got %q", next.session.Selection)
 	}
 	if cmd == nil {
-		t.Fatalf("expected reload command after node shortcut")
+		t.Fatalf("expected detail load command after node shortcut")
 	}
 
 	msgOut := cmd()
 	updated, _ = next.Update(msgOut)
 	final := updated.(model)
-	if seen.Resource != "nodes" || seen.Namespace != "all" {
-		t.Fatalf("expected nodes/all query after shortcut, got %#v", seen)
+	if seen.Resource != "nodes" || seen.Namespace != "all" || seen.Name != "node-a" {
+		t.Fatalf("expected node detail query after shortcut, got %#v", seen)
 	}
-	if final.resourceList.Resource != "nodes" {
-		t.Fatalf("expected nodes payload after shortcut navigation, got %q", final.resourceList.Resource)
+	if !final.resourceViewOpen {
+		t.Fatalf("expected node detail view open after shortcut")
+	}
+	if final.detail.Resource != "nodes" || final.detail.Name != "node-a" {
+		t.Fatalf("expected node detail payload after shortcut, got %#v", final.detail)
 	}
 }
 
@@ -3254,6 +3364,11 @@ func TestFooterLegendShowsContextualHintsWithoutMoveJump(t *testing.T) {
 	for _, expected := range []string{"s namespace", "v node", "o owner", ": cmd", "enter detail"} {
 		if !strings.Contains(footer, expected) {
 			t.Fatalf("expected footer legend to contain %q, got %q", expected, footer)
+		}
+	}
+	for _, expected := range []string{"1 name", "2 ns", "3 ready", "4 status", "5 age", "6 node", "7 owner", "r asc"} {
+		if !strings.Contains(footer, expected) {
+			t.Fatalf("expected footer legend to contain sort hint %q, got %q", expected, footer)
 		}
 	}
 }
@@ -4509,6 +4624,7 @@ func TestBackShortcutWithoutHistoryShowsMessage(t *testing.T) {
 
 func TestBackShortcutAfterMouseNodeJump(t *testing.T) {
 	var seen []protocol.ResourceListQuery
+	var seenDetail protocol.ResourceDetailQuery
 
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -4526,18 +4642,23 @@ func TestBackShortcutAfterMouseNodeJump(t *testing.T) {
 		},
 		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
 			seen = append(seen, query)
-			items := []protocol.ResourceItem{
-				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a"},
-			}
-			if query.Resource == "nodes" {
-				items = []protocol.ResourceItem{
-					{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
-				}
-			}
 			return protocol.ResourceListPayload{
 				Resource:  query.Resource,
 				Namespace: query.Namespace,
-				Items:     items,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: "default", Status: "Running", Node: "node-a"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			seenDetail = query
+			return protocol.ResourceDetailPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Name:      query.Name,
+				Found:     true,
+				Item:      &protocol.ResourceItem{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
 				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 			}, nil
 		},
@@ -4555,10 +4676,16 @@ func TestBackShortcutAfterMouseNodeJump(t *testing.T) {
 		t.Fatalf("expected nodes after click, got %q", afterClick.session.Resource)
 	}
 	if cmd == nil {
-		t.Fatalf("expected reload command after node click")
+		t.Fatalf("expected detail command after node click")
 	}
 	updated, _ = afterClick.Update(cmd())
 	afterNodeLoaded := updated.(model)
+	if !afterNodeLoaded.resourceViewOpen {
+		t.Fatalf("expected node detail view after click")
+	}
+	if seenDetail.Resource != "nodes" || seenDetail.Name != "node-a" {
+		t.Fatalf("expected node detail query after click, got %#v", seenDetail)
+	}
 
 	updated, backCmd := afterNodeLoaded.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
 	afterBack := updated.(model)
@@ -4573,8 +4700,8 @@ func TestBackShortcutAfterMouseNodeJump(t *testing.T) {
 	if final.resourceList.Resource != "pods" {
 		t.Fatalf("expected pods payload after back, got %q", final.resourceList.Resource)
 	}
-	if len(seen) < 2 {
-		t.Fatalf("expected list reloads for click and back, got %d", len(seen))
+	if len(seen) < 1 {
+		t.Fatalf("expected list reload for back after node jump, got %d", len(seen))
 	}
 }
 
@@ -4981,8 +5108,8 @@ func TestPodEventsLinesRenderCompactTable(t *testing.T) {
 	}
 }
 
-func TestPodViewShortcutNodeNavigatesToNodesList(t *testing.T) {
-	var seen protocol.ResourceListQuery
+func TestPodViewShortcutNodeOpensNodeDetail(t *testing.T) {
+	var seen protocol.ResourceDetailQuery
 
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -5016,14 +5143,14 @@ func TestPodViewShortcutNodeNavigatesToNodesList(t *testing.T) {
 				},
 			}, nil
 		},
-		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
 			seen = query
-			return protocol.ResourceListPayload{
+			return protocol.ResourceDetailPayload{
 				Resource:  query.Resource,
 				Namespace: query.Namespace,
-				Items: []protocol.ResourceItem{
-					{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
-				},
+				Name:      query.Name,
+				Found:     true,
+				Item:      &protocol.ResourceItem{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
 				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 			}, nil
 		},
@@ -5039,25 +5166,31 @@ func TestPodViewShortcutNodeNavigatesToNodesList(t *testing.T) {
 		t.Fatalf("expected pod view open")
 	}
 
-	updated, listCmd := withView.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	updated, detailCmd := withView.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
 	withNodeNav := updated.(model)
 	if withNodeNav.session.Resource != "nodes" {
-		t.Fatalf("expected v shortcut to switch to nodes, got %q", withNodeNav.session.Resource)
+		t.Fatalf("expected v shortcut to target nodes resource, got %q", withNodeNav.session.Resource)
 	}
 	if withNodeNav.podViewOpen {
 		t.Fatalf("expected pod view to close when navigating to nodes")
 	}
-	if listCmd == nil {
-		t.Fatalf("expected list reload command for nodes")
+	if !withNodeNav.detailLoading {
+		t.Fatalf("expected node detail loading after v shortcut")
+	}
+	if detailCmd == nil {
+		t.Fatalf("expected detail load command for node")
 	}
 
-	updated, _ = withNodeNav.Update(listCmd())
+	updated, _ = withNodeNav.Update(detailCmd())
 	afterReload := updated.(model)
-	if seen.Resource != "nodes" || seen.Namespace != "all" {
-		t.Fatalf("expected nodes/all list query, got %#v", seen)
+	if seen.Resource != "nodes" || seen.Namespace != "all" || seen.Name != "node-a" {
+		t.Fatalf("expected nodes/all detail query, got %#v", seen)
 	}
-	if afterReload.resourceList.Resource != "nodes" {
-		t.Fatalf("expected nodes payload after reload, got %q", afterReload.resourceList.Resource)
+	if !afterReload.resourceViewOpen {
+		t.Fatalf("expected resource view open after node detail load")
+	}
+	if afterReload.detail.Resource != "nodes" || afterReload.detail.Name != "node-a" {
+		t.Fatalf("expected node detail payload, got %#v", afterReload.detail)
 	}
 }
 

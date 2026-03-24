@@ -194,6 +194,8 @@ type keyMap struct {
 	Down          key.Binding
 	JumpUp        key.Binding
 	JumpDown      key.Binding
+	SortColumn    key.Binding
+	SortDirection key.Binding
 	Delete        key.Binding
 	DeleteForce   key.Binding
 	Edit          key.Binding
@@ -231,6 +233,14 @@ func defaultKeyMap() keyMap {
 		JumpDown: key.NewBinding(
 			key.WithKeys("pgdown", "ctrl+d"),
 			key.WithHelp("pgdn/ctrl+d", "jump down"),
+		),
+		SortColumn: key.NewBinding(
+			key.WithKeys("1", "2", "3", "4", "5", "6", "7", "8", "9"),
+			key.WithHelp("1..9", "sort col"),
+		),
+		SortDirection: key.NewBinding(
+			key.WithKeys("r"),
+			key.WithHelp("r", "sort dir"),
 		),
 		Delete: key.NewBinding(
 			key.WithKeys("d"),
@@ -311,6 +321,8 @@ func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{
 		k.Up,
 		k.JumpDown,
+		k.SortColumn,
+		k.SortDirection,
 		k.Delete,
 		k.Edit,
 		k.OpenNamespace,
@@ -336,6 +348,8 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		k.Down,
 		k.JumpUp,
 		k.JumpDown,
+		k.SortColumn,
+		k.SortDirection,
 		k.Delete,
 		k.DeleteForce,
 		k.Edit,
@@ -512,6 +526,9 @@ type model struct {
 	historyBack    []protocol.SessionState
 	historyForward []protocol.SessionState
 
+	sortColumn     string
+	sortDescending bool
+
 	selected               int
 	listScroll             int
 	loading                bool
@@ -630,6 +647,8 @@ func newModel(opts Options) model {
 		keys:                   keys,
 		help:                   h,
 		styles:                 newStyles(opts.UseColor),
+		sortColumn:             "name",
+		sortDescending:         false,
 		flashingItems:          map[string]time.Time{},
 		podAnnotationOpen:      map[string]bool{},
 		podFlashingFields:      map[string]time.Time{},
@@ -643,6 +662,7 @@ func newModel(opts Options) model {
 		logsPollEvery:          defaultLogsFollowInterval,
 		execProcess:            tea.ExecProcess,
 	}
+	m.resourceList.Items = m.sortedResourceItems(m.resourceList.Items, m.resourceList.Resource)
 	m.selectFromSession()
 	return m
 }
@@ -737,10 +757,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.loading = false
 		previousPayload := m.resourceList
-		m.resourceList = msg.payload
+		payload := msg.payload
+		payload.Items = m.sortedResourceItems(payload.Items, payload.Resource)
+		m.resourceList = payload
 		if strings.EqualFold(strings.TrimSpace(previousPayload.Resource), strings.TrimSpace(msg.payload.Resource)) &&
 			strings.EqualFold(strings.TrimSpace(previousPayload.Namespace), strings.TrimSpace(msg.payload.Namespace)) {
-			m.updateFlashingItems(previousPayload.Items, msg.payload.Items)
+			m.updateFlashingItems(previousPayload.Items, payload.Items)
 		} else {
 			m.clearFlashingItems()
 		}
@@ -1029,6 +1051,8 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch {
+	case m.applySortShortcut(msg.String()):
+		return m, nil
 	case key.Matches(msg, m.keys.SearchNext):
 		if !m.jumpToSearchMatch(1) {
 			if strings.TrimSpace(m.searchQuery) == "" {
@@ -1500,14 +1524,7 @@ func (m model) navigateItemColumn(item protocol.ResourceItem, column string, via
 			m.commandMessage = "node is not clickable on selected row"
 			return m, nil
 		}
-		m.session.Resource = "nodes"
-		m.session.Selection = node
-		m.pushNavigationHistory(previousSession)
-		m.clearPodView()
-		m.clearDetail()
-		m.clearFlashingItems()
-		m.commandMessage = "opened node " + node + " via " + via
-		return m.startListReload()
+		return m.openNodeDetail(node, via, previousSession)
 	case "owner":
 		resource, ownerSelection, ok := ownerNavigation(item.OwnerKind, item.OwnerName)
 		if !ok {
@@ -1539,16 +1556,31 @@ func (m model) navigatePodNode(via string) (tea.Model, tea.Cmd) {
 		m.commandMessage = "node is not available for this pod"
 		return m, nil
 	}
+	return m.openNodeDetail(node, via, m.session)
+}
 
-	previousSession := m.session
+func (m model) openNodeDetail(node string, via string, previousSession protocol.SessionState) (tea.Model, tea.Cmd) {
+	node = strings.TrimSpace(node)
+	if node == "" || node == "-" {
+		m.commandMessage = "node is not available"
+		return m, nil
+	}
 	m.session.Resource = "nodes"
 	m.session.Selection = node
 	m.pushNavigationHistory(previousSession)
 	m.clearPodView()
 	m.clearDetail()
 	m.clearFlashingItems()
-	m.commandMessage = "opened node " + node + " via " + via
-	return m.startListReload()
+	m.commandMessage = "opening node " + node + " via " + via + "..."
+	return m.startDetailReloadWithQuery(protocol.ResourceDetailQuery{
+		KubeContext:   m.session.KubeContext,
+		Resource:      "nodes",
+		Namespace:     "all",
+		Filter:        m.session.Filter,
+		ItemNamespace: "",
+		Name:          node,
+		SimulateStale: m.simulateStale,
+	}, true)
 }
 
 func (m model) navigatePodOwner(via string) (tea.Model, tea.Cmd) {
@@ -2876,6 +2908,8 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 			return true, fmt.Sprintf("resource switched to %s (%s)", m.session.Resource, m.session.Filter), true, nil
 		}
 		return true, fmt.Sprintf("resource switched to %s", m.session.Resource), true, nil
+	case "sort", "order":
+		return m.applySortCommand(fields[1:])
 	default:
 		resource, ok := canonicalResourceName(command)
 		if ok {
@@ -2896,6 +2930,63 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 		}
 		return false, "", false, fmt.Errorf("unknown command %q", fields[0])
 	}
+}
+
+func (m *model) applySortCommand(args []string) (updated bool, message string, reload bool, err error) {
+	column := ""
+	directionSpecified := false
+	descending := m.sortDescending
+	toggle := false
+
+	for _, raw := range args {
+		token := strings.ToLower(strings.TrimSpace(raw))
+		if token == "" {
+			continue
+		}
+		switch token {
+		case "asc", "ascending":
+			directionSpecified = true
+			descending = false
+			continue
+		case "desc", "descending":
+			directionSpecified = true
+			descending = true
+			continue
+		case "toggle":
+			directionSpecified = true
+			toggle = true
+			continue
+		}
+		normalized, ok := normalizeSortColumnToken(token)
+		if !ok {
+			return false, "", false, fmt.Errorf("unknown sort column %q", raw)
+		}
+		if column != "" {
+			return false, "", false, fmt.Errorf("sort accepts one column: try `:sort %s`", normalized)
+		}
+		column = normalized
+	}
+
+	if column == "" {
+		column = m.activeSortColumnForResource(m.resourceList.Resource)
+	}
+	if !m.columnSortableForResource(m.resourceList.Resource, column) {
+		return false, "", false, fmt.Errorf(
+			"column %q is not sortable for %s (available: %s)",
+			column,
+			strings.TrimSpace(m.resourceList.Resource),
+			strings.Join(m.sortableColumnsForResource(m.resourceList.Resource), ", "),
+		)
+	}
+
+	if toggle {
+		descending = !m.sortDescending
+	} else if !directionSpecified && !strings.EqualFold(column, m.activeSortColumnForResource(m.resourceList.Resource)) {
+		descending = false
+	}
+
+	m.setSort(column, descending)
+	return false, m.currentSortMessage(), false, nil
 }
 
 type editInvocation struct {
@@ -5369,6 +5460,295 @@ func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, 
 	return name, namespace, ready, status, age, node
 }
 
+func normalizeSortColumnToken(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "name", "n":
+		return "name", true
+	case "namespace", "ns":
+		return "namespace", true
+	case "ready":
+		return "ready", true
+	case "status", "st":
+		return "status", true
+	case "age":
+		return "age", true
+	case "node":
+		return "node", true
+	case "owner":
+		return "owner", true
+	default:
+		return "", false
+	}
+}
+
+func sortColumnDisplayName(column string) string {
+	column, ok := normalizeSortColumnToken(column)
+	if !ok {
+		return "name"
+	}
+	return column
+}
+
+func sortColumnLegendName(column string) string {
+	switch sortColumnDisplayName(column) {
+	case "namespace":
+		return "ns"
+	default:
+		return sortColumnDisplayName(column)
+	}
+}
+
+func parseSortShortcutIndex(value string) (int, bool) {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) != 1 || runes[0] < '1' || runes[0] > '9' {
+		return 0, false
+	}
+	return int(runes[0] - '0'), true
+}
+
+func sortDirectionLabel(descending bool) string {
+	if descending {
+		return "desc"
+	}
+	return "asc"
+}
+
+func (m model) sortableColumnsForResource(resource string) []string {
+	columns := listColumnsForResource(resource, m.listContentWidth())
+	values := make([]string, 0, len(columns))
+	for _, column := range columns {
+		values = append(values, column.id)
+	}
+	return values
+}
+
+func (m model) activeSortColumnForResource(resource string) string {
+	current, ok := normalizeSortColumnToken(m.sortColumn)
+	if !ok {
+		current = "name"
+	}
+	for _, candidate := range m.sortableColumnsForResource(resource) {
+		if candidate == current {
+			return current
+		}
+	}
+	return "name"
+}
+
+func (m model) columnSortableForResource(resource string, column string) bool {
+	column, ok := normalizeSortColumnToken(column)
+	if !ok {
+		return false
+	}
+	for _, candidate := range m.sortableColumnsForResource(resource) {
+		if candidate == column {
+			return true
+		}
+	}
+	return false
+}
+
+func compareStrings(left string, right string) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareInts(left int, right int) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareInt64s(left int64, right int64) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func parseSortAgeSeconds(value string) (int64, bool) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" || value == "-" {
+		return 0, false
+	}
+	if len(value) < 2 {
+		return 0, false
+	}
+	unit := value[len(value)-1]
+	amount, err := strconv.ParseInt(value[:len(value)-1], 10, 64)
+	if err != nil || amount < 0 {
+		return 0, false
+	}
+	switch unit {
+	case 's':
+		return amount, true
+	case 'm':
+		return amount * 60, true
+	case 'h':
+		return amount * 3600, true
+	case 'd':
+		return amount * 86400, true
+	default:
+		return 0, false
+	}
+}
+
+func compareReadyValues(left string, right string) int {
+	leftReady, leftTotal, leftOK := parseReadyFraction(left)
+	rightReady, rightTotal, rightOK := parseReadyFraction(right)
+	if leftOK && rightOK {
+		leftRatio := leftReady * rightTotal
+		rightRatio := rightReady * leftTotal
+		if cmp := compareInts(leftRatio, rightRatio); cmp != 0 {
+			return cmp
+		}
+		if cmp := compareInts(leftTotal, rightTotal); cmp != 0 {
+			return cmp
+		}
+		return compareInts(leftReady, rightReady)
+	}
+	if leftOK && !rightOK {
+		return -1
+	}
+	if !leftOK && rightOK {
+		return 1
+	}
+	return compareStrings(strings.ToLower(strings.TrimSpace(left)), strings.ToLower(strings.TrimSpace(right)))
+}
+
+func compareResourceItemsByColumn(left protocol.ResourceItem, right protocol.ResourceItem, column string) int {
+	column, ok := normalizeSortColumnToken(column)
+	if !ok {
+		column = "name"
+	}
+	switch column {
+	case "age":
+		leftAge, leftOK := parseSortAgeSeconds(left.Age)
+		rightAge, rightOK := parseSortAgeSeconds(right.Age)
+		if leftOK && rightOK {
+			return compareInt64s(leftAge, rightAge)
+		}
+		if leftOK && !rightOK {
+			return -1
+		}
+		if !leftOK && rightOK {
+			return 1
+		}
+	case "ready":
+		return compareReadyValues(left.Ready, right.Ready)
+	}
+	leftValue := strings.ToLower(strings.TrimSpace(listValueForColumn(column, left)))
+	rightValue := strings.ToLower(strings.TrimSpace(listValueForColumn(column, right)))
+	return compareStrings(leftValue, rightValue)
+}
+
+func sortedResourceItemsForColumn(items []protocol.ResourceItem, column string, descending bool) []protocol.ResourceItem {
+	sorted := append([]protocol.ResourceItem(nil), items...)
+	sort.SliceStable(sorted, func(i int, j int) bool {
+		cmp := compareResourceItemsByColumn(sorted[i], sorted[j], column)
+		if cmp == 0 {
+			cmp = compareResourceItemsByColumn(sorted[i], sorted[j], "name")
+		}
+		if cmp == 0 {
+			cmp = compareResourceItemsByColumn(sorted[i], sorted[j], "namespace")
+		}
+		if cmp == 0 {
+			cmp = compareResourceItemsByColumn(sorted[i], sorted[j], "status")
+		}
+		if descending {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
+	return sorted
+}
+
+func (m model) sortedResourceItems(items []protocol.ResourceItem, resource string) []protocol.ResourceItem {
+	column := m.activeSortColumnForResource(resource)
+	if !m.columnSortableForResource(resource, column) {
+		column = "name"
+	}
+	return sortedResourceItemsForColumn(items, column, m.sortDescending)
+}
+
+func (m *model) sortResourceListItemsPreserveSelection() {
+	selectionKey := ""
+	if item, ok := m.currentItem(); ok {
+		selectionKey = resourceItemKey(item)
+	}
+	m.resourceList.Items = m.sortedResourceItems(m.resourceList.Items, m.resourceList.Resource)
+	if selectionKey != "" {
+		for idx, item := range m.resourceList.Items {
+			if resourceItemKey(item) == selectionKey {
+				m.selected = idx
+				m.session.Selection = item.Name
+				m.adjustListScrollForSelection()
+				return
+			}
+		}
+	}
+	m.selectFromSession()
+}
+
+func (m *model) setSort(column string, descending bool) {
+	column, ok := normalizeSortColumnToken(column)
+	if !ok {
+		column = "name"
+	}
+	if !m.columnSortableForResource(m.resourceList.Resource, column) {
+		column = "name"
+		descending = false
+	}
+	m.sortColumn = column
+	m.sortDescending = descending
+	m.sortResourceListItemsPreserveSelection()
+}
+
+func (m model) currentSortMessage() string {
+	column := sortColumnDisplayName(m.activeSortColumnForResource(m.resourceList.Resource))
+	return fmt.Sprintf("sorted by %s (%s)", column, sortDirectionLabel(m.sortDescending))
+}
+
+func (m *model) applySortShortcut(token string) bool {
+	if token == "r" {
+		m.setSort(m.activeSortColumnForResource(m.resourceList.Resource), !m.sortDescending)
+		m.commandMessage = m.currentSortMessage()
+		return true
+	}
+	index, ok := parseSortShortcutIndex(token)
+	if !ok {
+		return false
+	}
+	columns := m.sortableColumnsForResource(m.resourceList.Resource)
+	if index < 1 || index > len(columns) {
+		m.commandMessage = fmt.Sprintf("sort column %d unavailable", index)
+		return true
+	}
+	column := columns[index-1]
+	if strings.EqualFold(column, m.activeSortColumnForResource(m.resourceList.Resource)) {
+		m.setSort(column, !m.sortDescending)
+	} else {
+		m.setSort(column, false)
+	}
+	m.commandMessage = m.currentSortMessage()
+	return true
+}
+
 func renderListHeader(columns []listColumn) string {
 	values := make([]string, 0, len(columns))
 	for _, column := range columns {
@@ -5791,8 +6171,9 @@ func (m model) legendHints() []string {
 	if strings.EqualFold(strings.TrimSpace(m.session.Resource), "pods") && m.loadPodView != nil {
 		enterHint = "enter pod"
 	}
+	hints = append(hints, enterHint)
+	hints = append(hints, m.sortLegendHints()...)
 	hints = append(hints,
-		enterHint,
 		"d delete",
 		"e edit",
 		": cmd",
@@ -5801,6 +6182,19 @@ func (m model) legendHints() []string {
 		"C-y forward",
 		"q quit",
 	)
+	return hints
+}
+
+func (m model) sortLegendHints() []string {
+	columns := m.sortableColumnsForResource(m.resourceList.Resource)
+	hints := make([]string, 0, len(columns)+1)
+	for idx, column := range columns {
+		if idx >= 9 {
+			break
+		}
+		hints = append(hints, fmt.Sprintf("%d %s", idx+1, sortColumnLegendName(column)))
+	}
+	hints = append(hints, "r "+sortDirectionLabel(m.sortDescending))
 	return hints
 }
 
@@ -6747,6 +7141,16 @@ func (m model) commandSuggestions(input string) []string {
 			return prefixMatches([]string{"restart"}, valuePrefix)
 		}
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
+	case "sort", "order":
+		sortColumns := m.sortableColumnsForResource(m.resourceList.Resource)
+		sortOrders := []string{"asc", "desc", "toggle"}
+		if len(fields) == 1 {
+			return prefixMatches(append(sortColumns, sortOrders...), valuePrefix)
+		}
+		if len(fields) == 2 && !hasTrailingSpace {
+			return prefixMatches(append(sortColumns, sortOrders...), valuePrefix)
+		}
+		return prefixMatches(sortOrders, valuePrefix)
 	case "resource":
 		if len(fields) <= 1 || (len(fields) == 2 && !hasTrailingSpace) {
 			return prefixMatches(resourceSuggestions(), valuePrefix)
@@ -7164,6 +7568,8 @@ func baseSuggestions() []string {
 		"restart",
 		"rollout",
 		"scale",
+		"sort",
+		"order",
 		"ns",
 		"namespace",
 		"filter",
@@ -7460,7 +7866,7 @@ func commandSupportsArgument(token string) bool {
 		return true
 	}
 	switch token {
-	case "ctx", "context", "resource", "filter", "delete", "del", "rm", "edit", "logs", "scale", "restart", "rollout":
+	case "ctx", "context", "resource", "filter", "delete", "del", "rm", "edit", "logs", "scale", "restart", "rollout", "sort", "order":
 		return true
 	default:
 		return false
