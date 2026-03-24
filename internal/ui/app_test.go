@@ -373,6 +373,100 @@ func TestDeleteCommandRunsActionAndReloadsList(t *testing.T) {
 	}
 }
 
+func TestDeleteShortcutRunsBulkActionForMultiSelection(t *testing.T) {
+	var actionSeen []protocol.ActionQuery
+	var listReloads int
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "pod-0",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "pod-0", Namespace: "default", Status: "Running"},
+				{Name: "pod-1", Namespace: "default", Status: "Running"},
+				{Name: "pod-2", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadAction: func(_ context.Context, query protocol.ActionQuery) (protocol.ActionResult, error) {
+			actionSeen = append(actionSeen, query)
+			return protocol.ActionResult{
+				Success: true,
+				Code:    protocol.ActionCodeOK,
+				Message: "deleted",
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listReloads++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.multiSelectedItems = map[string]struct{}{
+		resourceItemKey(m.resourceList.Items[0]): {},
+		resourceItemKey(m.resourceList.Items[1]): {},
+	}
+	m.multiSelectAnchor = resourceItemKey(m.resourceList.Items[0])
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	withConfirm := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected confirmation before bulk delete action")
+	}
+	if !withConfirm.deleteConfirmOpen {
+		t.Fatalf("expected delete confirmation prompt")
+	}
+	if len(withConfirm.deleteConfirmTargets) != 2 {
+		t.Fatalf("expected 2 bulk delete targets, got %d", len(withConfirm.deleteConfirmTargets))
+	}
+	if !strings.Contains(withConfirm.commandMessage, "confirm delete 2 targets") {
+		t.Fatalf("expected bulk confirmation message, got %q", withConfirm.commandMessage)
+	}
+
+	updated, cmd = withConfirm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	withBulk := updated.(model)
+	if !withBulk.actionLoading {
+		t.Fatalf("expected bulk action loading after confirmation")
+	}
+	if cmd == nil {
+		t.Fatalf("expected bulk action command")
+	}
+
+	updated, nextCmd := withBulk.Update(cmd())
+	afterBulk := updated.(model)
+	if nextCmd == nil {
+		t.Fatalf("expected list reload after bulk delete")
+	}
+	if len(actionSeen) != 2 {
+		t.Fatalf("expected two delete actions, got %d", len(actionSeen))
+	}
+	if actionSeen[0].Name != "pod-0" || actionSeen[1].Name != "pod-1" {
+		t.Fatalf("unexpected bulk delete targets order: %#v", actionSeen)
+	}
+	if afterBulk.commandMessage != "deleted 2 targets" {
+		t.Fatalf("unexpected bulk result message: %q", afterBulk.commandMessage)
+	}
+
+	updated, _ = afterBulk.Update(nextCmd())
+	final := updated.(model)
+	if listReloads != 1 {
+		t.Fatalf("expected one list reload after bulk delete, got %d", listReloads)
+	}
+	if len(final.multiSelectedItems) != 0 {
+		t.Fatalf("expected multi-selection cleared after bulk delete, got %d", len(final.multiSelectedItems))
+	}
+}
+
 func TestDeleteCommandSupportsForceAndYesFlags(t *testing.T) {
 	var actionSeen protocol.ActionQuery
 
@@ -426,6 +520,76 @@ func TestDeleteCommandSupportsForceAndYesFlags(t *testing.T) {
 	_, _ = next.Update(cmd())
 	if !actionSeen.Force {
 		t.Fatalf("expected force flag to be forwarded in delete action query")
+	}
+}
+
+func TestDeleteCommandYesRunsBulkActionForMultiSelection(t *testing.T) {
+	var actionSeen []protocol.ActionQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "pod-0",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "pod-0", Namespace: "default", Status: "Running"},
+				{Name: "pod-1", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadAction: func(_ context.Context, query protocol.ActionQuery) (protocol.ActionResult, error) {
+			actionSeen = append(actionSeen, query)
+			return protocol.ActionResult{
+				Success: true,
+				Code:    protocol.ActionCodeOK,
+				Message: "deleted",
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.multiSelectedItems = map[string]struct{}{
+		resourceItemKey(m.resourceList.Items[0]): {},
+		resourceItemKey(m.resourceList.Items[1]): {},
+	}
+	m.multiSelectAnchor = resourceItemKey(m.resourceList.Items[0])
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("delete --yes")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	withBulk := updated.(model)
+	if withBulk.deleteConfirmOpen {
+		t.Fatalf("expected --yes to skip confirmation")
+	}
+	if !withBulk.actionLoading {
+		t.Fatalf("expected bulk action loading for --yes")
+	}
+	if cmd == nil {
+		t.Fatalf("expected bulk action command")
+	}
+
+	updated, nextCmd := withBulk.Update(cmd())
+	afterBulk := updated.(model)
+	if len(actionSeen) != 2 {
+		t.Fatalf("expected two delete actions, got %d", len(actionSeen))
+	}
+	if nextCmd == nil {
+		t.Fatalf("expected list reload after bulk delete")
+	}
+	if afterBulk.commandMessage != "deleted 2 targets" {
+		t.Fatalf("unexpected bulk result message: %q", afterBulk.commandMessage)
 	}
 }
 
@@ -2808,6 +2972,52 @@ func TestJumpBindingsMoveByTen(t *testing.T) {
 	}
 }
 
+func TestUppercaseJKExtendsListSelectionRange(t *testing.T) {
+	items := []protocol.ResourceItem{
+		{Name: "pod-0", Namespace: "default", Status: "Running"},
+		{Name: "pod-1", Namespace: "default", Status: "Running"},
+		{Name: "pod-2", Namespace: "default", Status: "Running"},
+	}
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "pod-0",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items:     items,
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'J'}})
+	withRange := updated.(model)
+	if withRange.selected != 1 {
+		t.Fatalf("expected active selection to move to index 1, got %d", withRange.selected)
+	}
+	if len(withRange.multiSelectedItems) != 2 {
+		t.Fatalf("expected 2 selected items in range, got %d", len(withRange.multiSelectedItems))
+	}
+	if !withRange.isItemMultiSelected(withRange.resourceList.Items[0]) {
+		t.Fatalf("expected first item to be in multi-selection range")
+	}
+	if withRange.isItemMultiSelected(withRange.resourceList.Items[1]) {
+		t.Fatalf("expected active row to not be marked as secondary multi-selection")
+	}
+
+	updated, _ = withRange.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	collapsed := updated.(model)
+	if collapsed.selected != 2 {
+		t.Fatalf("expected j to move active selection to index 2, got %d", collapsed.selected)
+	}
+	if len(collapsed.multiSelectedItems) != 0 {
+		t.Fatalf("expected normal movement to collapse multi-selection, got %d", len(collapsed.multiSelectedItems))
+	}
+}
+
 func TestRenderMainPaneTitleUsesClusterScopeForNodes(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -3471,6 +3681,60 @@ func TestMouseClickNamespaceInPodRowSwitchesNamespace(t *testing.T) {
 	}
 	if final.resourceList.Namespace != "payments" {
 		t.Fatalf("expected refreshed namespace payments, got %q", final.resourceList.Namespace)
+	}
+}
+
+func TestMouseShiftClickExtendsListSelectionRange(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "pod-0",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "pod-0", Namespace: "default", Status: "Running"},
+				{Name: "pod-1", Namespace: "default", Status: "Running"},
+				{Name: "pod-2", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.mouseCapture = true
+
+	updated, cmd := m.Update(tea.MouseMsg{
+		X:      clickXForColumn(t, m, 2, "status"),
+		Y:      8, // third item row
+		Shift:  true,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	withRange := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected shift-click to only adjust selection range")
+	}
+	if withRange.selected != 2 {
+		t.Fatalf("expected active selection to move to index 2, got %d", withRange.selected)
+	}
+	if len(withRange.multiSelectedItems) != 3 {
+		t.Fatalf("expected 3 items selected via shift-click range, got %d", len(withRange.multiSelectedItems))
+	}
+
+	updated, _ = withRange.Update(tea.MouseMsg{
+		X:      clickXForColumn(t, withRange, 1, "status"),
+		Y:      7, // second item row
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	collapsed := updated.(model)
+	if collapsed.selected != 1 {
+		t.Fatalf("expected single click to move selection to index 1, got %d", collapsed.selected)
+	}
+	if len(collapsed.multiSelectedItems) != 0 {
+		t.Fatalf("expected single click to clear multi-selection, got %d", len(collapsed.multiSelectedItems))
 	}
 }
 

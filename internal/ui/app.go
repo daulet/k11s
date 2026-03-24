@@ -116,6 +116,13 @@ type actionFailedMsg struct {
 	err error
 }
 
+type bulkDeleteLoadedMsg struct {
+	seq       int
+	total     int
+	succeeded int
+	failed    []string
+}
+
 type editCompletedMsg struct {
 	target string
 	err    error
@@ -545,6 +552,8 @@ type model struct {
 	sortDescending bool
 
 	selected               int
+	multiSelectedItems     map[string]struct{}
+	multiSelectAnchor      string
 	listScroll             int
 	loading                bool
 	requestSeq             int
@@ -575,6 +584,7 @@ type model struct {
 	actionActiveSeq        int
 	deleteConfirmOpen      bool
 	deleteConfirmQuery     protocol.ActionQuery
+	deleteConfirmTargets   []protocol.ActionQuery
 	deleteConfirmAccept    bool
 	deleteConfirmFocus     int
 	logs                   protocol.LogsPayload
@@ -669,6 +679,7 @@ func newModel(opts Options) model {
 		styles:                 newStyles(opts.UseColor),
 		sortColumn:             "name",
 		sortDescending:         false,
+		multiSelectedItems:     map[string]struct{}{},
 		flashingItems:          map[string]time.Time{},
 		podAnnotationOpen:      map[string]bool{},
 		podFlashingFields:      map[string]time.Time{},
@@ -795,6 +806,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clearFlashingItems()
 		}
 		m.selectFromSession()
+		m.pruneMultiSelection()
 		m.syncPodViewSelection()
 		m.syncDetailSelection()
 		m.syncLogsSelection()
@@ -920,6 +932,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.commandMessage = msg.result.Message
+		if m.loadResourceList == nil {
+			return m, nil
+		}
+		updatedModel, listCmd := m.startListReloadWithAnnouncement(false)
+		return updatedModel, listCmd
+	case bulkDeleteLoadedMsg:
+		if msg.seq != m.actionActiveSeq {
+			return m, nil
+		}
+		m.actionLoading = false
+		m.clearMultiSelection()
+		switch {
+		case msg.total <= 0:
+			m.commandMessage = "no delete targets selected"
+		case len(msg.failed) == 0:
+			m.commandMessage = fmt.Sprintf("deleted %d targets", msg.succeeded)
+		case msg.succeeded <= 0:
+			m.commandMessage = fmt.Sprintf(
+				"delete failed for %d targets: %s",
+				msg.total,
+				summarizeBulkDeleteFailures(msg.failed),
+			)
+		default:
+			m.commandMessage = fmt.Sprintf(
+				"deleted %d/%d targets; failures: %s",
+				msg.succeeded,
+				msg.total,
+				summarizeBulkDeleteFailures(msg.failed),
+			)
+		}
 		if m.loadResourceList == nil {
 			return m, nil
 		}
@@ -1132,6 +1174,14 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.navigateSelectedColumn("node", "shortcut")
 	case key.Matches(msg, m.keys.OpenOwner):
 		return m.navigateSelectedColumn("owner", "shortcut")
+	case isExtendSelectionJumpUp(msg):
+		m.extendSelection(-10)
+	case isExtendSelectionJumpDown(msg):
+		m.extendSelection(10)
+	case isExtendSelectionUp(msg):
+		m.extendSelection(-1)
+	case isExtendSelectionDown(msg):
+		m.extendSelection(1)
 	case key.Matches(msg, m.keys.JumpUp):
 		m.jumpSelection(-10)
 	case key.Matches(msg, m.keys.JumpDown):
@@ -1143,6 +1193,26 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func isExtendSelectionUp(msg tea.KeyMsg) bool {
+	keyText := strings.TrimSpace(msg.String())
+	return keyText == "K" || keyText == "shift+up"
+}
+
+func isExtendSelectionDown(msg tea.KeyMsg) bool {
+	keyText := strings.TrimSpace(msg.String())
+	return keyText == "J" || keyText == "shift+down"
+}
+
+func isExtendSelectionJumpUp(msg tea.KeyMsg) bool {
+	keyText := strings.TrimSpace(msg.String())
+	return keyText == "shift+pgup"
+}
+
+func isExtendSelectionJumpDown(msg tea.KeyMsg) bool {
+	keyText := strings.TrimSpace(msg.String())
+	return keyText == "shift+pgdown"
 }
 
 func (m model) updatePodViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1420,7 +1490,7 @@ func (m model) updateDeleteConfirmMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case msg.String() == "esc" || strings.EqualFold(msg.String(), "n"):
-		m.deleteConfirmOpen = false
+		m.resetDeleteConfirmation()
 		m.commandMessage = "delete canceled"
 		return m, nil
 	case msg.String() == "!" || strings.EqualFold(msg.String(), "f"):
@@ -1436,15 +1506,23 @@ func (m model) updateDeleteConfirmMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case strings.EqualFold(msg.String(), "y"):
 		query := m.deleteConfirmQuery
-		m.deleteConfirmOpen = false
+		targets := append([]protocol.ActionQuery(nil), m.deleteConfirmTargets...)
+		m.resetDeleteConfirmation()
+		if len(targets) > 1 {
+			return m.startBulkDeleteAction(targets, query.Force)
+		}
 		return m.startAction(query)
 	case msg.Type == tea.KeyEnter:
 		if m.deleteConfirmAccept {
 			query := m.deleteConfirmQuery
-			m.deleteConfirmOpen = false
+			targets := append([]protocol.ActionQuery(nil), m.deleteConfirmTargets...)
+			m.resetDeleteConfirmation()
+			if len(targets) > 1 {
+				return m.startBulkDeleteAction(targets, query.Force)
+			}
 			return m.startAction(query)
 		}
-		m.deleteConfirmOpen = false
+		m.resetDeleteConfirmation()
 		m.commandMessage = "delete canceled"
 		return m, nil
 	default:
@@ -1482,6 +1560,10 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	itemIndex, ok := m.itemIndexAtBodyLine(lineIndex)
 	if !ok {
+		return m, nil
+	}
+	if msg.Shift {
+		m.extendSelectionTo(itemIndex)
 		return m, nil
 	}
 	m.setSelection(itemIndex)
@@ -2530,13 +2612,19 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m.startLogs(logsQuery)
 		}
-		if deleteQuery, executeNow, isDelete, deleteErr := m.deleteQueryFromCommand(commandText); isDelete {
+		if deleteQuery, bulkTargets, executeNow, isDelete, deleteErr := m.deleteQueryFromCommand(commandText); isDelete {
 			if deleteErr != nil {
 				m.enterCommandMode()
 				m.input.SetValue(commandText)
 				m.commandMessage = deleteErr.Error()
 				m.suggestions = m.commandSuggestions(m.input.Value())
 				return m, nil
+			}
+			if len(bulkTargets) > 1 {
+				if executeNow {
+					return m.startBulkDeleteAction(bulkTargets, deleteQuery.Force)
+				}
+				return m.startDeleteConfirmationForTargets(bulkTargets, "command")
 			}
 			if executeNow {
 				return m.startAction(deleteQuery)
@@ -2927,10 +3015,49 @@ func (m *model) jumpSelection(delta int) {
 	m.setSelection(next)
 }
 
+func (m *model) extendSelection(delta int) {
+	if len(m.resourceList.Items) == 0 || delta == 0 {
+		return
+	}
+	next := m.selected + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(m.resourceList.Items) {
+		next = len(m.resourceList.Items) - 1
+	}
+	m.extendSelectionTo(next)
+}
+
+func (m *model) extendSelectionTo(index int) {
+	if index < 0 || index >= len(m.resourceList.Items) {
+		return
+	}
+
+	anchorIndex, ok := m.indexForItemKey(m.multiSelectAnchor)
+	if !ok {
+		anchorIndex = m.selected
+		if anchorIndex < 0 || anchorIndex >= len(m.resourceList.Items) {
+			anchorIndex = index
+		}
+		m.multiSelectAnchor = resourceItemKey(m.resourceList.Items[anchorIndex])
+	}
+
+	m.selected = index
+	m.session.Selection = m.currentSelection()
+	m.clearDetail()
+	m.setMultiSelectionRange(anchorIndex, index)
+	if count := len(m.multiSelectedItems); count > 1 {
+		m.commandMessage = fmt.Sprintf("%d rows selected", count)
+	}
+	m.adjustListScrollForSelection()
+}
+
 func (m *model) setSelection(index int) {
 	if index < 0 || index >= len(m.resourceList.Items) {
 		return
 	}
+	m.clearMultiSelection()
 	if m.selected == index {
 		m.session.Selection = m.currentSelection()
 		m.adjustListScrollForSelection()
@@ -2940,6 +3067,65 @@ func (m *model) setSelection(index int) {
 	m.session.Selection = m.currentSelection()
 	m.clearDetail()
 	m.adjustListScrollForSelection()
+}
+
+func (m *model) setMultiSelectionRange(anchorIndex int, targetIndex int) {
+	if anchorIndex < 0 || anchorIndex >= len(m.resourceList.Items) ||
+		targetIndex < 0 || targetIndex >= len(m.resourceList.Items) {
+		return
+	}
+	if m.multiSelectedItems == nil {
+		m.multiSelectedItems = map[string]struct{}{}
+	}
+	for key := range m.multiSelectedItems {
+		delete(m.multiSelectedItems, key)
+	}
+	start := anchorIndex
+	end := targetIndex
+	if start > end {
+		start, end = end, start
+	}
+	for i := start; i <= end; i++ {
+		m.multiSelectedItems[resourceItemKey(m.resourceList.Items[i])] = struct{}{}
+	}
+}
+
+func (m *model) clearMultiSelection() {
+	m.multiSelectAnchor = ""
+	if m.multiSelectedItems == nil {
+		m.multiSelectedItems = map[string]struct{}{}
+		return
+	}
+	for key := range m.multiSelectedItems {
+		delete(m.multiSelectedItems, key)
+	}
+}
+
+func (m *model) pruneMultiSelection() {
+	if len(m.multiSelectedItems) == 0 && strings.TrimSpace(m.multiSelectAnchor) == "" {
+		return
+	}
+	if len(m.resourceList.Items) == 0 {
+		m.clearMultiSelection()
+		return
+	}
+	available := make(map[string]struct{}, len(m.resourceList.Items))
+	for _, item := range m.resourceList.Items {
+		available[resourceItemKey(item)] = struct{}{}
+	}
+	for key := range m.multiSelectedItems {
+		if _, ok := available[key]; !ok {
+			delete(m.multiSelectedItems, key)
+		}
+	}
+	if m.multiSelectAnchor != "" {
+		if _, ok := available[m.multiSelectAnchor]; !ok {
+			m.multiSelectAnchor = ""
+		}
+	}
+	if len(m.multiSelectedItems) <= 1 {
+		m.clearMultiSelection()
+	}
 }
 
 func (m *model) adjustListScrollForSelection() {
@@ -3143,6 +3329,34 @@ func (m model) isItemFlashing(item protocol.ResourceItem) bool {
 
 func resourceItemKey(item protocol.ResourceItem) string {
 	return strings.TrimSpace(item.Namespace) + "/" + strings.TrimSpace(item.Name)
+}
+
+func (m model) indexForItemKey(key string) (int, bool) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return 0, false
+	}
+	for idx, item := range m.resourceList.Items {
+		if resourceItemKey(item) == key {
+			return idx, true
+		}
+	}
+	return 0, false
+}
+
+func (m model) isItemMultiSelected(item protocol.ResourceItem) bool {
+	if len(m.multiSelectedItems) == 0 {
+		return false
+	}
+	key := resourceItemKey(item)
+	if _, ok := m.multiSelectedItems[key]; !ok {
+		return false
+	}
+	current, ok := m.currentItem()
+	if !ok {
+		return true
+	}
+	return resourceItemKey(current) != key
 }
 
 func resourceItemSame(left protocol.ResourceItem, right protocol.ResourceItem) bool {
@@ -3657,21 +3871,21 @@ func (m model) startDirectOpen(invocation directOpenInvocation, via string) (tea
 	}, true)
 }
 
-func (m model) deleteQueryFromCommand(input string) (query protocol.ActionQuery, executeNow bool, handled bool, err error) {
+func (m model) deleteQueryFromCommand(input string) (query protocol.ActionQuery, bulk []protocol.ActionQuery, executeNow bool, handled bool, err error) {
 	fields := strings.Fields(input)
 	if len(fields) == 0 {
-		return protocol.ActionQuery{}, false, false, nil
+		return protocol.ActionQuery{}, nil, false, false, nil
 	}
 	command := strings.ToLower(strings.TrimSpace(fields[0]))
 	switch command {
 	case "delete", "del", "rm":
 	default:
-		return protocol.ActionQuery{}, false, false, nil
+		return protocol.ActionQuery{}, nil, false, false, nil
 	}
 
-	name, itemNamespace, force, confirmed, parseErr := m.parseDeleteCommandArgs(fields[1:])
+	name, itemNamespace, force, confirmed, explicitTarget, parseErr := m.parseDeleteCommandArgs(fields[1:])
 	if parseErr != nil {
-		return protocol.ActionQuery{}, false, true, parseErr
+		return protocol.ActionQuery{}, nil, false, true, parseErr
 	}
 	resource := strings.TrimSpace(m.session.Resource)
 	if activeResource, _, _, ok := m.activeActionTarget(); ok && strings.TrimSpace(activeResource) != "" {
@@ -3687,10 +3901,15 @@ func (m model) deleteQueryFromCommand(input string) (query protocol.ActionQuery,
 		Name:          name,
 		Force:         force,
 	}
-	return query, confirmed, true, nil
+	if !explicitTarget {
+		if targets := m.multiDeleteTargetsForList(force); len(targets) > 1 {
+			return query, targets, confirmed, true, nil
+		}
+	}
+	return query, nil, confirmed, true, nil
 }
 
-func (m model) parseDeleteCommandArgs(args []string) (name string, itemNamespace string, force bool, confirmed bool, err error) {
+func (m model) parseDeleteCommandArgs(args []string) (name string, itemNamespace string, force bool, confirmed bool, explicitTarget bool, err error) {
 	target := ""
 	for _, raw := range args {
 		value := strings.TrimSpace(raw)
@@ -3706,14 +3925,15 @@ func (m model) parseDeleteCommandArgs(args []string) (name string, itemNamespace
 			continue
 		}
 		if strings.HasPrefix(value, "-") {
-			return "", "", false, false, fmt.Errorf("unsupported delete option %q", raw)
+			return "", "", false, false, false, fmt.Errorf("unsupported delete option %q", raw)
 		}
 		if target != "" {
-			return "", "", false, false, fmt.Errorf("delete accepts at most one target: try `:delete <name>`")
+			return "", "", false, false, false, fmt.Errorf("delete accepts at most one target: try `:delete <name>`")
 		}
 		target = value
 	}
 	if target != "" {
+		explicitTarget = true
 		if ns, itemName, ok := strings.Cut(target, "/"); ok {
 			itemNamespace = strings.TrimSpace(ns)
 			name = strings.TrimSpace(itemName)
@@ -3721,15 +3941,15 @@ func (m model) parseDeleteCommandArgs(args []string) (name string, itemNamespace
 			name = target
 		}
 		if name == "" {
-			return "", "", false, false, fmt.Errorf("action target name is required")
+			return "", "", false, false, false, fmt.Errorf("action target name is required")
 		}
 	} else {
 		resource, resolvedName, resolvedNamespace, ok := m.activeActionTarget()
 		if !ok {
-			return "", "", false, false, fmt.Errorf("action target required: select an item or pass `<name>`")
+			return "", "", false, false, false, fmt.Errorf("action target required: select an item or pass `<name>`")
 		}
 		if resource == "" || resolvedName == "" {
-			return "", "", false, false, fmt.Errorf("action target name is required")
+			return "", "", false, false, false, fmt.Errorf("action target name is required")
 		}
 		name = resolvedName
 		itemNamespace = resolvedNamespace
@@ -3737,7 +3957,7 @@ func (m model) parseDeleteCommandArgs(args []string) (name string, itemNamespace
 	if itemNamespace == "-" || strings.EqualFold(itemNamespace, "<cluster>") || strings.EqualFold(itemNamespace, "all") {
 		itemNamespace = ""
 	}
-	return name, itemNamespace, force, confirmed, nil
+	return name, itemNamespace, force, confirmed, explicitTarget, nil
 }
 
 func (m model) editInvocationFromCommand(input string) (editInvocation, bool, error) {
@@ -3941,20 +4161,74 @@ func deleteTargetLabel(query protocol.ActionQuery) string {
 	return name
 }
 
+func cloneDeleteTargetsWithForce(targets []protocol.ActionQuery, force bool) []protocol.ActionQuery {
+	if len(targets) == 0 {
+		return nil
+	}
+	cloned := make([]protocol.ActionQuery, 0, len(targets))
+	for _, target := range targets {
+		target.Action = protocol.ActionDelete
+		target.Resource = normalizeResourceInput(target.Resource)
+		if target.Resource == "" {
+			target.Resource = "pods"
+		}
+		target.Name = strings.TrimSpace(target.Name)
+		target.ItemNamespace = sanitizeActionNamespace(target.ItemNamespace)
+		target.Force = force
+		if target.Name == "" {
+			continue
+		}
+		cloned = append(cloned, target)
+	}
+	return cloned
+}
+
 func (m model) deleteConfirmationMessage() string {
 	query := m.deleteConfirmQuery
-	target := deleteTargetLabel(query)
+	targetCount := len(m.deleteConfirmTargets)
+	if targetCount <= 0 {
+		targetCount = 1
+	}
 	resource := strings.TrimSpace(query.Resource)
 	if resource == "" {
 		resource = strings.TrimSpace(m.session.Resource)
 	}
+	if targetCount > 1 {
+		if query.Force {
+			return fmt.Sprintf(
+				"confirm force delete %d targets in %s? (enter/y confirm, n/esc cancel, ! toggle force)",
+				targetCount,
+				resource,
+			)
+		}
+		return fmt.Sprintf(
+			"confirm delete %d targets in %s? (enter/y confirm, n/esc cancel, ! toggle force)",
+			targetCount,
+			resource,
+		)
+	}
+	target := deleteTargetLabel(query)
 	if query.Force {
 		return fmt.Sprintf("confirm force delete %s %s? (enter/y confirm, n/esc cancel, ! toggle force)", resource, target)
 	}
 	return fmt.Sprintf("confirm delete %s %s? (enter/y confirm, n/esc cancel, ! toggle force)", resource, target)
 }
 
+func summarizeBulkDeleteFailures(failures []string) string {
+	if len(failures) == 0 {
+		return ""
+	}
+	if len(failures) <= 2 {
+		return strings.Join(failures, "; ")
+	}
+	return fmt.Sprintf("%s; %s; +%d more", failures[0], failures[1], len(failures)-2)
+}
+
 func (m model) startDeleteConfirmationForActive(force bool, via string) (tea.Model, tea.Cmd) {
+	if targets := m.multiDeleteTargetsForList(force); len(targets) > 1 {
+		return m.startDeleteConfirmationForTargets(targets, via)
+	}
+
 	resource, name, itemNamespace, ok := m.activeActionTarget()
 	if !ok {
 		m.commandMessage = "delete target required: select an item first"
@@ -3973,7 +4247,54 @@ func (m model) startDeleteConfirmationForActive(force bool, via string) (tea.Mod
 	return m.startDeleteConfirmation(query, via)
 }
 
+func (m model) multiDeleteTargetsForList(force bool) []protocol.ActionQuery {
+	if m.podViewOpen || m.resourceViewOpen {
+		return nil
+	}
+	if len(m.multiSelectedItems) <= 1 {
+		return nil
+	}
+	resource := normalizeResourceInput(m.session.Resource)
+	if resource == "" {
+		resource = "pods"
+	}
+	targets := make([]protocol.ActionQuery, 0, len(m.multiSelectedItems))
+	for _, item := range m.resourceList.Items {
+		if _, ok := m.multiSelectedItems[resourceItemKey(item)]; !ok {
+			continue
+		}
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			continue
+		}
+		targets = append(targets, protocol.ActionQuery{
+			Action:        protocol.ActionDelete,
+			KubeContext:   m.session.KubeContext,
+			Resource:      resource,
+			Namespace:     m.session.Namespace,
+			Filter:        m.session.Filter,
+			ItemNamespace: sanitizeActionNamespace(item.Namespace),
+			Name:          name,
+			Force:         force,
+		})
+	}
+	return targets
+}
+
+func (m model) startDeleteConfirmationForTargets(targets []protocol.ActionQuery, via string) (tea.Model, tea.Cmd) {
+	if len(targets) == 0 {
+		m.commandMessage = "delete target required: select an item first"
+		return m, nil
+	}
+	first := targets[0]
+	return m.startDeleteConfirmationWithTargets(first, targets, via)
+}
+
 func (m model) startDeleteConfirmation(query protocol.ActionQuery, via string) (tea.Model, tea.Cmd) {
+	return m.startDeleteConfirmationWithTargets(query, []protocol.ActionQuery{query}, via)
+}
+
+func (m model) startDeleteConfirmationWithTargets(query protocol.ActionQuery, targets []protocol.ActionQuery, via string) (tea.Model, tea.Cmd) {
 	query.Action = protocol.ActionDelete
 	query.Resource = normalizeResourceInput(query.Resource)
 	if query.Resource == "" {
@@ -3985,8 +4306,14 @@ func (m model) startDeleteConfirmation(query protocol.ActionQuery, via string) (
 		m.commandMessage = "delete target name is required"
 		return m, nil
 	}
+	clonedTargets := cloneDeleteTargetsWithForce(targets, query.Force)
+	if len(clonedTargets) == 0 {
+		m.commandMessage = "delete target required: select an item first"
+		return m, nil
+	}
 	m.deleteConfirmOpen = true
 	m.deleteConfirmQuery = query
+	m.deleteConfirmTargets = clonedTargets
 	m.deleteConfirmAccept = false
 	m.deleteConfirmFocus = deleteConfirmFocusDecision
 	m.commandMessage = m.deleteConfirmationMessage()
@@ -3994,6 +4321,13 @@ func (m model) startDeleteConfirmation(query protocol.ActionQuery, via string) (
 		m.commandMessage = m.commandMessage + fmt.Sprintf(" [%s]", strings.TrimSpace(via))
 	}
 	return m, nil
+}
+
+func (m *model) resetDeleteConfirmation() {
+	m.deleteConfirmOpen = false
+	m.deleteConfirmAccept = false
+	m.deleteConfirmFocus = deleteConfirmFocusDecision
+	m.deleteConfirmTargets = nil
 }
 
 func (m model) editInvocation(resource string, name string, itemNamespace string) (editInvocation, error) {
@@ -4287,6 +4621,21 @@ func (m model) startAction(query protocol.ActionQuery) (tea.Model, tea.Cmd) {
 	return m, m.loadActionCmd(ctx, cancel, m.actionActiveSeq, query)
 }
 
+func (m model) startBulkDeleteAction(targets []protocol.ActionQuery, force bool) (tea.Model, tea.Cmd) {
+	targets = cloneDeleteTargetsWithForce(targets, force)
+	if len(targets) == 0 {
+		m.commandMessage = "no delete targets selected"
+		return m, nil
+	}
+	m.actionRequestSeq++
+	m.actionActiveSeq = m.actionRequestSeq
+	m.actionLoading = true
+	m.commandMessage = fmt.Sprintf("delete %d targets...", len(targets))
+	ctx, cancel := context.WithCancel(context.Background())
+	m.setActionCancel(cancel)
+	return m, m.loadBulkDeleteCmd(ctx, cancel, m.actionActiveSeq, targets)
+}
+
 func (m model) startLogs(query protocol.LogsQuery) (tea.Model, tea.Cmd) {
 	return m.startLogsWithAnnouncement(query, true)
 }
@@ -4440,6 +4789,56 @@ func (m model) loadActionCmd(
 			return actionFailedMsg{seq: seq, err: err}
 		}
 		return actionLoadedMsg{seq: seq, result: result}
+	}
+}
+
+func (m model) loadBulkDeleteCmd(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	seq int,
+	targets []protocol.ActionQuery,
+) tea.Cmd {
+	if m.loadAction == nil {
+		return func() tea.Msg {
+			return actionFailedMsg{
+				seq: seq,
+				err: fmt.Errorf("action loader is not configured"),
+			}
+		}
+	}
+
+	return func() tea.Msg {
+		if cancel != nil {
+			defer cancel()
+		}
+		result := bulkDeleteLoadedMsg{
+			seq:   seq,
+			total: len(targets),
+		}
+		for _, query := range targets {
+			if err := ctx.Err(); err != nil {
+				return actionFailedMsg{seq: seq, err: err}
+			}
+			actionResult, err := m.loadAction(ctx, query)
+			if err != nil {
+				result.failed = append(result.failed, fmt.Sprintf("%s (%v)", deleteTargetLabel(query), err))
+				continue
+			}
+			if actionResult.Success {
+				result.succeeded++
+				continue
+			}
+			code := strings.TrimSpace(string(actionResult.Code))
+			if code == "" {
+				code = string(protocol.ActionCodeInternal)
+			}
+			msg := strings.TrimSpace(actionResult.Message)
+			if msg == "" {
+				msg = "unknown error"
+			}
+			result.failed = append(result.failed, fmt.Sprintf("%s (%s: %s)", deleteTargetLabel(query), code, msg))
+		}
+		return result
 	}
 }
 
@@ -4744,7 +5143,13 @@ func (m model) renderDeleteConfirmPopupBody(contentWidth int) []string {
 	if resource == "" {
 		resource = strings.TrimSpace(m.session.Resource)
 	}
-	target := deleteTargetLabel(query)
+	targetCount := len(m.deleteConfirmTargets)
+	targetLine := ""
+	if targetCount > 1 {
+		targetLine = fmt.Sprintf("Targets: %s (%d selected)", resource, targetCount)
+	} else {
+		targetLine = fmt.Sprintf("Target: %s %s", resource, deleteTargetLabel(query))
+	}
 	title := "Delete Resource"
 	if query.Force {
 		title = "Force Delete Resource"
@@ -4779,7 +5184,7 @@ func (m model) renderDeleteConfirmPopupBody(contentWidth int) []string {
 	bodyLines := make([]string, 0, 16)
 	bodyLines = append(bodyLines, renderStyledWrappedLines(title, modalWidth, m.styles.DeleteTitle, false)...)
 	bodyLines = append(bodyLines, "")
-	bodyLines = append(bodyLines, renderStyledWrappedLines(fmt.Sprintf("Target: %s %s", resource, target), modalWidth, lipgloss.NewStyle(), false)...)
+	bodyLines = append(bodyLines, renderStyledWrappedLines(targetLine, modalWidth, lipgloss.NewStyle(), false)...)
 	bodyLines = append(bodyLines, "")
 	bodyLines = append(bodyLines, yesNoLine)
 	bodyLines = append(bodyLines, "")
@@ -5866,6 +6271,8 @@ func (m model) listLines() []string {
 		line := m.renderListItem(columns, item)
 		if i == m.selected {
 			line = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(plainLine, "  "))
+		} else if m.isItemMultiSelected(item) {
+			line = m.styles.SelectedRow.Render("* " + strings.TrimPrefix(plainLine, "  "))
 		} else if m.isItemFlashing(item) {
 			// Flash highlighting must take precedence over per-cell clickable colors.
 			line = m.styles.ChangedRow.Render(plainLine)
@@ -6826,6 +7233,7 @@ func (m model) legendHints() []string {
 	hints = append(hints, enterHint)
 	hints = append(hints, m.sortLegendHints()...)
 	hints = append(hints,
+		"J/K range",
 		"d delete",
 		"e edit",
 		mouseHint,
@@ -6836,7 +7244,7 @@ func (m model) legendHints() []string {
 		"q quit",
 	)
 	if m.mouseCapture {
-		hints = append(hints, "click links")
+		hints = append(hints, "click links", "S-click range")
 	}
 	return hints
 }
