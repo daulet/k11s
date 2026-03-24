@@ -3160,7 +3160,7 @@ func (m *model) refreshLogsView() error {
 		return nil
 	}
 	if m.logsOutputFormat == logsOutputRaw {
-		view.Lines = append([]string(nil), m.logs.Lines...)
+		view.Lines = decodeANSIEscapeLiteralLines(m.logs.Lines)
 		m.logsView = view
 		return nil
 	}
@@ -3170,13 +3170,50 @@ func (m *model) refreshLogsView() error {
 	}
 	formatted, err := run(m.logs.Lines)
 	if err != nil {
-		view.Lines = append([]string(nil), m.logs.Lines...)
+		view.Lines = decodeANSIEscapeLiteralLines(m.logs.Lines)
 		m.logsView = view
 		return err
 	}
-	view.Lines = formatted
+	view.Lines = decodeANSIEscapeLiteralLines(formatted)
 	m.logsView = view
 	return nil
+}
+
+func decodeANSIEscapeLiteralLines(lines []string) []string {
+	if len(lines) == 0 {
+		return nil
+	}
+	decoded := make([]string, len(lines))
+	for i, line := range lines {
+		decoded[i] = decodeANSIEscapeLiterals(line)
+	}
+	return decoded
+}
+
+func decodeANSIEscapeLiterals(value string) string {
+	if value == "" || !strings.Contains(value, `\`) {
+		return value
+	}
+
+	replaced := value
+	// Handle both once-escaped and double-escaped literals that commonly
+	// appear in JSON logs and unjson output.
+	pairs := [][2]string{
+		{`\\u001b`, "\x1b"},
+		{`\\u001B`, "\x1b"},
+		{`\\x1b`, "\x1b"},
+		{`\\x1B`, "\x1b"},
+		{`\\033`, "\x1b"},
+		{`\u001b`, "\x1b"},
+		{`\u001B`, "\x1b"},
+		{`\x1b`, "\x1b"},
+		{`\x1B`, "\x1b"},
+		{`\033`, "\x1b"},
+	}
+	for _, pair := range pairs {
+		replaced = strings.ReplaceAll(replaced, pair[0], pair[1])
+	}
+	return replaced
 }
 
 func runUnjsonCommand(lines []string) ([]string, error) {
@@ -5293,9 +5330,9 @@ func (m model) podLogsLines(width int) []string {
 		return lines
 	}
 
-	for _, line := range payload.Lines {
-		lines = appendWrappedLines(lines, line, width)
-	}
+	// Keep raw log lines intact so ANSI colors and spacing/ascii formatting survive.
+	// Width clipping is handled later by fitDisplayWidth during pane rendering.
+	lines = append(lines, payload.Lines...)
 	if payload.Truncated {
 		lines = append(lines, "... output truncated")
 	}

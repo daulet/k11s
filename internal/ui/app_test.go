@@ -2505,6 +2505,81 @@ func TestPodLogsFormatShortcutTogglesUnjsonAndBackToRaw(t *testing.T) {
 	}
 }
 
+func TestRefreshLogsViewDecodesEscapedANSILiterals(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Lines: []string{
+			`info msg=\u001b[36mcyborg-container\u001b[0m`,
+			`info msg=\\u001b[35mcyborg-alt\\u001b[0m`,
+		},
+	}
+
+	if err := m.refreshLogsView(); err != nil {
+		t.Fatalf("refresh logs view: %v", err)
+	}
+	if len(m.logsView.Lines) != 2 {
+		t.Fatalf("expected two log lines in logs view, got %#v", m.logsView.Lines)
+	}
+	if !strings.Contains(m.logsView.Lines[0], "\x1b[36mcyborg-container\x1b[0m") {
+		t.Fatalf("expected single-escaped ANSI to decode, got %q", m.logsView.Lines[0])
+	}
+	if !strings.Contains(m.logsView.Lines[1], "\x1b[35mcyborg-alt\x1b[0m") {
+		t.Fatalf("expected double-escaped ANSI to decode, got %q", m.logsView.Lines[1])
+	}
+}
+
+func TestPodLogsFormatShortcutDecodesEscapedANSIFromUnjson(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.podViewOpen = true
+	m.podViewTab = 2 // overview + container + logs
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Containers: []protocol.PodContainer{
+			{Name: "app"},
+		},
+	}
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Lines:         []string{`{"msg":"x"}`},
+	}
+	m.runUnjson = func(lines []string) ([]string, error) {
+		return []string{`info msg=\u001b[32mcyborg-container\u001b[0m`}, nil
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	withUnjson := updated.(model)
+	if withUnjson.logsOutputFormat != logsOutputUnjson {
+		t.Fatalf("expected logs output format unjson, got %q", withUnjson.logsOutputFormat)
+	}
+	if len(withUnjson.logsView.Lines) != 1 {
+		t.Fatalf("expected one formatted log line, got %#v", withUnjson.logsView.Lines)
+	}
+	if !strings.Contains(withUnjson.logsView.Lines[0], "\x1b[32mcyborg-container\x1b[0m") {
+		t.Fatalf("expected escaped ANSI from unjson output to decode, got %q", withUnjson.logsView.Lines[0])
+	}
+}
+
 func TestPodYAMLSlashSearchAppliesAndScrollsToMatch(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -5190,6 +5265,48 @@ func TestPodLogsLinesDistinguishLoadingVsNoLogs(t *testing.T) {
 	}
 	if rendered := strings.Join(nonFollowEmpty.podLogsLines(90), "\n"); !strings.Contains(rendered, "no logs for this container") {
 		t.Fatalf("expected explicit no-logs non-follow state, got %q", rendered)
+	}
+}
+
+func TestPodLogsLinesPreserveANSIAndSpacing(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "mc1-lab1",
+			Namespace:   "inference-engine",
+			Resource:    "pods",
+		},
+	})
+	m.podViewOpen = true
+	m.podViewTab = 1 // overview + logs
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "mc1-lab1",
+		Namespace:   "inference-engine",
+		Name:        "cyborg-conductor",
+		Found:       true,
+	}
+	raw := "\x1b[36mcyborg-container\x1b[0m  |  /\\_/\\"
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "inference-engine",
+		ItemNamespace: "inference-engine",
+		Name:          "cyborg-conductor",
+		Lines:         []string{raw},
+	}
+
+	lines := m.podLogsLines(120)
+	if len(lines) != 1 {
+		t.Fatalf("expected single raw pod log line, got %#v", lines)
+	}
+	if lines[0] != raw {
+		t.Fatalf("expected ANSI/spaces preserved, got %q", lines[0])
+	}
+
+	rendered := m.renderMainPane(120, 20)
+	if !strings.Contains(rendered, "\x1b[36mcyborg-container\x1b[0m") {
+		t.Fatalf("expected rendered pane to retain ANSI color codes, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "  |  /\\_/\\") {
+		t.Fatalf("expected rendered pane to retain spacing/ascii section, got %q", rendered)
 	}
 }
 
