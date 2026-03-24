@@ -670,7 +670,7 @@ func newModel(opts Options) model {
 		podAnnotationOpen:      map[string]bool{},
 		podFlashingFields:      map[string]time.Time{},
 		resourceFlashingFields: map[string]time.Time{},
-		mouseCapture:           true,
+		mouseCapture:           false,
 		flashDuration:          defaultRowFlashDuration,
 		logsTailLines:          defaultLogsTailLines,
 		logsOutputFormat:       logsOutputRaw,
@@ -689,6 +689,11 @@ func newModel(opts Options) model {
 
 func (m model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.schedulePoll(), m.scheduleNamespacePoll(), m.scheduleCRDPoll()}
+	if m.mouseCapture {
+		cmds = append(cmds, enableMouseCaptureCmd())
+	} else {
+		cmds = append(cmds, disableMouseCaptureCmd())
+	}
 	if m.loadNamespaces != nil {
 		cmds = append(cmds, m.loadNamespacesCmd(m.session.KubeContext))
 	}
@@ -1027,6 +1032,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		if msg.Type == tea.KeyF2 {
+			return m.toggleMouseCapture()
+		}
 		if m.commandMode {
 			return m.updateCommandMode(msg)
 		}
@@ -1174,14 +1182,6 @@ func (m model) updatePodViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clearPodView()
 		m.commandMessage = "closed pod view"
 		return m, nil
-	case msg.String() == "f2":
-		m.mouseCapture = !m.mouseCapture
-		if m.mouseCapture {
-			m.commandMessage = "mouse capture enabled"
-			return m, enableMouseCaptureCmd()
-		}
-		m.commandMessage = "mouse capture disabled (use terminal text selection)"
-		return m, disableMouseCaptureCmd()
 	case msg.Type == tea.KeyTab || msg.String() == "right":
 		m.stepPodViewTab(1)
 		if m.isPodLogsTabActive() {
@@ -1450,6 +1450,9 @@ func (m model) updateDeleteConfirmMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if !m.mouseCapture {
+		return m, nil
+	}
 	if m.commandMode || m.searchMode || m.deleteConfirmOpen {
 		return m, nil
 	}
@@ -6325,6 +6328,11 @@ func (m model) renderFooter(width int) string {
 }
 
 func (m model) legendHints() []string {
+	mouseHint := "F2 mouse-on"
+	if m.mouseCapture {
+		mouseHint = "F2 text-select"
+	}
+
 	if m.commandMode {
 		if m.autocomplete.active {
 			return []string{
@@ -6408,6 +6416,7 @@ func (m model) legendHints() []string {
 			"n/N next/prev",
 			"d delete",
 			"e edit",
+			mouseHint,
 			"esc back",
 			": cmd",
 			"q quit",
@@ -6437,6 +6446,7 @@ func (m model) legendHints() []string {
 	hints = append(hints,
 		"d delete",
 		"e edit",
+		mouseHint,
 		": cmd",
 		"/ search",
 		"C-o back",
@@ -6444,6 +6454,16 @@ func (m model) legendHints() []string {
 		"q quit",
 	)
 	return hints
+}
+
+func (m model) toggleMouseCapture() (tea.Model, tea.Cmd) {
+	m.mouseCapture = !m.mouseCapture
+	if m.mouseCapture {
+		m.commandMessage = "mouse capture enabled"
+		return m, enableMouseCaptureCmd()
+	}
+	m.commandMessage = "mouse capture disabled (use terminal text selection)"
+	return m, disableMouseCaptureCmd()
 }
 
 func (m model) sortLegendHints() []string {

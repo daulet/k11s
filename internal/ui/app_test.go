@@ -3240,6 +3240,7 @@ func TestMouseClickNamespaceInPodRowSwitchesNamespace(t *testing.T) {
 			}, nil
 		},
 	})
+	m.mouseCapture = true
 
 	msg := tea.MouseMsg{
 		X:      clickXForColumn(t, m, 0, "namespace"),
@@ -3299,6 +3300,7 @@ func TestMouseClickNodeInPodRowOpensNodeDetail(t *testing.T) {
 			}, nil
 		},
 	})
+	m.mouseCapture = true
 
 	msg := tea.MouseMsg{
 		X:      clickXForColumn(t, m, 0, "node"),
@@ -3364,6 +3366,7 @@ func TestMouseClickOwnerInPodRowOpensOwnerResource(t *testing.T) {
 			}, nil
 		},
 	})
+	m.mouseCapture = true
 
 	msg := tea.MouseMsg{
 		X:      clickXForColumn(t, m, 0, "owner"),
@@ -4929,6 +4932,7 @@ func TestBackShortcutAfterMouseNodeJump(t *testing.T) {
 			}, nil
 		},
 	})
+	m.mouseCapture = true
 
 	clickNode := tea.MouseMsg{
 		X:      clickXForColumn(t, m, 0, "node"),
@@ -5657,6 +5661,7 @@ func TestPodOverviewAnnotationClickExpandsValue(t *testing.T) {
 			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 		},
 	})
+	m.mouseCapture = true
 	m.width = 120
 	m.height = 40
 	m.podViewOpen = true
@@ -6197,20 +6202,99 @@ func TestPodViewF2TogglesMouseCapture(t *testing.T) {
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF2})
 	next := updated.(model)
-	if next.mouseCapture {
-		t.Fatalf("expected mouse capture to be disabled after first F2")
+	if !next.mouseCapture {
+		t.Fatalf("expected mouse capture to be enabled after first F2")
 	}
 	if cmd == nil {
-		t.Fatalf("expected mouse disable command")
+		t.Fatalf("expected mouse enable command")
 	}
 
 	updated, cmd = next.Update(tea.KeyMsg{Type: tea.KeyF2})
 	next = updated.(model)
-	if !next.mouseCapture {
-		t.Fatalf("expected mouse capture to be re-enabled after second F2")
+	if next.mouseCapture {
+		t.Fatalf("expected mouse capture to be disabled after second F2")
 	}
 	if cmd == nil {
-		t.Fatalf("expected mouse enable command")
+		t.Fatalf("expected mouse disable command")
+	}
+}
+
+func TestListViewF2TogglesMouseCapture(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyF2})
+	withCapture := updated.(model)
+	if !withCapture.mouseCapture {
+		t.Fatalf("expected F2 to enable mouse capture in list view")
+	}
+
+	updated, _ = withCapture.Update(tea.KeyMsg{Type: tea.KeyF2})
+	withSelection := updated.(model)
+	if withSelection.mouseCapture {
+		t.Fatalf("expected second F2 to disable mouse capture in list view")
+	}
+}
+
+func TestMouseClickIgnoredWhenCaptureDisabled(t *testing.T) {
+	var listCalls int
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "payments", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listCalls++
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items:     nil,
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	if m.mouseCapture {
+		t.Fatalf("expected mouse capture disabled by default")
+	}
+
+	click := tea.MouseMsg{
+		X:      clickXForColumn(t, m, 0, "namespace"),
+		Y:      6,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	}
+	updated, cmd := m.Update(click)
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected no command when mouse capture is disabled")
+	}
+	if next.session.Namespace != "default" {
+		t.Fatalf("expected namespace unchanged with mouse capture disabled, got %q", next.session.Namespace)
+	}
+	if listCalls != 0 {
+		t.Fatalf("expected no list reload when mouse capture is disabled, got %d", listCalls)
 	}
 }
 
