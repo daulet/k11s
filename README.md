@@ -112,3 +112,17 @@ Autocomplete notes:
 
 CI checks:
 - `.github/workflows/ci.yml` runs format, vet, tests, startup smoke test, and advisory perf sanity.
+
+Homebrew install:
+- `brew install daulet/tap/k11s`
+- The formula installs both `k11s` and `k11sd`, but only exposes `k11s` in `PATH`.
+- `k11s` is wrapped with `K11SD_PATH` pointing at the formula-managed daemon in `libexec`, so users do not need to install or manage `k11sd` separately.
+
+Homebrew release flow:
+- Tag and push a release tag: `git tag -a v0.1.0 -m "k11s v0.1.0" && git push origin v0.1.0`
+- `.github/workflows/release.yml` builds both binaries for macOS (`x86_64` and `aarch64`), packages them into `k11s-<target>.tar.gz`, publishes GitHub release assets, and updates `daulet/homebrew-tap` `Formula/k11s.rb`.
+- Required secret in this repo: `HOMEBREW_TAP_TOKEN` (token with push access to `daulet/homebrew-tap`).
+
+Manual local formula update (optional):
+- `./scripts/release_bundles.sh v0.1.0`
+- `./scripts/update_homebrew_formula.sh v0.1.0 ../homebrew-tap`
