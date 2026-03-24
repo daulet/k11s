@@ -2349,6 +2349,162 @@ func TestPodLogsSearchNextPrevBindings(t *testing.T) {
 	}
 }
 
+func TestPodLogsJumpBindingsUsePageDelta(t *testing.T) {
+	lines := make([]string, 0, 120)
+	for i := 0; i < 120; i++ {
+		lines = append(lines, fmt.Sprintf("line-%03d", i))
+	}
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.width = 100
+	m.height = 20
+	m.podViewOpen = true
+	m.podViewTab = 2 // overview + container + logs
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Containers: []protocol.PodContainer{
+			{Name: "app"},
+		},
+	}
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Lines:         lines,
+	}
+
+	expectedDelta := m.podScrollPageDelta()
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	down := updated.(model)
+	if down.podScroll != expectedDelta {
+		t.Fatalf("expected ctrl+d to scroll by page delta %d in logs tab, got %d", expectedDelta, down.podScroll)
+	}
+
+	updated, _ = down.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	up := updated.(model)
+	if up.podScroll != 0 {
+		t.Fatalf("expected ctrl+u to return to top in logs tab, got %d", up.podScroll)
+	}
+}
+
+func TestPodLogsTailShortcutReloadsWithPresetTail(t *testing.T) {
+	var seen protocol.LogsQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		LoadLogs: func(_ context.Context, query protocol.LogsQuery) (protocol.LogsPayload, error) {
+			seen = query
+			return protocol.LogsPayload{
+				Resource:      "pods",
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Container:     query.Container,
+				Lines:         []string{"line-1"},
+			}, nil
+		},
+	})
+	m.podViewOpen = true
+	m.podViewTab = 2 // overview + container + logs
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "dev-cluster",
+		Namespace:   "default",
+		Name:        "api",
+		Found:       true,
+		Containers: []protocol.PodContainer{
+			{Name: "app"},
+		},
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	next := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected logs reload command for tail shortcut")
+	}
+	if next.logsTailLines != logsTailPresetLong {
+		t.Fatalf("expected logs tail preset %d, got %d", logsTailPresetLong, next.logsTailLines)
+	}
+	if next.logsFollowQuery.TailLines != logsTailPresetLong {
+		t.Fatalf("expected follow query tail preset %d, got %d", logsTailPresetLong, next.logsFollowQuery.TailLines)
+	}
+
+	updated, _ = next.Update(cmd())
+	final := updated.(model)
+	if seen.TailLines != logsTailPresetLong {
+		t.Fatalf("expected logs request tail preset %d, got %d", logsTailPresetLong, seen.TailLines)
+	}
+	if len(final.logs.Lines) != 1 || final.logs.Lines[0] != "line-1" {
+		t.Fatalf("expected logs payload from tail reload, got %#v", final.logs)
+	}
+}
+
+func TestPodLogsFormatShortcutTogglesUnjsonAndBackToRaw(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+	})
+	m.podViewOpen = true
+	m.podViewTab = 2 // overview + container + logs
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Containers: []protocol.PodContainer{
+			{Name: "app"},
+		},
+	}
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Lines:         []string{`{"msg":"ok"}`},
+	}
+	m.runUnjson = func(lines []string) ([]string, error) {
+		if len(lines) != 1 {
+			t.Fatalf("expected one input line for unjson stub, got %d", len(lines))
+		}
+		return []string{"msg=ok"}, nil
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	withUnjson := updated.(model)
+	if withUnjson.logsOutputFormat != logsOutputUnjson {
+		t.Fatalf("expected logs output format unjson, got %q", withUnjson.logsOutputFormat)
+	}
+	if len(withUnjson.logsView.Lines) != 1 || withUnjson.logsView.Lines[0] != "msg=ok" {
+		t.Fatalf("expected formatted logs view output, got %#v", withUnjson.logsView.Lines)
+	}
+	if !strings.Contains(withUnjson.commandMessage, "logs format: unjson") {
+		t.Fatalf("expected command message about unjson format, got %q", withUnjson.commandMessage)
+	}
+
+	updated, _ = withUnjson.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	withRaw := updated.(model)
+	if withRaw.logsOutputFormat != logsOutputRaw {
+		t.Fatalf("expected logs output format raw, got %q", withRaw.logsOutputFormat)
+	}
+	if len(withRaw.logsView.Lines) != 1 || withRaw.logsView.Lines[0] != `{"msg":"ok"}` {
+		t.Fatalf("expected raw logs restored after second toggle, got %#v", withRaw.logsView.Lines)
+	}
+}
+
 func TestPodYAMLSlashSearchAppliesAndScrollsToMatch(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -3369,6 +3525,41 @@ func TestFooterLegendShowsContextualHintsWithoutMoveJump(t *testing.T) {
 	for _, expected := range []string{"1 name", "2 ns", "3 ready", "4 status", "5 age", "6 node", "7 owner", "r asc"} {
 		if !strings.Contains(footer, expected) {
 			t.Fatalf("expected footer legend to contain sort hint %q, got %q", expected, footer)
+		}
+	}
+}
+
+func TestFooterLegendShowsLogsShortcutsInPodLogsTab(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.podViewOpen = true
+	m.podViewTab = 2 // overview + container + logs
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Containers: []protocol.PodContainer{
+			{Name: "app"},
+		},
+	}
+
+	footer := m.renderFooter(180)
+	for _, expected := range []string{"pgup/dn page", "1..4 tail", "u raw/unjson"} {
+		if !strings.Contains(footer, expected) {
+			t.Fatalf("expected logs footer legend to contain %q, got %q", expected, footer)
 		}
 	}
 }

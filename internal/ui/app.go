@@ -29,6 +29,11 @@ const (
 	maxNavigationHistoryEntries      = 128
 	annotationPreviewRunes           = 96
 	maxFollowLogLines                = 4000
+	defaultLogsTailLines             = int64(200)
+	logsTailPresetShort              = int64(200)
+	logsTailPresetMedium             = int64(1000)
+	logsTailPresetLong               = int64(5000)
+	logsTailPresetXL                 = int64(20000)
 )
 
 const (
@@ -188,6 +193,13 @@ type detailTabEntry struct {
 	kind  detailTabKind
 	label string
 }
+
+type logsOutputFormat string
+
+const (
+	logsOutputRaw    logsOutputFormat = "raw"
+	logsOutputUnjson logsOutputFormat = "unjson"
+)
 
 type keyMap struct {
 	Up            key.Binding
@@ -563,11 +575,15 @@ type model struct {
 	deleteConfirmAccept    bool
 	deleteConfirmFocus     int
 	logs                   protocol.LogsPayload
+	logsView               protocol.LogsPayload
 	logsLoading            bool
 	logsRequestSeq         int
 	logsActiveSeq          int
 	logsFollow             bool
 	logsFollowQuery        protocol.LogsQuery
+	logsTailLines          int64
+	logsOutputFormat       logsOutputFormat
+	logsOutputErrorShown   bool
 	logsPollEvery          time.Duration
 	listCancel             context.CancelFunc
 	detailCancel           context.CancelFunc
@@ -588,6 +604,7 @@ type model struct {
 	namespacePollEvery     time.Duration
 	crdPollEvery           time.Duration
 	execProcess            func(*exec.Cmd, tea.ExecCallback) tea.Cmd
+	runUnjson              func(lines []string) ([]string, error)
 
 	width  int
 	height int
@@ -655,12 +672,15 @@ func newModel(opts Options) model {
 		resourceFlashingFields: map[string]time.Time{},
 		mouseCapture:           true,
 		flashDuration:          defaultRowFlashDuration,
+		logsTailLines:          defaultLogsTailLines,
+		logsOutputFormat:       logsOutputRaw,
 		now:                    time.Now,
 		pollEvery:              defaultBackgroundRefreshInterval,
 		namespacePollEvery:     defaultNamespaceRefreshInterval,
 		crdPollEvery:           defaultCRDRefreshInterval,
 		logsPollEvery:          defaultLogsFollowInterval,
 		execProcess:            tea.ExecProcess,
+		runUnjson:              runUnjsonCommand,
 	}
 	m.resourceList.Items = m.sortedResourceItems(m.resourceList.Items, m.resourceList.Resource)
 	m.selectFromSession()
@@ -943,6 +963,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.logs = msg.payload
 		}
+		formatErr := m.refreshLogsView()
 		if len(m.logs.Lines) > 0 {
 			m.podLogsAutoSwitch = 0
 		}
@@ -951,6 +972,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.announce {
 			m.commandMessage = fmt.Sprintf("logs loaded: %d lines for %s", len(msg.payload.Lines), msg.payload.Name)
+		}
+		if formatErr != nil {
+			if !m.logsOutputErrorShown {
+				m.commandMessage = fmt.Sprintf("logs format (%s) failed: %v; showing raw logs", m.logsOutputFormat, formatErr)
+				m.logsOutputErrorShown = true
+			}
+		} else {
+			m.logsOutputErrorShown = false
 		}
 		if m.logsFollow {
 			return m, m.scheduleLogsPoll()
@@ -1106,6 +1135,16 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updatePodViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.isPodLogsTabActive() {
+		if tailLines, ok := logsTailPresetForShortcut(msg.String()); ok {
+			return m.applyPodLogsTailPreset(tailLines, "shortcut")
+		}
+		if msg.String() == "u" {
+			m.toggleLogsOutputFormat()
+			return m, nil
+		}
+	}
+
 	switch {
 	case key.Matches(msg, m.keys.SearchNext):
 		if !m.jumpToSearchMatch(1) {
@@ -1180,10 +1219,18 @@ func (m model) updatePodViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Detail):
 		return m.startPodViewReload(true)
 	case key.Matches(msg, m.keys.JumpUp):
-		m.scrollPodContent(-m.podScrollJumpDelta())
+		if m.isPodLogsTabActive() {
+			m.scrollPodContent(-m.podScrollPageDelta())
+		} else {
+			m.scrollPodContent(-m.podScrollJumpDelta())
+		}
 		return m, nil
 	case key.Matches(msg, m.keys.JumpDown):
-		m.scrollPodContent(m.podScrollJumpDelta())
+		if m.isPodLogsTabActive() {
+			m.scrollPodContent(m.podScrollPageDelta())
+		} else {
+			m.scrollPodContent(m.podScrollJumpDelta())
+		}
 		return m, nil
 	case key.Matches(msg, m.keys.Up):
 		m.scrollPodContent(-1)
@@ -1994,6 +2041,19 @@ func (m model) podScrollJumpDelta() int {
 		return 10
 	}
 	delta := contentHeight / 2
+	if delta < 5 {
+		delta = 5
+	}
+	return delta
+}
+
+func (m model) podScrollPageDelta() int {
+	_, _, mainInnerHeight := m.normalizedDimensions()
+	contentHeight := mainInnerHeight - 4 // title + spacer + tabs + spacer
+	if contentHeight < 2 {
+		return 10
+	}
+	delta := contentHeight - 1
 	if delta < 5 {
 		delta = 5
 	}
@@ -2910,6 +2970,8 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 		return true, fmt.Sprintf("resource switched to %s", m.session.Resource), true, nil
 	case "sort", "order":
 		return m.applySortCommand(fields[1:])
+	case "logfmt", "logformat":
+		return m.applyLogsOutputFormatCommand(fields[1:])
 	default:
 		resource, ok := canonicalResourceName(command)
 		if ok {
@@ -2987,6 +3049,155 @@ func (m *model) applySortCommand(args []string) (updated bool, message string, r
 
 	m.setSort(column, descending)
 	return false, m.currentSortMessage(), false, nil
+}
+
+func normalizeLogsOutputFormatToken(value string) (logsOutputFormat, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "raw":
+		return logsOutputRaw, true
+	case "unjson":
+		return logsOutputUnjson, true
+	default:
+		return "", false
+	}
+}
+
+func formatTailLinesLabel(tailLines int64) string {
+	switch tailLines {
+	case logsTailPresetMedium:
+		return "1k"
+	case logsTailPresetLong:
+		return "5k"
+	case logsTailPresetXL:
+		return "20k"
+	default:
+		return strconv.FormatInt(tailLines, 10)
+	}
+}
+
+func (m model) currentLogsTailLines() int64 {
+	if m.logsTailLines <= 0 {
+		return defaultLogsTailLines
+	}
+	return m.logsTailLines
+}
+
+func logsTailPresetForShortcut(value string) (int64, bool) {
+	switch strings.TrimSpace(value) {
+	case "1":
+		return logsTailPresetShort, true
+	case "2":
+		return logsTailPresetMedium, true
+	case "3":
+		return logsTailPresetLong, true
+	case "4":
+		return logsTailPresetXL, true
+	default:
+		return 0, false
+	}
+}
+
+func (m model) applyPodLogsTailPreset(tailLines int64, via string) (tea.Model, tea.Cmd) {
+	if !m.isPodLogsTabActive() {
+		return m, nil
+	}
+	query, ok := m.buildPodLogsQuery()
+	if !ok {
+		return m, nil
+	}
+	if tailLines <= 0 {
+		tailLines = defaultLogsTailLines
+	}
+	query.TailLines = tailLines
+	m.commandMessage = fmt.Sprintf("loading logs tail=%s (%s)", formatTailLinesLabel(tailLines), via)
+	return m.startLogsWithAnnouncement(query, false)
+}
+
+func (m *model) toggleLogsOutputFormat() {
+	next := logsOutputUnjson
+	if m.logsOutputFormat == logsOutputUnjson {
+		next = logsOutputRaw
+	}
+	m.logsOutputFormat = next
+	if err := m.refreshLogsView(); err != nil {
+		m.logsOutputErrorShown = true
+		m.commandMessage = fmt.Sprintf("logs format (%s) failed: %v; showing raw logs", m.logsOutputFormat, err)
+		return
+	}
+	m.logsOutputErrorShown = false
+	m.commandMessage = fmt.Sprintf("logs format: %s", m.logsOutputFormat)
+}
+
+func (m *model) applyLogsOutputFormatCommand(args []string) (updated bool, message string, reload bool, err error) {
+	if len(args) == 0 {
+		return false, fmt.Sprintf("logs format: %s", m.logsOutputFormat), false, nil
+	}
+	if len(args) > 1 {
+		return false, "", false, fmt.Errorf("logfmt accepts one value: raw | unjson | toggle")
+	}
+	token := strings.ToLower(strings.TrimSpace(args[0]))
+	if token == "toggle" {
+		m.toggleLogsOutputFormat()
+		return false, m.commandMessage, false, nil
+	}
+	next, ok := normalizeLogsOutputFormatToken(token)
+	if !ok {
+		return false, "", false, fmt.Errorf("unknown logs format %q (use raw or unjson)", args[0])
+	}
+	m.logsOutputFormat = next
+	if formatErr := m.refreshLogsView(); formatErr != nil {
+		m.logsOutputErrorShown = true
+		return false, fmt.Sprintf("logs format (%s) failed: %v; showing raw logs", m.logsOutputFormat, formatErr), false, nil
+	}
+	m.logsOutputErrorShown = false
+	return false, fmt.Sprintf("logs format: %s", m.logsOutputFormat), false, nil
+}
+
+func (m *model) refreshLogsView() error {
+	view := m.logs
+	if len(m.logs.Lines) == 0 {
+		m.logsView = view
+		return nil
+	}
+	if m.logsOutputFormat == logsOutputRaw {
+		view.Lines = append([]string(nil), m.logs.Lines...)
+		m.logsView = view
+		return nil
+	}
+	run := m.runUnjson
+	if run == nil {
+		run = runUnjsonCommand
+	}
+	formatted, err := run(m.logs.Lines)
+	if err != nil {
+		view.Lines = append([]string(nil), m.logs.Lines...)
+		m.logsView = view
+		return err
+	}
+	view.Lines = formatted
+	m.logsView = view
+	return nil
+}
+
+func runUnjsonCommand(lines []string) ([]string, error) {
+	if len(lines) == 0 {
+		return nil, nil
+	}
+	cmd := exec.Command("unjson")
+	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		stderr := strings.TrimSpace(string(output))
+		if stderr == "" {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%s", stderr)
+	}
+	text := strings.TrimRight(string(output), "\n")
+	if text == "" {
+		return nil, nil
+	}
+	return strings.Split(text, "\n"), nil
 }
 
 type editInvocation struct {
@@ -3585,7 +3796,7 @@ func (m model) logsQueryFromCommand(input string) (protocol.LogsQuery, bool, err
 		nonFollowArgs = append(nonFollowArgs, arg)
 	}
 
-	tailLines := int64(200)
+	tailLines := m.currentLogsTailLines()
 	targetArgs := nonFollowArgs
 	if len(nonFollowArgs) > 1 {
 		parsed, parseErr := strconv.Atoi(strings.TrimSpace(nonFollowArgs[len(nonFollowArgs)-1]))
@@ -3778,13 +3989,18 @@ func (m model) startLogs(query protocol.LogsQuery) (tea.Model, tea.Cmd) {
 }
 
 func (m model) startLogsWithAnnouncement(query protocol.LogsQuery, announce bool) (tea.Model, tea.Cmd) {
+	if query.TailLines <= 0 {
+		query.TailLines = m.currentLogsTailLines()
+	}
 	sameTarget := sameLogsQueryTarget(m.logsFollowQuery, query)
 
 	m.logsRequestSeq++
 	m.logsActiveSeq = m.logsRequestSeq
 	m.logsLoading = true
+	m.logsTailLines = query.TailLines
 	if !query.Follow || !sameTarget {
 		m.logs = protocol.LogsPayload{}
+		m.logsView = protocol.LogsPayload{}
 	}
 	m.logsFollow = query.Follow
 	m.logsFollowQuery = query
@@ -5037,6 +5253,7 @@ func (m model) podContainer(name string) (protocol.PodContainer, bool) {
 }
 
 func (m model) podLogsLines(width int) []string {
+	payload := m.displayLogsPayload()
 	lines := []string{}
 	containers := m.podLogContainers()
 	if len(containers) > 0 {
@@ -5051,7 +5268,7 @@ func (m model) podLogsLines(width int) []string {
 		lines = append(lines, line)
 	}
 
-	if strings.TrimSpace(m.logs.Name) == "" && len(m.logs.Lines) == 0 {
+	if strings.TrimSpace(payload.Name) == "" && len(payload.Lines) == 0 {
 		if m.logsLoading && m.logsFollow {
 			lines = append(lines, "starting log tail...")
 			return lines
@@ -5063,7 +5280,7 @@ func (m model) podLogsLines(width int) []string {
 		lines = append(lines, "logs unavailable")
 		return lines
 	}
-	if len(m.logs.Lines) == 0 {
+	if len(payload.Lines) == 0 {
 		if m.logsFollow {
 			lines = append(lines, "no logs yet for this container (following)")
 			return lines
@@ -5076,10 +5293,10 @@ func (m model) podLogsLines(width int) []string {
 		return lines
 	}
 
-	for _, line := range m.logs.Lines {
+	for _, line := range payload.Lines {
 		lines = appendWrappedLines(lines, line, width)
 	}
-	if m.logs.Truncated {
+	if payload.Truncated {
 		lines = append(lines, "... output truncated")
 	}
 	return lines
@@ -6110,10 +6327,14 @@ func (m model) legendHints() []string {
 		}
 	}
 	if m.podViewOpen {
+		jumpHint := "pgup/dn jump"
+		if m.isPodLogsTabActive() {
+			jumpHint = "pgup/dn page"
+		}
 		hints := []string{
 			"tab next",
 			"S-tab prev",
-			"pgup/dn jump",
+			jumpHint,
 			"g/G top/bot",
 			"/ search",
 			"n/N next/prev",
@@ -6122,6 +6343,9 @@ func (m model) legendHints() []string {
 		}
 		if m.isPodLogsTabActive() && len(m.podLogContainers()) > 1 {
 			hints = append(hints, "[/ ] container")
+		}
+		if m.isPodLogsTabActive() {
+			hints = append(hints, "1..4 tail", "u raw/unjson")
 		}
 		if m.canNavigatePodNode() {
 			hints = append(hints, "v node")
@@ -6518,6 +6742,19 @@ func (m model) buildPodLogsQuery() (protocol.LogsQuery, bool) {
 		container = containers[index]
 	}
 
+	follow := true
+	if sameLogsQueryTarget(m.logsFollowQuery, protocol.LogsQuery{
+		KubeContext:   m.session.KubeContext,
+		Resource:      "pods",
+		Namespace:     namespace,
+		Filter:        m.session.Filter,
+		ItemNamespace: namespace,
+		Name:          m.podView.Name,
+		Container:     container,
+	}) {
+		follow = m.logsFollowQuery.Follow
+	}
+
 	return protocol.LogsQuery{
 		KubeContext:   m.session.KubeContext,
 		Resource:      "pods",
@@ -6526,8 +6763,8 @@ func (m model) buildPodLogsQuery() (protocol.LogsQuery, bool) {
 		ItemNamespace: namespace,
 		Name:          m.podView.Name,
 		Container:     container,
-		TailLines:     200,
-		Follow:        true,
+		TailLines:     m.currentLogsTailLines(),
+		Follow:        follow,
 	}, true
 }
 
@@ -6574,6 +6811,8 @@ func (m *model) clearLogs() {
 	m.logsFollow = false
 	m.logsFollowQuery = protocol.LogsQuery{}
 	m.logs = protocol.LogsPayload{}
+	m.logsView = protocol.LogsPayload{}
+	m.logsOutputErrorShown = false
 	m.podLogsAutoSwitch = 0
 }
 
@@ -7047,22 +7286,31 @@ func (m model) detailLines() []string {
 	}
 }
 
+func (m model) displayLogsPayload() protocol.LogsPayload {
+	if strings.TrimSpace(m.logsView.Name) != "" || len(m.logsView.Lines) > 0 || m.logsView.Truncated {
+		return m.logsView
+	}
+	return m.logs
+}
+
 func (m model) logsLines() []string {
-	if m.logs.Name == "" && len(m.logs.Lines) == 0 {
+	payload := m.displayLogsPayload()
+	if payload.Name == "" && len(payload.Lines) == 0 {
 		if m.logsLoading {
 			return []string{"logs: loading..."}
 		}
 		return nil
 	}
 
-	header := fmt.Sprintf("logs: %s/%s", strings.TrimSpace(m.logs.ItemNamespace), strings.TrimSpace(m.logs.Name))
+	header := fmt.Sprintf("logs: %s/%s", strings.TrimSpace(payload.ItemNamespace), strings.TrimSpace(payload.Name))
+	header += fmt.Sprintf(" [tail=%s fmt=%s]", formatTailLinesLabel(m.currentLogsTailLines()), m.logsOutputFormat)
 	if m.logsFollow {
 		header += " (following)"
 	}
 	lines := []string{
 		header,
 	}
-	displayLines := m.logs.Lines
+	displayLines := payload.Lines
 	if len(displayLines) == 0 {
 		if m.logsFollow {
 			lines = append(lines, "  no logs yet (following)")
@@ -7083,7 +7331,7 @@ func (m model) logsLines() []string {
 	for _, line := range displayLines {
 		lines = append(lines, "  "+line)
 	}
-	if m.logs.Truncated {
+	if payload.Truncated {
 		lines = append(lines, "  ... output truncated")
 	}
 	return lines
@@ -7123,6 +7371,8 @@ func (m model) commandSuggestions(input string) []string {
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "logs":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
+	case "logfmt", "logformat":
+		return prefixMatches([]string{string(logsOutputRaw), string(logsOutputUnjson), "toggle"}, valuePrefix)
 	case "scale":
 		if len(fields) <= 1 || (len(fields) == 2 && !hasTrailingSpace) {
 			return nil
@@ -7565,6 +7815,8 @@ func baseSuggestions() []string {
 		"rm",
 		"edit",
 		"logs",
+		"logfmt",
+		"logformat",
 		"restart",
 		"rollout",
 		"scale",
@@ -7866,7 +8118,7 @@ func commandSupportsArgument(token string) bool {
 		return true
 	}
 	switch token {
-	case "ctx", "context", "resource", "filter", "delete", "del", "rm", "edit", "logs", "scale", "restart", "rollout", "sort", "order":
+	case "ctx", "context", "resource", "filter", "delete", "del", "rm", "edit", "logs", "logfmt", "logformat", "scale", "restart", "rollout", "sort", "order":
 		return true
 	default:
 		return false
