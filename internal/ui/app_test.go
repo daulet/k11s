@@ -1876,6 +1876,46 @@ func TestListLinesShowNoItemsLoadingState(t *testing.T) {
 	}
 }
 
+func TestLoadingEmptyStateUsesDistinctYellowStyle(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Freshness: protocol.FreshnessMeta{
+				State:              protocol.FreshnessStateCatchingUp,
+				SnapshotTimeUnixMs: 0,
+			},
+		},
+		UseColor: true,
+	})
+
+	line := m.renderEmptyItemsLine()
+	if !strings.Contains(line, "no items (loading)") {
+		t.Fatalf("expected loading empty-state label, got %q", line)
+	}
+
+	loadingFG, ok := m.styles.EmptyLoading.GetForeground().(lipgloss.Color)
+	if !ok {
+		t.Fatalf("expected loading style foreground to be lipgloss.Color")
+	}
+	if loadingFG != lipgloss.Color("226") {
+		t.Fatalf("expected yellow loading foreground 226, got %q", loadingFG)
+	}
+
+	liveFG, ok := m.styles.EmptyLive.GetForeground().(lipgloss.Color)
+	if !ok {
+		t.Fatalf("expected live style foreground to be lipgloss.Color")
+	}
+	if loadingFG == liveFG {
+		t.Fatalf("expected loading foreground to differ from live foreground; got %q", loadingFG)
+	}
+}
+
 func TestListLinesShowNoItemsLiveState(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -2157,6 +2197,70 @@ func TestListLoadedFlashesChangedItems(t *testing.T) {
 	next := updated.(model)
 	if !next.isItemFlashing(next.resourceList.Items[0]) {
 		t.Fatalf("expected changed item to be flashing")
+	}
+}
+
+func TestFlashingListRowUsesChangedStyleNotClickableStyle(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "worker",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Pending", Ready: "0/1", Node: "node-a"},
+				{Name: "worker", Namespace: "default", Status: "Running", Ready: "1/1", Node: "node-b"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		UseColor: true,
+	})
+	m.now = func() time.Time { return now }
+	m.flashDuration = 2 * time.Second
+
+	updated, _ := m.Update(listLoadedMsg{
+		seq: m.activeSeq,
+		payload: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running", Ready: "1/1", Node: "node-a"},
+				{Name: "worker", Namespace: "default", Status: "Running", Ready: "1/1", Node: "node-b"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	next := updated.(model)
+	if !next.isItemFlashing(next.resourceList.Items[0]) {
+		t.Fatalf("expected changed item to be flashing")
+	}
+
+	var apiLine string
+	ansiRE := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	for _, line := range next.listLines() {
+		plain := ansiRE.ReplaceAllString(line, "")
+		if strings.Contains(plain, "api") && strings.Contains(plain, "default") {
+			apiLine = line
+			break
+		}
+	}
+	if apiLine == "" {
+		t.Fatalf("expected list line for flashing pod, got %#v", next.listLines())
+	}
+
+	clickablePrefix := ansiRE.FindString(next.styles.Clickable.Render("x"))
+	if clickablePrefix != "" && strings.Contains(apiLine, clickablePrefix) {
+		t.Fatalf("expected flashing row to avoid clickable style %q, got %q", clickablePrefix, apiLine)
+	}
+
+	changedPrefix := ansiRE.FindString(next.styles.ChangedRow.Render("x"))
+	if changedPrefix != "" && !strings.Contains(apiLine, changedPrefix) {
+		t.Fatalf("expected flashing row to keep changed-row style %q, got %q", changedPrefix, apiLine)
 	}
 }
 

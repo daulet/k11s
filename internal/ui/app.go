@@ -504,7 +504,7 @@ func newStyles(useColor bool) styles {
 		MainError:     lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true),
 		EmptyLive:     lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true),
 		EmptyCached:   lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true),
-		EmptyLoading:  lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true),
+		EmptyLoading:  lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true),
 		StatusLive:    lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("42")).Bold(true).Padding(0, 1),
 		StatusCatch:   lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("214")).Bold(true).Padding(0, 1),
 		StatusStale:   lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("160")).Bold(true).Padding(0, 1),
@@ -5862,11 +5862,13 @@ func (m model) listLines() []string {
 	lines = append(lines, m.styles.ColumnHeader.Render(renderListHeader(columns)))
 
 	for i, item := range m.resourceList.Items {
+		plainLine := renderListItem(columns, item)
 		line := m.renderListItem(columns, item)
 		if i == m.selected {
-			line = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(renderListItem(columns, item), "  "))
+			line = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(plainLine, "  "))
 		} else if m.isItemFlashing(item) {
-			line = m.styles.ChangedRow.Render(line)
+			// Flash highlighting must take precedence over per-cell clickable colors.
+			line = m.styles.ChangedRow.Render(plainLine)
 		} else if podRowNotFullyReady(m.resourceList.Resource, item) {
 			line = m.styles.PodNotReady.Render(line)
 		} else if rowSucceeded(item) {
