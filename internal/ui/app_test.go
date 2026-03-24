@@ -2022,6 +2022,44 @@ func TestRenderMainPaneCentersNoItemsState(t *testing.T) {
 	}
 }
 
+func TestLegendShowsClickLinksHintWhenMouseCaptureEnabled(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-123"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.mouseCapture = true
+
+	hints := strings.Join(m.legendHints(), "  ")
+	if !strings.Contains(hints, "click links") {
+		t.Fatalf("expected click-links hint in list legend when mouse capture is enabled, got %q", hints)
+	}
+
+	m.resourceViewOpen = true
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Found:         true,
+		Item:          &protocol.ResourceItem{Name: "api", Namespace: "default", Status: "Running"},
+	}
+	hints = strings.Join(m.legendHints(), "  ")
+	if !strings.Contains(hints, "click links") {
+		t.Fatalf("expected click-links hint in detail legend when mouse capture is enabled, got %q", hints)
+	}
+}
+
 func TestRenderPaneDoesNotWrapLongLines(t *testing.T) {
 	const (
 		width       = 12
@@ -3211,6 +3249,67 @@ func TestNamespacesReloadUsesAllNamespaceForClusterScope(t *testing.T) {
 	}
 }
 
+func TestNamespaceCommandKeepsCurrentResourceType(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "worker", Namespace: query.Namespace, Status: "Running"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("ns inference-engine")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updated.(model)
+	if !next.loading {
+		t.Fatalf("expected loading after ns command")
+	}
+	if next.session.Namespace != "inference-engine" {
+		t.Fatalf("expected namespace switched to inference-engine, got %q", next.session.Namespace)
+	}
+	if next.session.Resource != "pods" {
+		t.Fatalf("expected ns command to keep current resource type pods, got %q", next.session.Resource)
+	}
+	if next.resourceViewOpen {
+		t.Fatalf("did not expect ns command to open resource detail view")
+	}
+	if cmd == nil {
+		t.Fatalf("expected list reload command after ns command")
+	}
+
+	updated, _ = next.Update(cmd())
+	final := updated.(model)
+	if seen.Resource != "pods" || seen.Namespace != "inference-engine" {
+		t.Fatalf("expected pods list reload in inference-engine, got %#v", seen)
+	}
+	if final.resourceList.Resource != "pods" || final.resourceList.Namespace != "inference-engine" {
+		t.Fatalf("unexpected payload after ns command: resource=%q namespace=%q", final.resourceList.Resource, final.resourceList.Namespace)
+	}
+}
+
 func TestMouseClickNamespaceInPodRowSwitchesNamespace(t *testing.T) {
 	var seen protocol.ResourceListQuery
 
@@ -4067,6 +4166,83 @@ func TestEnterInNodePodsTabUsesDetailContextForPodView(t *testing.T) {
 	}
 }
 
+func TestMouseClickInNodePodsTabOpensPodView(t *testing.T) {
+	var seen protocol.PodViewQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "ctx-session",
+			Namespace:   "all",
+			Resource:    "nodes",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "nodes",
+			Namespace: "all",
+			Items: []protocol.ResourceItem{
+				{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadPodView: func(_ context.Context, query protocol.PodViewQuery) (protocol.PodViewPayload, error) {
+			seen = query
+			return protocol.PodViewPayload{
+				KubeContext: query.KubeContext,
+				Namespace:   query.Namespace,
+				Name:        query.Name,
+				Found:       true,
+				Overview:    protocol.PodOverview{Phase: "Running"},
+				Freshness:   protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.mouseCapture = true
+	m.resourceViewOpen = true
+	m.resourceViewTab = 1 // overview + node-pods + owned
+	m.detailKubeContext = "ctx-detail"
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "nodes",
+		Namespace:     "all",
+		ItemNamespace: "<cluster>",
+		Name:          "node-a",
+		Found:         true,
+		Item: &protocol.ResourceItem{
+			Name:      "node-a",
+			Namespace: "<cluster>",
+			Status:    "Ready",
+		},
+		NodePods: []protocol.DetailChild{
+			{Resource: "pods", Namespace: "default", Name: "api-0", Status: "Running"},
+		},
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+
+	updated, podCmd := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      8,
+		Y:      11, // first node-pods row
+	})
+	next := updated.(model)
+	if podCmd == nil {
+		t.Fatalf("expected pod-view command from node-pods click")
+	}
+	if !next.podViewOpen || !next.podViewLoading {
+		t.Fatalf("expected pod view open/loading after click, got open=%v loading=%v", next.podViewOpen, next.podViewLoading)
+	}
+	if next.resourceViewOpen {
+		t.Fatalf("expected resource view closed when opening pod via click")
+	}
+	if next.session.Resource != "pods" || next.session.Selection != "api-0" {
+		t.Fatalf("expected session switched to pod target, got resource=%q selection=%q", next.session.Resource, next.session.Selection)
+	}
+
+	updated, _ = next.Update(podCmd())
+	_ = updated
+	if seen.KubeContext != "ctx-detail" || seen.Namespace != "default" || seen.Name != "api-0" {
+		t.Fatalf("unexpected pod-view query from click: %#v", seen)
+	}
+}
+
 func TestEnterInOwnedTabSelectsOwnedResource(t *testing.T) {
 	var detailSeen []protocol.ResourceDetailQuery
 	var listCalls int
@@ -4333,6 +4509,267 @@ func TestEnterInOwnedTabOpensPodViewForOwnedPod(t *testing.T) {
 	}
 	if listCalls != 0 {
 		t.Fatalf("expected no list reload while opening owned pod view, got %d", listCalls)
+	}
+}
+
+func TestMouseClickInOwnedTabOpensOwnedResource(t *testing.T) {
+	var seen protocol.ResourceDetailQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			seen = query
+			return protocol.ResourceDetailPayload{
+				Resource:      query.Resource,
+				Namespace:     query.Namespace,
+				ItemNamespace: query.ItemNamespace,
+				Name:          query.Name,
+				Found:         true,
+				Item:          &protocol.ResourceItem{Name: query.Name, Namespace: query.ItemNamespace, Status: "Ready"},
+				Freshness:     protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.mouseCapture = true
+	m.resourceViewOpen = true
+	m.resourceViewTab = 1 // overview + owned
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "deployments",
+		Namespace:     "default",
+		ItemNamespace: "default",
+		Name:          "api",
+		Found:         true,
+		Item:          &protocol.ResourceItem{Name: "api", Namespace: "default", Status: "Available"},
+		Children: []protocol.DetailChild{
+			{Resource: "replicasets", Namespace: "default", Name: "api-222", Status: "Ready"},
+		},
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+
+	updated, cmd := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      8,
+		Y:      11, // first owned-resource row
+	})
+	next := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected detail load command from owned-row click")
+	}
+	if !next.detailLoading {
+		t.Fatalf("expected detail loading after owned-row click")
+	}
+	if next.session.Resource != "replicasets" || next.session.Selection != "api-222" {
+		t.Fatalf("expected session switched to clicked owned resource, got resource=%q selection=%q", next.session.Resource, next.session.Selection)
+	}
+
+	updated, _ = next.Update(cmd())
+	_ = updated
+	if seen.Resource != "replicasets" || seen.ItemNamespace != "default" || seen.Name != "api-222" {
+		t.Fatalf("unexpected detail query from owned-row click: %#v", seen)
+	}
+}
+
+func TestMouseClickDetailOverviewNamespaceSwitchesNamespace(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: query.Namespace, Status: "Available"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.mouseCapture = true
+	m.resourceViewOpen = true
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "deployments",
+		Namespace:     "default",
+		ItemNamespace: "payments",
+		Name:          "api",
+		Found:         true,
+		Item:          &protocol.ResourceItem{Name: "api", Namespace: "payments", Status: "Available"},
+		Freshness:     protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+
+	updated, cmd := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      8,
+		Y:      10, // namespace line in detail overview
+	})
+	next := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected list reload command from namespace click")
+	}
+	if !next.loading {
+		t.Fatalf("expected loading after namespace click")
+	}
+	if next.session.Namespace != "payments" {
+		t.Fatalf("expected namespace switched via click, got %q", next.session.Namespace)
+	}
+	if next.resourceViewOpen {
+		t.Fatalf("expected detail view to close after namespace navigation")
+	}
+
+	updated, _ = next.Update(cmd())
+	final := updated.(model)
+	if seen.Namespace != "payments" {
+		t.Fatalf("expected list query namespace payments, got %q", seen.Namespace)
+	}
+	if final.resourceList.Namespace != "payments" {
+		t.Fatalf("expected refreshed namespace payments, got %q", final.resourceList.Namespace)
+	}
+}
+
+func TestMouseClickDetailOverviewNodeAndOwnerFieldsNavigate(t *testing.T) {
+	var detailSeen protocol.ResourceDetailQuery
+	var listSeen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			detailSeen = query
+			return protocol.ResourceDetailPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Name:      query.Name,
+				Found:     true,
+				Item:      &protocol.ResourceItem{Name: query.Name, Namespace: "<cluster>", Status: "Ready"},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			listSeen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: query.Namespace, Status: "Available"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.mouseCapture = true
+	m.resourceViewOpen = true
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "payments",
+		Name:          "api-7fd6",
+		Found:         true,
+		Overview: []protocol.DetailField{
+			{Key: "node", Value: "node-a"},
+			{Key: "owner", Value: "ReplicaSet/api-6c9d4f6d56"},
+		},
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+
+	// Click first overview field ("node").
+	updated, nodeCmd := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      8,
+		Y:      9,
+	})
+	withNodeNav := updated.(model)
+	if nodeCmd == nil {
+		t.Fatalf("expected detail command from node field click")
+	}
+	if !withNodeNav.detailLoading || withNodeNav.session.Resource != "nodes" || withNodeNav.session.Selection != "node-a" {
+		t.Fatalf("expected node navigation state after click, got resource=%q selection=%q loading=%v", withNodeNav.session.Resource, withNodeNav.session.Selection, withNodeNav.detailLoading)
+	}
+	updated, _ = withNodeNav.Update(nodeCmd())
+	_ = updated
+	if detailSeen.Resource != "nodes" || detailSeen.Name != "node-a" {
+		t.Fatalf("expected node detail query from field click, got %#v", detailSeen)
+	}
+
+	// Reset to overview and click second overview field ("owner").
+	m.resourceViewOpen = true
+	m.resourceViewLoading = false
+	m.detailLoading = false
+	m.session.Resource = "pods"
+	m.session.Selection = "api-7fd6"
+	m.detail = protocol.ResourceDetailPayload{
+		Resource:      "pods",
+		Namespace:     "default",
+		ItemNamespace: "payments",
+		Name:          "api-7fd6",
+		Found:         true,
+		Overview: []protocol.DetailField{
+			{Key: "node", Value: "node-a"},
+			{Key: "owner", Value: "ReplicaSet/api-6c9d4f6d56"},
+		},
+		Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+	}
+	updated, ownerCmd := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      8,
+		Y:      10,
+	})
+	withOwnerNav := updated.(model)
+	if ownerCmd == nil {
+		t.Fatalf("expected list reload command from owner field click")
+	}
+	if !withOwnerNav.loading || withOwnerNav.session.Resource != "deployments" || withOwnerNav.session.Selection != "api" {
+		t.Fatalf("expected owner navigation state after click, got resource=%q selection=%q loading=%v", withOwnerNav.session.Resource, withOwnerNav.session.Selection, withOwnerNav.loading)
+	}
+	if withOwnerNav.session.Namespace != "payments" {
+		t.Fatalf("expected owner field click to carry detail namespace payments, got %q", withOwnerNav.session.Namespace)
+	}
+	updated, _ = withOwnerNav.Update(ownerCmd())
+	final := updated.(model)
+	if listSeen.Resource != "deployments" || listSeen.Namespace != "payments" {
+		t.Fatalf("expected deployments/payments list query from owner field click, got %#v", listSeen)
+	}
+	if final.resourceList.Resource != "deployments" {
+		t.Fatalf("expected deployments payload after owner field click, got %q", final.resourceList.Resource)
 	}
 }
 
@@ -5503,6 +5940,150 @@ func TestPodViewShortcutNodeOpensNodeDetail(t *testing.T) {
 	}
 	if afterReload.detail.Resource != "nodes" || afterReload.detail.Name != "node-a" {
 		t.Fatalf("expected node detail payload, got %#v", afterReload.detail)
+	}
+}
+
+func TestPodViewMouseClickNodeLineOpensNodeDetail(t *testing.T) {
+	var seen protocol.ResourceDetailQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceDetail: func(_ context.Context, query protocol.ResourceDetailQuery) (protocol.ResourceDetailPayload, error) {
+			seen = query
+			return protocol.ResourceDetailPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Name:      query.Name,
+				Found:     true,
+				Item:      &protocol.ResourceItem{Name: "node-a", Namespace: "<cluster>", Status: "Ready"},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.mouseCapture = true
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		Namespace: "default",
+		Name:      "api",
+		Found:     true,
+		Overview: protocol.PodOverview{
+			Owner: "ReplicaSet/api-123",
+			Node:  "node-a",
+			Phase: "Running",
+		},
+	}
+
+	updated, cmd := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      8,
+		Y:      11, // node line in pod overview
+	})
+	withNodeNav := updated.(model)
+	if withNodeNav.session.Resource != "nodes" {
+		t.Fatalf("expected click on node line to target nodes resource, got %q", withNodeNav.session.Resource)
+	}
+	if !withNodeNav.detailLoading {
+		t.Fatalf("expected node detail loading after click")
+	}
+	if cmd == nil {
+		t.Fatalf("expected detail load command for node click")
+	}
+
+	updated, _ = withNodeNav.Update(cmd())
+	afterReload := updated.(model)
+	if seen.Resource != "nodes" || seen.Namespace != "all" || seen.Name != "node-a" {
+		t.Fatalf("expected nodes/all detail query, got %#v", seen)
+	}
+	if !afterReload.resourceViewOpen {
+		t.Fatalf("expected resource view open after node click load")
+	}
+}
+
+func TestPodViewMouseClickOwnerLineOpensOwnerResource(t *testing.T) {
+	var seen protocol.ResourceListQuery
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:  query.Resource,
+				Namespace: query.Namespace,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: query.Namespace, Status: "Available"},
+				},
+				Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+	m.mouseCapture = true
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		Namespace: "payments",
+		Name:      "api-7fd6",
+		Found:     true,
+		Overview: protocol.PodOverview{
+			Owner: "ReplicaSet/api-6c9d4f6d56",
+			Node:  "node-a",
+			Phase: "Running",
+		},
+	}
+
+	updated, cmd := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      8,
+		Y:      9, // owner line in pod overview
+	})
+	next := updated.(model)
+	if !next.loading {
+		t.Fatalf("expected loading after owner-line click")
+	}
+	if next.session.Resource != "deployments" {
+		t.Fatalf("expected owner click to open deployments, got %q", next.session.Resource)
+	}
+	if next.session.Selection != "api" {
+		t.Fatalf("expected owner-derived selection api, got %q", next.session.Selection)
+	}
+	if next.session.Namespace != "payments" {
+		t.Fatalf("expected owner click to carry pod namespace payments, got %q", next.session.Namespace)
+	}
+	if cmd == nil {
+		t.Fatalf("expected reload command after owner click")
+	}
+
+	updated, _ = next.Update(cmd())
+	final := updated.(model)
+	if seen.Resource != "deployments" || seen.Namespace != "payments" {
+		t.Fatalf("expected deployments/payments query after owner click, got %#v", seen)
+	}
+	if final.resourceList.Resource != "deployments" {
+		t.Fatalf("expected deployments payload after owner click navigation, got %q", final.resourceList.Resource)
 	}
 }
 

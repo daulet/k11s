@@ -403,6 +403,7 @@ type styles struct {
 	SearchMatch    lipgloss.Style
 	SelectedRow    lipgloss.Style
 	ChangedRow     lipgloss.Style
+	Clickable      lipgloss.Style
 	PodNotReady    lipgloss.Style
 	RowSucceeded   lipgloss.Style
 	Legend         lipgloss.Style
@@ -443,6 +444,7 @@ func newStyles(useColor bool) styles {
 			SearchMatch:   lipgloss.NewStyle().Bold(true),
 			SelectedRow:   lipgloss.NewStyle().Bold(true),
 			ChangedRow:    lipgloss.NewStyle().Bold(true),
+			Clickable:     lipgloss.NewStyle(),
 			PodNotReady:   lipgloss.NewStyle().Bold(true),
 			RowSucceeded:  lipgloss.NewStyle().Faint(true),
 			Legend:        lipgloss.NewStyle().Faint(true),
@@ -495,6 +497,7 @@ func newStyles(useColor bool) styles {
 		SearchMatch:   lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true),
 		SelectedRow:   lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("27")).Bold(true),
 		ChangedRow:    lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("190")).Bold(true),
+		Clickable:     lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Underline(true),
 		PodNotReady:   lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
 		RowSucceeded:  lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
 		Legend:        lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
@@ -1463,7 +1466,7 @@ func (m model) updateMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m.updatePodViewMouseMode(msg)
 	}
 	if m.resourceViewOpen {
-		return m, nil
+		return m.updateResourceViewMouseMode(msg)
 	}
 	if len(m.resourceList.Items) == 0 {
 		return m, nil
@@ -1529,6 +1532,16 @@ func (m model) updatePodViewMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	contentLines := m.podViewContentLines(contentWidth, contentHeight)
 	scroll := m.normalizedPodScroll(len(contentLines), contentHeight)
 	absoluteLine := scroll + contentLine
+
+	if target, ok := m.podOverviewNavigationTargetAtLine(absoluteLine); ok {
+		switch target {
+		case "node":
+			return m.navigatePodNode("click")
+		case "owner":
+			return m.navigatePodOwner("click")
+		}
+	}
+
 	key, ok := m.podOverviewAnnotationKeyAtLine(contentWidth, absoluteLine)
 	if !ok {
 		return m, nil
@@ -1536,6 +1549,238 @@ func (m model) updatePodViewMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	m.togglePodAnnotation(key)
 	return m, nil
+}
+
+func (m model) updateResourceViewMouseMode(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if !m.resourceViewOpen || m.resourceViewLoading {
+		return m, nil
+	}
+
+	_, _, mainInnerHeight := m.normalizedDimensions()
+	const inputBoxTotalHeight = 4
+	const detailBodyHeaderLines = 4 // title + spacer + tabs + spacer
+	mainBodyStartY := inputBoxTotalHeight + 1
+	lineIndex := msg.Y - mainBodyStartY
+	if lineIndex < detailBodyHeaderLines || lineIndex >= mainInnerHeight {
+		return m, nil
+	}
+
+	contentHeight := mainInnerHeight - detailBodyHeaderLines
+	if contentHeight < 1 {
+		return m, nil
+	}
+	contentLine := lineIndex - detailBodyHeaderLines
+	if contentLine < 0 || contentLine >= contentHeight {
+		return m, nil
+	}
+
+	width, _, _ := m.normalizedDimensions()
+	contentWidth := width - m.styles.MainPane.GetHorizontalFrameSize()
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+
+	contentLines := m.resourceViewContentLines(contentWidth, contentHeight)
+	scroll := m.normalizedResourceScroll(len(contentLines), contentHeight)
+	absoluteLine := scroll + contentLine
+
+	tab, ok := m.activeDetailTab()
+	if !ok {
+		return m, nil
+	}
+
+	switch tab.kind {
+	case detailTabOwned:
+		index, ok := m.detailOwnedIndexAtLine(absoluteLine)
+		if !ok {
+			return m, nil
+		}
+		m.selectDetailOwnedAt(index)
+		return m.openDetailChildFromDetail(m.detail.Children[index], "click", "owned")
+	case detailTabNodePods:
+		index, ok := m.detailNodePodIndexAtLine(absoluteLine)
+		if !ok {
+			return m, nil
+		}
+		m.selectDetailNodePodAt(index)
+		child := m.detail.NodePods[index]
+		if strings.TrimSpace(child.Resource) == "" {
+			child.Resource = "pods"
+		}
+		return m.openDetailChildFromDetail(child, "click", "node pod")
+	case detailTabOverview:
+		detailWidth := contentWidth - 2
+		if detailWidth < 12 {
+			detailWidth = contentWidth
+		}
+		return m.navigateDetailOverviewAtLine(detailWidth, absoluteLine, "click")
+	default:
+		return m, nil
+	}
+}
+
+func (m model) detailOwnedIndexAtLine(line int) (int, bool) {
+	if len(m.detail.Children) == 0 {
+		return 0, false
+	}
+	index := line - 2 // heading + table header
+	if index < 0 || index >= len(m.detail.Children) {
+		return 0, false
+	}
+	return index, true
+}
+
+func (m model) detailNodePodIndexAtLine(line int) (int, bool) {
+	if len(m.detail.NodePods) == 0 {
+		return 0, false
+	}
+	index := line - 2 // heading + table header
+	if index < 0 || index >= len(m.detail.NodePods) {
+		return 0, false
+	}
+	return index, true
+}
+
+func (m model) podOverviewNavigationTargetAtLine(line int) (string, bool) {
+	switch line {
+	case 0:
+		if m.canNavigatePodOwner() {
+			return "owner", true
+		}
+	case 2:
+		if m.canNavigatePodNode() {
+			return "node", true
+		}
+	}
+	return "", false
+}
+
+func (m model) navigateDetailOverviewAtLine(width int, line int, via string) (tea.Model, tea.Cmd) {
+	if line < 0 {
+		return m, nil
+	}
+
+	target, ok := m.detailOverviewNavigationTargetAtLine(width, line)
+	if !ok {
+		return m, nil
+	}
+
+	previousSession := m.session
+	switch target.kind {
+	case "namespace":
+		return m.navigateNamespace(target.namespace, via, previousSession)
+	case "node":
+		return m.openNodeDetail(target.node, via, previousSession)
+	case "owner":
+		resource, selection, ok := ownerNavigation(target.ownerKind, target.ownerName)
+		if !ok {
+			m.commandMessage = fmt.Sprintf("owner %s/%s is not navigable yet", target.ownerKind, target.ownerName)
+			return m, nil
+		}
+		if resourceUsesNamespace(resource) {
+			namespace := strings.TrimSpace(target.namespace)
+			if namespace == "" {
+				namespace = strings.TrimSpace(m.detail.ItemNamespace)
+			}
+			if namespace != "" && namespace != "-" && !strings.EqualFold(namespace, "<cluster>") {
+				m.session.Namespace = namespace
+			}
+		}
+		m.session.Resource = resource
+		m.session.Selection = selection
+		m.pushNavigationHistory(previousSession)
+		m.clearPodView()
+		m.clearDetail()
+		m.clearFlashingItems()
+		m.commandMessage = fmt.Sprintf("opened owner %s/%s via %s", target.ownerKind, selection, via)
+		return m.startListReload()
+	default:
+		return m, nil
+	}
+}
+
+type detailOverviewNavigationTarget struct {
+	kind      string
+	namespace string
+	node      string
+	ownerKind string
+	ownerName string
+}
+
+func (m model) detailOverviewNavigationTargetAtLine(width int, line int) (detailOverviewNavigationTarget, bool) {
+	if line < 0 {
+		return detailOverviewNavigationTarget{}, false
+	}
+
+	cursor := 0
+	if m.detail.Item != nil {
+		// name:
+		cursor++
+		// namespace:
+		if line == cursor {
+			namespace := strings.TrimSpace(m.detail.Item.Namespace)
+			if m.isNamespaceNavigable(namespace) {
+				return detailOverviewNavigationTarget{kind: "namespace", namespace: namespace}, true
+			}
+			return detailOverviewNavigationTarget{}, false
+		}
+		cursor++
+		// status:
+		cursor++
+		if strings.TrimSpace(m.detail.Item.Ready) != "" {
+			// ready:
+			cursor++
+		}
+	}
+
+	for _, field := range m.detail.Overview {
+		key := strings.TrimSpace(field.Key)
+		value := strings.TrimSpace(field.Value)
+		if key == "" || value == "" {
+			continue
+		}
+		wrapped := wrapText(key+": "+value, width)
+		if len(wrapped) == 0 {
+			continue
+		}
+		if line == cursor {
+			return m.detailOverviewNavigationTargetForField(key, value)
+		}
+		cursor += len(wrapped)
+	}
+
+	return detailOverviewNavigationTarget{}, false
+}
+
+func (m model) detailOverviewNavigationTargetForField(key string, value string) (detailOverviewNavigationTarget, bool) {
+	normalizedKey := strings.ToLower(strings.TrimSpace(key))
+	switch normalizedKey {
+	case "namespace", "metadata.namespace":
+		namespace := strings.TrimSpace(value)
+		if m.isNamespaceNavigable(namespace) {
+			return detailOverviewNavigationTarget{kind: "namespace", namespace: namespace}, true
+		}
+		return detailOverviewNavigationTarget{}, false
+	case "node", "node name", "nodename", "spec.nodename":
+		node := strings.TrimSpace(value)
+		if node == "" || node == "-" {
+			return detailOverviewNavigationTarget{}, false
+		}
+		return detailOverviewNavigationTarget{kind: "node", node: node}, true
+	case "owner", "ownerreference", "ownerreferences", "metadata.ownerreferences":
+		ownerKind, ownerName, ok := parsePodOwner(value)
+		if !ok {
+			return detailOverviewNavigationTarget{}, false
+		}
+		return detailOverviewNavigationTarget{
+			kind:      "owner",
+			namespace: strings.TrimSpace(m.detail.ItemNamespace),
+			ownerKind: ownerKind,
+			ownerName: ownerName,
+		}, true
+	default:
+		return detailOverviewNavigationTarget{}, false
+	}
 }
 
 func (m model) navigateSelectedColumn(column string, via string) (tea.Model, tea.Cmd) {
@@ -1550,24 +1795,13 @@ func (m model) navigateSelectedColumn(column string, via string) (tea.Model, tea
 func (m model) navigateItemColumn(item protocol.ResourceItem, column string, via string) (tea.Model, tea.Cmd) {
 	previousSession := m.session
 	switch column {
+	case "name":
+		if strings.EqualFold(strings.TrimSpace(m.session.Resource), "pods") && m.loadPodView != nil {
+			return m.startPodViewReload(true)
+		}
+		return m.startDetailReload(true)
 	case "namespace":
-		namespace := strings.TrimSpace(item.Namespace)
-		if namespace == "" || namespace == "-" || strings.EqualFold(namespace, "<cluster>") {
-			m.commandMessage = "namespace is not clickable on selected row"
-			return m, nil
-		}
-		if strings.EqualFold(namespace, m.session.Namespace) {
-			m.commandMessage = "already in namespace " + namespace
-			return m, nil
-		}
-		m.session.Namespace = namespace
-		m.session.Selection = ""
-		m.pushNavigationHistory(previousSession)
-		m.clearPodView()
-		m.clearDetail()
-		m.clearFlashingItems()
-		m.commandMessage = "namespace switched to " + namespace + " via " + via
-		return m.startListReload()
+		return m.navigateNamespace(item.Namespace, via, previousSession)
 	case "node":
 		node := strings.TrimSpace(item.Node)
 		if node == "" || node == "-" {
@@ -1598,6 +1832,30 @@ func (m model) navigateItemColumn(item protocol.ResourceItem, column string, via
 	default:
 		return m, nil
 	}
+}
+
+func (m model) navigateNamespace(namespace string, via string, previousSession protocol.SessionState) (tea.Model, tea.Cmd) {
+	namespace = strings.TrimSpace(namespace)
+	if !m.isNamespaceNavigable(namespace) {
+		m.commandMessage = "namespace is not clickable here"
+		return m, nil
+	}
+	m.session.Namespace = namespace
+	m.session.Selection = ""
+	m.pushNavigationHistory(previousSession)
+	m.clearPodView()
+	m.clearDetail()
+	m.clearFlashingItems()
+	m.commandMessage = "namespace switched to " + namespace + " via " + via
+	return m.startListReload()
+}
+
+func (m model) isNamespaceNavigable(namespace string) bool {
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" || namespace == "-" || strings.EqualFold(namespace, "<cluster>") {
+		return false
+	}
+	return !strings.EqualFold(namespace, m.session.Namespace)
 }
 
 func (m model) navigatePodNode(via string) (tea.Model, tea.Cmd) {
@@ -3286,6 +3544,11 @@ func (m model) directOpenInvocationFromCommand(input string) (directOpenInvocati
 			return directOpenInvocation{}, true, fmt.Errorf("resource open accepts one target: try `:resource %s <name>`", resource)
 		}
 	default:
+		// Keep namespace-scoping commands (`:ns`, `:namespace`) handled by
+		// applyCommand instead of treating them as direct-open resource aliases.
+		if command == "ns" || command == "namespace" {
+			return directOpenInvocation{}, false, nil
+		}
 		resolved, ok := canonicalResourceName(command)
 		if !ok || len(fields) < 2 {
 			return directOpenInvocation{}, false, nil
@@ -4577,6 +4840,19 @@ func renderStyledSegment(value string, width int, style lipgloss.Style) string {
 	return style.Render(text)
 }
 
+func renderStyledValueSegment(value string, width int, style lipgloss.Style) string {
+	if width <= 0 {
+		return style.Render(value)
+	}
+	text := fixedWidthCell(value, width)
+	trimmed := strings.TrimRight(text, " ")
+	padding := text[len(trimmed):]
+	if trimmed == "" {
+		return padding
+	}
+	return style.Render(trimmed) + padding
+}
+
 func renderStyledWrappedLines(value string, width int, style lipgloss.Style, center bool) []string {
 	wrapped := wrapText(value, width)
 	lines := make([]string, 0, len(wrapped))
@@ -4802,7 +5078,11 @@ func (m model) detailOverviewLines(width int) []string {
 	lines := make([]string, 0, len(m.detail.Overview)+8)
 	if m.detail.Item != nil {
 		lines = append(lines, m.renderDetailFieldLine("name", "name: "+defaultDash(m.detail.Item.Name)))
-		lines = append(lines, m.renderDetailFieldLine("namespace", "namespace: "+defaultDash(m.detail.Item.Namespace)))
+		namespaceLine := m.renderDetailFieldLine("namespace", "namespace: "+defaultDash(m.detail.Item.Namespace))
+		if m.isNamespaceNavigable(m.detail.Item.Namespace) {
+			namespaceLine = m.styles.Clickable.Render(namespaceLine)
+		}
+		lines = append(lines, namespaceLine)
 		lines = append(lines, m.renderDetailFieldLine("status", "status: "+defaultDash(m.detail.Item.Status)))
 		if strings.TrimSpace(m.detail.Item.Ready) != "" {
 			lines = append(lines, m.renderDetailFieldLine("ready", "ready: "+defaultDash(m.detail.Item.Ready)))
@@ -4814,9 +5094,14 @@ func (m model) detailOverviewLines(width int) []string {
 		if key == "" || value == "" {
 			continue
 		}
+		_, navigable := m.detailOverviewNavigationTargetForField(key, value)
 		wrapped := wrapText(key+": "+value, width)
 		for _, line := range wrapped {
-			lines = append(lines, m.renderDetailFieldLine("field:"+key, line))
+			rendered := m.renderDetailFieldLine("field:"+key, line)
+			if navigable {
+				rendered = m.styles.Clickable.Render(rendered)
+			}
+			lines = append(lines, rendered)
 		}
 	}
 	return lines
@@ -4862,6 +5147,8 @@ func (m model) detailOwnedLines(width int) []string {
 			row = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(row, "  "))
 		} else if m.isResourceFieldFlashing("children") {
 			row = m.styles.ChangedRow.Render(row)
+		} else {
+			row = m.renderDetailOwnedClickableRow(child, width)
 		}
 		lines = append(lines, row)
 	}
@@ -4907,10 +5194,45 @@ func (m model) detailNodePodsLines(width int) []string {
 			row = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(row, "  "))
 		} else if m.isResourceFieldFlashing("nodePods") {
 			row = m.styles.ChangedRow.Render(row)
+		} else {
+			row = m.renderDetailNodePodClickableRow(pod, width)
 		}
 		lines = append(lines, row)
 	}
 	return lines
+}
+
+func (m model) renderDetailOwnedClickableRow(child protocol.DetailChild, width int) string {
+	const (
+		childResourceWidth  = 16
+		childNamespaceWidth = 18
+		childStatusWidth    = 16
+	)
+	var b strings.Builder
+	b.WriteString("  ")
+	b.WriteString(renderStyledValueSegment(defaultDash(child.Resource), childResourceWidth, m.styles.Clickable))
+	b.WriteByte(' ')
+	b.WriteString(renderStyledValueSegment(defaultDash(child.Namespace), childNamespaceWidth, m.styles.Clickable))
+	b.WriteByte(' ')
+	b.WriteString(renderStyledValueSegment(defaultDash(child.Status), childStatusWidth, m.styles.Clickable))
+	b.WriteByte(' ')
+	b.WriteString(m.styles.Clickable.Render(defaultDash(child.Name)))
+	return fitToWidth(b.String(), width)
+}
+
+func (m model) renderDetailNodePodClickableRow(pod protocol.DetailChild, width int) string {
+	const (
+		podNamespaceWidth = 20
+		podStatusWidth    = 16
+	)
+	var b strings.Builder
+	b.WriteString("  ")
+	b.WriteString(renderStyledValueSegment(defaultDash(pod.Namespace), podNamespaceWidth, m.styles.Clickable))
+	b.WriteByte(' ')
+	b.WriteString(renderStyledValueSegment(defaultDash(pod.Status), podStatusWidth, m.styles.Clickable))
+	b.WriteByte(' ')
+	b.WriteString(m.styles.Clickable.Render(defaultDash(pod.Name)))
+	return fitToWidth(b.String(), width)
 }
 
 func (m model) detailOwnedSelectionLine() (int, bool) {
@@ -4981,10 +5303,18 @@ func (m model) podOverviewAnnotationKeyAtLine(width int, lineIndex int) (string,
 
 func (m model) podOverviewLinesWithAnnotationIndex(width int) ([]string, map[int]string) {
 	overview := m.podView.Overview
+	ownerLine := m.renderPodFieldLine("owner", "owner: "+defaultDash(overview.Owner))
+	if m.canNavigatePodOwner() {
+		ownerLine = m.styles.Clickable.Render(ownerLine)
+	}
+	nodeLine := m.renderPodFieldLine("node", "node: "+defaultDash(overview.Node))
+	if m.canNavigatePodNode() {
+		nodeLine = m.styles.Clickable.Render(nodeLine)
+	}
 	lines := []string{
-		m.renderPodFieldLine("owner", "owner: "+defaultDash(overview.Owner)),
+		ownerLine,
 		m.renderPodFieldLine("phase", "phase: "+defaultDash(overview.Phase)),
-		m.renderPodFieldLine("node", "node: "+defaultDash(overview.Node)),
+		nodeLine,
 		m.renderPodFieldLine("serviceAccount", "serviceAccount: "+defaultDash(overview.ServiceAccount)),
 		m.renderPodFieldLine("podIP", "podIP: "+defaultDash(overview.PodIP)),
 		m.renderPodFieldLine("startTime", "startTime: "+defaultDash(overview.StartTime)),
@@ -5532,9 +5862,9 @@ func (m model) listLines() []string {
 	lines = append(lines, m.styles.ColumnHeader.Render(renderListHeader(columns)))
 
 	for i, item := range m.resourceList.Items {
-		line := renderListItem(columns, item)
+		line := m.renderListItem(columns, item)
 		if i == m.selected {
-			line = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(line, "  "))
+			line = m.styles.SelectedRow.Render("> " + strings.TrimPrefix(renderListItem(columns, item), "  "))
 		} else if m.isItemFlashing(item) {
 			line = m.styles.ChangedRow.Render(line)
 		} else if podRowNotFullyReady(m.resourceList.Resource, item) {
@@ -6022,6 +6352,50 @@ func renderListItem(columns []listColumn, item protocol.ResourceItem) string {
 	return renderListValues(columns, values)
 }
 
+func (m model) renderListItem(columns []listColumn, item protocol.ResourceItem) string {
+	var b strings.Builder
+	b.WriteString("  ")
+	for idx, column := range columns {
+		value := listValueForColumn(column.id, item)
+		if idx == len(columns)-1 || column.width <= 0 {
+			if m.isListValueNavigable(item, column.id) {
+				b.WriteString(m.styles.Clickable.Render(value))
+			} else {
+				b.WriteString(value)
+			}
+			continue
+		}
+		if m.isListValueNavigable(item, column.id) {
+			b.WriteString(renderStyledValueSegment(value, column.width, m.styles.Clickable))
+		} else {
+			b.WriteString(fixedWidthCell(value, column.width))
+		}
+		b.WriteByte(' ')
+	}
+	return b.String()
+}
+
+func (m model) isListValueNavigable(item protocol.ResourceItem, columnID string) bool {
+	switch columnID {
+	case "name":
+		return true
+	case "namespace":
+		namespace := strings.TrimSpace(item.Namespace)
+		if namespace == "" || namespace == "-" || strings.EqualFold(namespace, "<cluster>") {
+			return false
+		}
+		return !strings.EqualFold(namespace, m.session.Namespace)
+	case "node":
+		node := strings.TrimSpace(item.Node)
+		return node != "" && node != "-"
+	case "owner":
+		_, _, ok := ownerNavigation(item.OwnerKind, item.OwnerName)
+		return ok
+	default:
+		return false
+	}
+}
+
 func renderListValues(columns []listColumn, values []string) string {
 	var b strings.Builder
 	b.WriteString("  ")
@@ -6399,6 +6773,9 @@ func (m model) legendHints() []string {
 			hints = append(hints, "o owner")
 		}
 		if m.mouseCapture {
+			hints = append(hints, "click links")
+		}
+		if m.mouseCapture {
 			hints = append(hints, "F2 text-select")
 		} else {
 			hints = append(hints, "F2 mouse-on")
@@ -6420,6 +6797,9 @@ func (m model) legendHints() []string {
 			"esc back",
 			": cmd",
 			"q quit",
+		}
+		if m.mouseCapture {
+			hints = append(hints, "click links")
 		}
 		if tab, ok := m.activeDetailTab(); ok && (tab.kind == detailTabOwned || tab.kind == detailTabNodePods) {
 			hints = append(hints, "enter select")
@@ -6453,6 +6833,9 @@ func (m model) legendHints() []string {
 		"C-y forward",
 		"q quit",
 	)
+	if m.mouseCapture {
+		hints = append(hints, "click links")
+	}
 	return hints
 }
 
