@@ -86,6 +86,7 @@ type ResourceItem struct {
 	Namespace string `json:"namespace"`
 	Ready     string `json:"ready,omitempty"`
 	Status    string `json:"status"`
+	Age       string `json:"age,omitempty"`
 	Node      string `json:"node,omitempty"`
 	OwnerKind string `json:"ownerKind,omitempty"`
 	OwnerName string `json:"ownerName,omitempty"`

@@ -773,6 +773,7 @@ func runListWatchLoop(
 }
 
 func podsToItems(pods []corev1.Pod) []protocol.ResourceItem {
+	now := time.Now()
 	items := make([]protocol.ResourceItem, 0, len(pods))
 	for _, pod := range pods {
 		status := "Unknown"
@@ -790,6 +791,7 @@ func podsToItems(pods []corev1.Pod) []protocol.ResourceItem {
 			Namespace: pod.Namespace,
 			Ready:     readyText,
 			Status:    status,
+			Age:       formatListAgeSince(pod.CreationTimestamp.Time, now),
 			Node:      pod.Spec.NodeName,
 			OwnerKind: ownerKind,
 			OwnerName: ownerName,
@@ -828,6 +830,7 @@ func podContainerReadyCounts(pod corev1.Pod) (ready int, total int) {
 }
 
 func servicesToItems(services []corev1.Service) []protocol.ResourceItem {
+	now := time.Now()
 	items := make([]protocol.ResourceItem, 0, len(services))
 	for _, service := range services {
 		status := "ClusterIP"
@@ -838,6 +841,7 @@ func servicesToItems(services []corev1.Service) []protocol.ResourceItem {
 			Name:      service.Name,
 			Namespace: service.Namespace,
 			Status:    status,
+			Age:       formatListAgeSince(service.CreationTimestamp.Time, now),
 		})
 	}
 	sortResourceItems(items)
@@ -845,6 +849,7 @@ func servicesToItems(services []corev1.Service) []protocol.ResourceItem {
 }
 
 func deploymentsToItems(deployments []appsv1.Deployment) []protocol.ResourceItem {
+	now := time.Now()
 	items := make([]protocol.ResourceItem, 0, len(deployments))
 	for _, deployment := range deployments {
 		replicas := deployment.Status.Replicas
@@ -861,6 +866,7 @@ func deploymentsToItems(deployments []appsv1.Deployment) []protocol.ResourceItem
 			Name:      deployment.Name,
 			Namespace: deployment.Namespace,
 			Status:    status,
+			Age:       formatListAgeSince(deployment.CreationTimestamp.Time, now),
 		})
 	}
 	sortResourceItems(items)
@@ -868,6 +874,7 @@ func deploymentsToItems(deployments []appsv1.Deployment) []protocol.ResourceItem
 }
 
 func nodesToItems(nodes []corev1.Node) []protocol.ResourceItem {
+	now := time.Now()
 	items := make([]protocol.ResourceItem, 0, len(nodes))
 	for _, node := range nodes {
 		status := "Unknown"
@@ -889,6 +896,7 @@ func nodesToItems(nodes []corev1.Node) []protocol.ResourceItem {
 			Name:      node.Name,
 			Namespace: "<cluster>",
 			Status:    status,
+			Age:       formatListAgeSince(node.CreationTimestamp.Time, now),
 		})
 	}
 	sortResourceItems(items)
@@ -896,6 +904,7 @@ func nodesToItems(nodes []corev1.Node) []protocol.ResourceItem {
 }
 
 func namespacesToItems(namespaces []corev1.Namespace) []protocol.ResourceItem {
+	now := time.Now()
 	items := make([]protocol.ResourceItem, 0, len(namespaces))
 	for _, namespace := range namespaces {
 		status := "Unknown"
@@ -906,6 +915,7 @@ func namespacesToItems(namespaces []corev1.Namespace) []protocol.ResourceItem {
 			Name:      namespace.Name,
 			Namespace: "<cluster>",
 			Status:    status,
+			Age:       formatListAgeSince(namespace.CreationTimestamp.Time, now),
 		})
 	}
 	sortResourceItems(items)
@@ -913,6 +923,7 @@ func namespacesToItems(namespaces []corev1.Namespace) []protocol.ResourceItem {
 }
 
 func crdsToItems(crds []apiextv1.CustomResourceDefinition) []protocol.ResourceItem {
+	now := time.Now()
 	items := make([]protocol.ResourceItem, 0, len(crds))
 	for _, crd := range crds {
 		scope := "Cluster"
@@ -943,6 +954,7 @@ func crdsToItems(crds []apiextv1.CustomResourceDefinition) []protocol.ResourceIt
 			Name:      crd.Name,
 			Namespace: "-",
 			Status:    status,
+			Age:       formatListAgeSince(crd.CreationTimestamp.Time, now),
 			OwnerName: strings.Join(aliases, ","),
 		})
 	}
@@ -980,12 +992,14 @@ func unstructuredToItems(values []unstructured.Unstructured) []protocol.Resource
 
 func unstructuredToItemsForResource(values []unstructured.Unstructured, resource string) []protocol.ResourceItem {
 	resource = strings.ToLower(strings.TrimSpace(resource))
+	now := time.Now()
 	items := make([]protocol.ResourceItem, 0, len(values))
 	for _, value := range values {
 		namespace := strings.TrimSpace(value.GetNamespace())
 		if namespace == "" {
 			namespace = "-"
 		}
+		age := formatListAgeSince(value.GetCreationTimestamp().Time, now)
 
 		if resource == "pods" || strings.EqualFold(strings.TrimSpace(value.GetKind()), "pod") {
 			phase := "Unknown"
@@ -1000,6 +1014,7 @@ func unstructuredToItemsForResource(values []unstructured.Unstructured, resource
 				Namespace: namespace,
 				Ready:     readyText,
 				Status:    phase,
+				Age:       age,
 				Node:      strings.TrimSpace(node),
 				OwnerKind: ownerKind,
 				OwnerName: ownerName,
@@ -1022,10 +1037,41 @@ func unstructuredToItemsForResource(values []unstructured.Unstructured, resource
 			Name:      value.GetName(),
 			Namespace: namespace,
 			Status:    status,
+			Age:       age,
 		})
 	}
 	sortResourceItems(items)
 	return items
+}
+
+func formatListAgeSince(createdAt time.Time, now time.Time) string {
+	if createdAt.IsZero() {
+		return ""
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	age := now.Sub(createdAt)
+	if age < 0 {
+		age = 0
+	}
+	return formatListAgeDuration(age)
+}
+
+func formatListAgeDuration(value time.Duration) string {
+	if value < 0 {
+		value = 0
+	}
+	switch {
+	case value < time.Minute:
+		return fmt.Sprintf("%ds", int(value/time.Second))
+	case value < time.Hour:
+		return fmt.Sprintf("%dm", int(value/time.Minute))
+	case value < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(value/time.Hour))
+	default:
+		return fmt.Sprintf("%dd", int(value/(24*time.Hour)))
+	}
 }
 
 func podReadyFromUnstructured(object map[string]any) string {

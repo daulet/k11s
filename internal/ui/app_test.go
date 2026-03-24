@@ -1670,7 +1670,7 @@ func TestListLinesIncludeColumnHeaders(t *testing.T) {
 			Resource:  "pods",
 			Namespace: "default",
 			Items: []protocol.ResourceItem{
-				{Name: "api", Namespace: "default", Ready: "1/1", Status: "Running"},
+				{Name: "api", Namespace: "default", Ready: "1/1", Status: "Running", Age: "2m"},
 			},
 			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 		},
@@ -1683,8 +1683,12 @@ func TestListLinesIncludeColumnHeaders(t *testing.T) {
 	if !strings.Contains(lines[0], "NAME") ||
 		!strings.Contains(lines[0], "NAMESPACE") ||
 		!strings.Contains(lines[0], "READY") ||
+		!strings.Contains(lines[0], "AGE") ||
 		!strings.Contains(lines[0], "STATUS") {
 		t.Fatalf("expected column headers in first row, got %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "2m") {
+		t.Fatalf("expected rendered pod row to include age, got %q", lines[1])
 	}
 }
 
@@ -1699,7 +1703,7 @@ func TestPodListColumnHeadersIncludeNodeAndOwner(t *testing.T) {
 			Resource:  "pods",
 			Namespace: "default",
 			Items: []protocol.ResourceItem{
-				{Name: "api", Namespace: "default", Ready: "1/1", Status: "Running", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
+				{Name: "api", Namespace: "default", Ready: "1/1", Status: "Running", Age: "3h", Node: "node-a", OwnerKind: "ReplicaSet", OwnerName: "api-12345"},
 			},
 			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
 		},
@@ -1709,8 +1713,11 @@ func TestPodListColumnHeadersIncludeNodeAndOwner(t *testing.T) {
 	if len(lines) < 2 {
 		t.Fatalf("expected at least header and one row, got %#v", lines)
 	}
-	if !strings.Contains(lines[0], "NODE") || !strings.Contains(lines[0], "OWNER") {
+	if !strings.Contains(lines[0], "AGE") || !strings.Contains(lines[0], "NODE") || !strings.Contains(lines[0], "OWNER") {
 		t.Fatalf("expected node/owner headers in first row, got %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "3h") {
+		t.Fatalf("expected rendered pod row to include age, got %q", lines[1])
 	}
 }
 

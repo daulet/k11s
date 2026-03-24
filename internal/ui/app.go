@@ -5237,12 +5237,13 @@ func (m model) listContentWidth() int {
 func listColumnsForResource(resource string, contentWidth int) []listColumn {
 	switch strings.ToLower(strings.TrimSpace(resource)) {
 	case "pods":
-		nameWidth, namespaceWidth, readyWidth, statusWidth, nodeWidth := podListColumnWidths(contentWidth)
+		nameWidth, namespaceWidth, readyWidth, statusWidth, ageWidth, nodeWidth := podListColumnWidths(contentWidth)
 		return []listColumn{
 			{id: "name", title: "NAME", width: nameWidth},
 			{id: "namespace", title: "NAMESPACE", width: namespaceWidth},
 			{id: "ready", title: "READY", width: readyWidth},
 			{id: "status", title: "STATUS", width: statusWidth},
+			{id: "age", title: "AGE", width: ageWidth},
 			{id: "node", title: "NODE", width: nodeWidth},
 			{id: "owner", title: "OWNER", width: 0},
 		}
@@ -5250,37 +5251,41 @@ func listColumnsForResource(resource string, contentWidth int) []listColumn {
 		return []listColumn{
 			{id: "name", title: "NAME", width: 36},
 			{id: "namespace", title: "NAMESPACE", width: 18},
+			{id: "age", title: "AGE", width: 5},
 			{id: "status", title: "STATUS", width: 0},
 		}
 	}
 }
 
-func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, status int, node int) {
+func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, status int, age int, node int) {
 	const (
 		nameMin      = 20
 		namespaceMin = 14
 		readyMin     = 5
 		statusMin    = 10
+		ageMin       = 5
 		nodeMin      = 12
 
 		nameMax      = 36
 		namespaceMax = 26
 		readyMax     = 7
 		statusMax    = 12
+		ageMax       = 5
 		nodeMax      = 24
 
 		ownerMinVisible = 12
-		fixedPadding    = 7 // indent + separators before the trailing owner column
+		fixedPadding    = 8 // indent + separators before the trailing owner column
 	)
 
 	name = nameMin
 	namespace = namespaceMin
 	ready = readyMin
 	status = statusMin
+	age = ageMin
 	node = nodeMin
 
-	minSum := nameMin + namespaceMin + readyMin + statusMin + nodeMin
-	maxSum := nameMax + namespaceMax + readyMax + statusMax + nodeMax
+	minSum := nameMin + namespaceMin + readyMin + statusMin + ageMin + nodeMin
+	maxSum := nameMax + namespaceMax + readyMax + statusMax + ageMax + nodeMax
 	target := contentWidth - ownerMinVisible - fixedPadding
 	if target < minSum {
 		target = minSum
@@ -5340,6 +5345,14 @@ func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, 
 				break
 			}
 		}
+		if age < ageMax {
+			age++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
 		if ready < readyMax {
 			ready++
 			remaining--
@@ -5353,7 +5366,7 @@ func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, 
 		}
 	}
 
-	return name, namespace, ready, status, node
+	return name, namespace, ready, status, age, node
 }
 
 func renderListHeader(columns []listColumn) string {
@@ -5398,6 +5411,8 @@ func listValueForColumn(columnID string, item protocol.ResourceItem) string {
 		return item.Namespace
 	case "status":
 		return item.Status
+	case "age":
+		return defaultDash(item.Age)
 	case "ready":
 		value := strings.TrimSpace(item.Ready)
 		if value == "" {
@@ -7334,6 +7349,7 @@ func itemMatchesSearch(item protocol.ResourceItem, query string) bool {
 	}
 	return strings.Contains(strings.ToLower(item.Name), query) ||
 		strings.Contains(strings.ToLower(item.Namespace), query) ||
+		strings.Contains(strings.ToLower(item.Age), query) ||
 		strings.Contains(strings.ToLower(item.Status), query)
 }
 

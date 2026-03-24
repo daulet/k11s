@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daulet/k11s/internal/protocol"
 	appsv1 "k8s.io/api/apps/v1"
@@ -394,6 +395,50 @@ func TestResolveListNamespace(t *testing.T) {
 		if apiNS != tc.wantAPI || displayNS != tc.wantDisplay {
 			t.Fatalf("input=%q expected (%q,%q) got (%q,%q)", tc.in, tc.wantAPI, tc.wantDisplay, apiNS, displayNS)
 		}
+	}
+}
+
+func TestFormatListAgeDuration(t *testing.T) {
+	tests := []struct {
+		in   time.Duration
+		want string
+	}{
+		{in: 10 * time.Second, want: "10s"},
+		{in: 70 * time.Second, want: "1m"},
+		{in: 2*time.Hour + 15*time.Minute, want: "2h"},
+		{in: 49 * time.Hour, want: "2d"},
+	}
+
+	for _, tc := range tests {
+		if got := formatListAgeDuration(tc.in); got != tc.want {
+			t.Fatalf("duration=%s expected %q got %q", tc.in, tc.want, got)
+		}
+	}
+}
+
+func TestUnstructuredToItemsForResourceIncludesAge(t *testing.T) {
+	created := time.Now().UTC().Add(-3*time.Hour - 5*time.Minute).Format(time.RFC3339)
+	items := unstructuredToItemsForResource([]unstructured.Unstructured{
+		{
+			Object: map[string]any{
+				"kind": "Deployment",
+				"metadata": map[string]any{
+					"name":              "api",
+					"namespace":         "default",
+					"creationTimestamp": created,
+				},
+				"status": map[string]any{
+					"ready": true,
+				},
+			},
+		},
+	}, "deployments")
+
+	if len(items) != 1 {
+		t.Fatalf("expected one item, got %d", len(items))
+	}
+	if items[0].Age != "3h" {
+		t.Fatalf("expected relative age 3h, got %#v", items[0])
 	}
 }
 
