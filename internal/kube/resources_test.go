@@ -248,8 +248,14 @@ func TestUnstructuredToItemsForPodsIncludesReadyNodeAndOwner(t *testing.T) {
 func TestDeploymentsToItems(t *testing.T) {
 	items := deploymentsToItems([]appsv1.Deployment{
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
-			Status:     appsv1.DeploymentStatus{Replicas: 3, AvailableReplicas: 1},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "web",
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{
+					{Kind: "ReplicaSet", Name: "web-rs", Controller: boolPtr(true)},
+				},
+			},
+			Status: appsv1.DeploymentStatus{Replicas: 3, AvailableReplicas: 1},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "default"},
@@ -266,13 +272,22 @@ func TestDeploymentsToItems(t *testing.T) {
 	if items[1].Name != "web" || items[1].Status != "1/3 available" {
 		t.Fatalf("unexpected second item: %#v", items[1])
 	}
+	if items[1].OwnerKind != "ReplicaSet" || items[1].OwnerName != "web-rs" {
+		t.Fatalf("expected deployment owner metadata, got %#v", items[1])
+	}
 }
 
 func TestServicesToItems(t *testing.T) {
 	items := servicesToItems([]corev1.Service{
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: "default"},
-			Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "b",
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{
+					{Kind: "Gateway", Name: "gw-main", Controller: boolPtr(true)},
+				},
+			},
+			Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "default"},
@@ -288,6 +303,9 @@ func TestServicesToItems(t *testing.T) {
 	}
 	if items[1].Name != "b" || items[1].Status != "NodePort" {
 		t.Fatalf("unexpected second item: %#v", items[1])
+	}
+	if items[1].OwnerKind != "Gateway" || items[1].OwnerName != "gw-main" {
+		t.Fatalf("expected service owner metadata, got %#v", items[1])
 	}
 }
 
@@ -426,6 +444,13 @@ func TestUnstructuredToItemsForResourceIncludesAge(t *testing.T) {
 					"name":              "api",
 					"namespace":         "default",
 					"creationTimestamp": created,
+					"ownerReferences": []any{
+						map[string]any{
+							"kind":       "Deployment",
+							"name":       "api-owner",
+							"controller": true,
+						},
+					},
 				},
 				"status": map[string]any{
 					"ready": true,
@@ -439,6 +464,9 @@ func TestUnstructuredToItemsForResourceIncludesAge(t *testing.T) {
 	}
 	if items[0].Age != "3h" {
 		t.Fatalf("expected relative age 3h, got %#v", items[0])
+	}
+	if items[0].OwnerKind != "Deployment" || items[0].OwnerName != "api-owner" {
+		t.Fatalf("expected owner metadata on generic resource item, got %#v", items[0])
 	}
 }
 

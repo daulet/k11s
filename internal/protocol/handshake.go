@@ -110,17 +110,18 @@ type ResourceDetailQuery struct {
 }
 
 type ResourceDetailPayload struct {
-	Resource      string        `json:"resource"`
-	Namespace     string        `json:"namespace"`
-	ItemNamespace string        `json:"itemNamespace,omitempty"`
-	Name          string        `json:"name"`
-	Found         bool          `json:"found"`
-	Item          *ResourceItem `json:"item,omitempty"`
-	Overview      []DetailField `json:"overview,omitempty"`
-	NodePods      []DetailChild `json:"nodePods,omitempty"`
-	Children      []DetailChild `json:"children,omitempty"`
-	YAML          string        `json:"yaml,omitempty"`
-	Freshness     FreshnessMeta `json:"freshness"`
+	Resource        string        `json:"resource"`
+	Namespace       string        `json:"namespace"`
+	ItemNamespace   string        `json:"itemNamespace,omitempty"`
+	Name            string        `json:"name"`
+	Found           bool          `json:"found"`
+	Item            *ResourceItem `json:"item,omitempty"`
+	Overview        []DetailField `json:"overview,omitempty"`
+	NodePods        []DetailChild `json:"nodePods,omitempty"`
+	Children        []DetailChild `json:"children,omitempty"`
+	ChildrenLoading bool          `json:"childrenLoading,omitempty"`
+	YAML            string        `json:"yaml,omitempty"`
+	Freshness       FreshnessMeta `json:"freshness"`
 }
 
 type DetailField struct {
@@ -225,17 +226,21 @@ const (
 const ActionDelete = "delete"
 const ActionScale = "scale"
 const ActionRolloutRestart = "rollout_restart"
+const ActionLabel = "label"
+const ActionAnnotate = "annotate"
 
 type ActionQuery struct {
-	Action        string `json:"action"`
-	KubeContext   string `json:"kubeContext,omitempty"`
-	Resource      string `json:"resource"`
-	Namespace     string `json:"namespace"`
-	Filter        string `json:"filter,omitempty"`
-	ItemNamespace string `json:"itemNamespace,omitempty"`
-	Name          string `json:"name"`
-	Force         bool   `json:"force,omitempty"`
-	Replicas      *int32 `json:"replicas,omitempty"`
+	Action        string            `json:"action"`
+	KubeContext   string            `json:"kubeContext,omitempty"`
+	Resource      string            `json:"resource"`
+	Namespace     string            `json:"namespace"`
+	Filter        string            `json:"filter,omitempty"`
+	ItemNamespace string            `json:"itemNamespace,omitempty"`
+	Name          string            `json:"name"`
+	Force         bool              `json:"force,omitempty"`
+	Replicas      *int32            `json:"replicas,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Annotations   map[string]string `json:"annotations,omitempty"`
 }
 
 type ActionResult struct {

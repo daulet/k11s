@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daulet/k11s/internal/protocol"
@@ -26,12 +27,44 @@ const (
 	detailLabelFieldBudget      = 10
 	detailAnnotationFieldBudget = 8
 	detailScalarMaxRunes        = 160
+	ownedChildrenCacheTTL       = 30 * time.Second
+	ownedChildrenScanTimeout    = 45 * time.Second
 )
 
 type ResourceDetailEnricher struct {
 	clients   *ClientFactory
 	resources *ResourceFetcher
 	now       func() time.Time
+
+	mu                sync.Mutex
+	ownedChildren     map[ownedChildrenCacheKey]ownedChildrenCacheEntry
+	ownedChildIndex   map[ownedChildrenLoadKey]ownedChildrenIndexEntry
+	ownedChildrenLoad map[ownedChildrenLoadKey]struct{}
+}
+
+type ownedChildrenCacheKey struct {
+	kubeContext      string
+	parentResource   string
+	parentNamespace  string
+	parentUID        string
+	parentNamespaced bool
+}
+
+type ownedChildrenCacheEntry struct {
+	children  []protocol.DetailChild
+	fetchedAt time.Time
+}
+
+type ownedChildrenLoadKey struct {
+	kubeContext      string
+	parentResource   string
+	parentNamespace  string
+	parentNamespaced bool
+}
+
+type ownedChildrenIndexEntry struct {
+	childrenByOwner map[string][]protocol.DetailChild
+	fetchedAt       time.Time
 }
 
 func NewResourceDetailEnricher(clients *ClientFactory, resources *ResourceFetcher) *ResourceDetailEnricher {
@@ -42,9 +75,12 @@ func NewResourceDetailEnricher(clients *ClientFactory, resources *ResourceFetche
 		resources = NewResourceFetcher(clients)
 	}
 	return &ResourceDetailEnricher{
-		clients:   clients,
-		resources: resources,
-		now:       time.Now,
+		clients:           clients,
+		resources:         resources,
+		now:               time.Now,
+		ownedChildren:     map[ownedChildrenCacheKey]ownedChildrenCacheEntry{},
+		ownedChildIndex:   map[ownedChildrenLoadKey]ownedChildrenIndexEntry{},
+		ownedChildrenLoad: map[ownedChildrenLoadKey]struct{}{},
 	}
 }
 
@@ -109,7 +145,14 @@ func (f *ResourceDetailEnricher) Enrich(
 
 	base.Overview = buildDetailOverviewFields(obj, f.now())
 	base.NodePods = f.fetchNodePods(ctx, query.KubeContext, canonicalResource, strings.TrimSpace(obj.GetName()))
-	base.Children = f.fetchOwnedChildren(ctx, query.KubeContext, canonicalResource, namespaced, itemNamespace, obj.GetUID())
+	base.Children, base.ChildrenLoading = f.fetchOwnedChildren(
+		ctx,
+		query.KubeContext,
+		canonicalResource,
+		namespaced,
+		itemNamespace,
+		obj.GetUID(),
+	)
 	base.YAML = buildDetailYAML(obj)
 	return base, nil
 }
@@ -246,8 +289,14 @@ func buildDetailOverviewFields(obj unstructured.Unstructured, now time.Time) []p
 	}
 	appendField("resourceVersion", obj.GetResourceVersion())
 
-	if owners := ownerReferenceValues(obj.GetOwnerReferences()); len(owners) > 0 {
-		appendField("owners", strings.Join(owners, ", "))
+	ownerReferences := obj.GetOwnerReferences()
+	if len(ownerReferences) > 0 {
+		if owner, ok := ownerReferencePrimaryValue(ownerReferences); ok {
+			appendField("owner", owner)
+		}
+		if owners := ownerReferenceValues(ownerReferences); len(owners) > 1 {
+			appendField("owners", strings.Join(owners, ", "))
+		}
 	}
 
 	labels := obj.GetLabels()
@@ -395,6 +444,31 @@ func ownerReferenceValues(values []metav1.OwnerReference) []string {
 	return result
 }
 
+func ownerReferencePrimaryValue(values []metav1.OwnerReference) (string, bool) {
+	if len(values) == 0 {
+		return "", false
+	}
+	fallback := ""
+	for _, owner := range values {
+		kind := strings.TrimSpace(owner.Kind)
+		name := strings.TrimSpace(owner.Name)
+		if kind == "" || name == "" {
+			continue
+		}
+		value := kind + "/" + name
+		if fallback == "" {
+			fallback = value
+		}
+		if owner.Controller != nil && *owner.Controller {
+			return value, true
+		}
+	}
+	if fallback == "" {
+		return "", false
+	}
+	return fallback, true
+}
+
 func sortedMapKeys(values map[string]string) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -485,14 +559,100 @@ func (f *ResourceDetailEnricher) fetchOwnedChildren(
 	parentNamespaced bool,
 	parentNamespace string,
 	parentUID types.UID,
-) []protocol.DetailChild {
+) ([]protocol.DetailChild, bool) {
 	uid := strings.TrimSpace(string(parentUID))
 	if uid == "" {
-		return nil
+		return nil, false
 	}
+	cacheKey := ownedChildrenCacheKey{
+		kubeContext:      strings.TrimSpace(kubeContext),
+		parentResource:   strings.TrimSpace(strings.ToLower(parentResource)),
+		parentNamespace:  strings.TrimSpace(parentNamespace),
+		parentUID:        uid,
+		parentNamespaced: parentNamespaced,
+	}
+	cached, stale, ok := f.cachedOwnedChildren(cacheKey)
+	if ok && !stale {
+		return cached, f.ownedChildrenLoading(cacheKey)
+	}
+	if indexed, indexedOK := f.cachedOwnedChildrenFromIndex(cacheKey); indexedOK {
+		// Prime per-owner cache from scope index to avoid repeated misses for empty owners.
+		f.storeOwnedChildren(cacheKey, indexed)
+		return indexed, f.ownedChildrenLoading(cacheKey)
+	}
+	if !ok || stale {
+		f.ensureOwnedChildrenLoaded(cacheKey, uid)
+	}
+	return cached, f.ownedChildrenLoading(cacheKey)
+}
 
-	childrenKinds := ownedChildResources(parentResource)
-	if len(childrenKinds) == 0 {
+func (f *ResourceDetailEnricher) ensureOwnedChildrenLoaded(
+	key ownedChildrenCacheKey,
+	requestedParentUID string,
+) {
+	loadKey := ownedChildrenLoadKey{
+		kubeContext:      key.kubeContext,
+		parentResource:   key.parentResource,
+		parentNamespace:  key.parentNamespace,
+		parentNamespaced: key.parentNamespaced,
+	}
+	f.mu.Lock()
+	if _, ok := f.ownedChildrenLoad[loadKey]; ok {
+		f.mu.Unlock()
+		return
+	}
+	f.ownedChildrenLoad[loadKey] = struct{}{}
+	f.mu.Unlock()
+
+	go func() {
+		defer f.clearOwnedChildrenLoad(loadKey)
+
+		scanCtx := context.Background()
+		cancel := func() {}
+		if ownedChildrenScanTimeout > 0 {
+			scanCtx, cancel = context.WithTimeout(context.Background(), ownedChildrenScanTimeout)
+		}
+		defer cancel()
+
+		childrenByOwner := f.loadOwnedChildren(
+			scanCtx,
+			key.kubeContext,
+			key.parentResource,
+			key.parentNamespaced,
+			key.parentNamespace,
+		)
+		f.storeOwnedChildrenByOwner(loadKey, childrenByOwner, requestedParentUID)
+	}()
+}
+
+func (f *ResourceDetailEnricher) clearOwnedChildrenLoad(key ownedChildrenLoadKey) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.ownedChildrenLoad, key)
+}
+
+func (f *ResourceDetailEnricher) ownedChildrenLoading(key ownedChildrenCacheKey) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	loadKey := ownedChildrenLoadKey{
+		kubeContext:      key.kubeContext,
+		parentResource:   key.parentResource,
+		parentNamespace:  key.parentNamespace,
+		parentNamespaced: key.parentNamespaced,
+	}
+	_, loading := f.ownedChildrenLoad[loadKey]
+	return loading
+}
+
+func (f *ResourceDetailEnricher) loadOwnedChildren(
+	ctx context.Context,
+	kubeContext string,
+	parentResource string,
+	parentNamespaced bool,
+	parentNamespace string,
+) map[string][]protocol.DetailChild {
+	targets := f.ownedChildTargets(ctx, kubeContext, parentResource, parentNamespaced)
+	if len(targets) == 0 {
 		return nil
 	}
 
@@ -501,16 +661,20 @@ func (f *ResourceDetailEnricher) fetchOwnedChildren(
 		return nil
 	}
 
-	children := make([]protocol.DetailChild, 0, 32)
-	for _, childResource := range childrenKinds {
-		target, err := f.resources.resolveDiscoveredResource(ctx, kubeContext, childResource)
-		if err != nil {
-			continue
+	childrenByOwner := map[string][]protocol.DetailChild{}
+	for _, target := range targets {
+		if ctx.Err() != nil {
+			break
 		}
-
 		namespace := ""
-		if target.Namespaced && parentNamespaced {
-			namespace = parentNamespace
+		if target.Namespaced {
+			namespace = "all"
+			if parentNamespaced {
+				parentNS := strings.TrimSpace(parentNamespace)
+				if parentNS != "" && parentNS != "-" && !strings.EqualFold(parentNS, "<cluster>") && !strings.EqualFold(parentNS, "all") {
+					namespace = parentNS
+				}
+			}
 		}
 
 		list, err := listDiscoveredUnstructured(ctx, dyn, target, namespace, metav1.ListOptions{})
@@ -519,32 +683,260 @@ func (f *ResourceDetailEnricher) fetchOwnedChildren(
 		}
 
 		for _, item := range list.Items {
-			if !hasOwnerUID(item.GetOwnerReferences(), uid) {
-				continue
-			}
 			itemNamespace := strings.TrimSpace(item.GetNamespace())
 			if itemNamespace == "" {
 				itemNamespace = "<cluster>"
 			}
-			children = append(children, protocol.DetailChild{
+			child := protocol.DetailChild{
 				Resource:  target.GVR.Resource,
 				Namespace: itemNamespace,
 				Name:      strings.TrimSpace(item.GetName()),
 				Status:    detailStatusFromUnstructured(item),
-			})
+			}
+			for _, owner := range item.GetOwnerReferences() {
+				ownerUID := strings.TrimSpace(string(owner.UID))
+				if ownerUID == "" {
+					continue
+				}
+				childrenByOwner[ownerUID] = append(childrenByOwner[ownerUID], child)
+			}
 		}
 	}
 
-	sort.SliceStable(children, func(i, j int) bool {
-		if children[i].Resource != children[j].Resource {
-			return children[i].Resource < children[j].Resource
+	for ownerUID, children := range childrenByOwner {
+		sort.SliceStable(children, func(i, j int) bool {
+			if children[i].Resource != children[j].Resource {
+				return children[i].Resource < children[j].Resource
+			}
+			if children[i].Namespace != children[j].Namespace {
+				return children[i].Namespace < children[j].Namespace
+			}
+			return children[i].Name < children[j].Name
+		})
+		childrenByOwner[ownerUID] = children
+	}
+	return childrenByOwner
+}
+
+func (f *ResourceDetailEnricher) storeOwnedChildrenByOwner(
+	key ownedChildrenLoadKey,
+	childrenByOwner map[string][]protocol.DetailChild,
+	requestedParentUID string,
+) {
+	f.storeOwnedChildrenIndex(key, childrenByOwner)
+
+	storeForUID := func(ownerUID string, children []protocol.DetailChild) {
+		cacheKey := ownedChildrenCacheKey{
+			kubeContext:      key.kubeContext,
+			parentResource:   key.parentResource,
+			parentNamespace:  key.parentNamespace,
+			parentUID:        ownerUID,
+			parentNamespaced: key.parentNamespaced,
 		}
-		if children[i].Namespace != children[j].Namespace {
-			return children[i].Namespace < children[j].Namespace
+		f.storeOwnedChildren(cacheKey, children)
+	}
+	for ownerUID, children := range childrenByOwner {
+		storeForUID(ownerUID, children)
+	}
+	if _, ok := childrenByOwner[requestedParentUID]; !ok {
+		storeForUID(requestedParentUID, nil)
+	}
+}
+
+func (f *ResourceDetailEnricher) ownedChildTargets(
+	ctx context.Context,
+	kubeContext string,
+	parentResource string,
+	parentNamespaced bool,
+) []discoveredResource {
+	snapshot, err := f.resources.discoverySnapshot(ctx, kubeContext)
+	if err != nil {
+		return nil
+	}
+
+	preferred := ownedChildResources(parentResource)
+	preferredSet := map[string]struct{}{}
+	for _, resource := range preferred {
+		normalized := strings.TrimSpace(strings.ToLower(resource))
+		if normalized == "" {
+			continue
 		}
-		return children[i].Name < children[j].Name
+		preferredSet[normalized] = struct{}{}
+	}
+
+	dedup := map[string]discoveredResource{}
+	for _, target := range snapshot.lookup {
+		resource := strings.TrimSpace(strings.ToLower(target.GVR.Resource))
+		if resource == "" {
+			continue
+		}
+		if parentNamespaced && !target.Namespaced {
+			continue
+		}
+		if len(preferredSet) > 0 {
+			if _, ok := preferredSet[resource]; !ok {
+				continue
+			}
+		}
+		key := target.GVR.Group + "/" + target.GVR.Version + "/" + target.GVR.Resource
+		dedup[key] = target
+	}
+
+	targets := make([]discoveredResource, 0, len(dedup))
+	for _, target := range dedup {
+		targets = append(targets, target)
+	}
+	genericTargets := len(preferredSet) == 0
+	sort.SliceStable(targets, func(i, j int) bool {
+		if genericTargets {
+			iPriority := genericOwnedChildResourcePriority(targets[i].GVR.Resource)
+			jPriority := genericOwnedChildResourcePriority(targets[j].GVR.Resource)
+			if iPriority != jPriority {
+				return iPriority < jPriority
+			}
+		}
+		if targets[i].GVR.Resource != targets[j].GVR.Resource {
+			return targets[i].GVR.Resource < targets[j].GVR.Resource
+		}
+		if targets[i].GVR.Group != targets[j].GVR.Group {
+			return targets[i].GVR.Group < targets[j].GVR.Group
+		}
+		return targets[i].GVR.Version < targets[j].GVR.Version
 	})
-	return children
+	return targets
+}
+
+func genericOwnedChildResourcePriority(resource string) int {
+	switch strings.ToLower(strings.TrimSpace(resource)) {
+	case "pods":
+		return 0
+	case "replicasets":
+		return 1
+	case "jobs":
+		return 2
+	case "statefulsets":
+		return 3
+	case "daemonsets":
+		return 4
+	case "deployments":
+		return 5
+	case "cronjobs":
+		return 6
+	case "controllerrevisions":
+		return 7
+	case "persistentvolumeclaims":
+		return 8
+	case "configmaps":
+		return 9
+	case "secrets":
+		return 10
+	case "services":
+		return 11
+	case "ingresses":
+		return 12
+	default:
+		return 100
+	}
+}
+
+func cloneDetailChildren(values []protocol.DetailChild) []protocol.DetailChild {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]protocol.DetailChild, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneDetailChildrenByOwner(values map[string][]protocol.DetailChild) map[string][]protocol.DetailChild {
+	if len(values) == 0 {
+		return map[string][]protocol.DetailChild{}
+	}
+	cloned := make(map[string][]protocol.DetailChild, len(values))
+	for ownerUID, children := range values {
+		uid := strings.TrimSpace(ownerUID)
+		if uid == "" {
+			continue
+		}
+		cloned[uid] = cloneDetailChildren(children)
+	}
+	return cloned
+}
+
+func (f *ResourceDetailEnricher) cachedOwnedChildren(key ownedChildrenCacheKey) ([]protocol.DetailChild, bool, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	entry, ok := f.ownedChildren[key]
+	if !ok {
+		return nil, false, false
+	}
+	stale := f.now().Sub(entry.fetchedAt) > ownedChildrenCacheTTL
+	return cloneDetailChildren(entry.children), stale, true
+}
+
+func (f *ResourceDetailEnricher) cachedOwnedChildrenFromIndex(key ownedChildrenCacheKey) ([]protocol.DetailChild, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	loadKey := ownedChildrenLoadKey{
+		kubeContext:      key.kubeContext,
+		parentResource:   key.parentResource,
+		parentNamespace:  key.parentNamespace,
+		parentNamespaced: key.parentNamespaced,
+	}
+	entry, ok := f.ownedChildIndex[loadKey]
+	if !ok {
+		return nil, false
+	}
+	if f.now().Sub(entry.fetchedAt) > ownedChildrenCacheTTL {
+		delete(f.ownedChildIndex, loadKey)
+		return nil, false
+	}
+	return cloneDetailChildren(entry.childrenByOwner[key.parentUID]), true
+}
+
+func (f *ResourceDetailEnricher) storeOwnedChildrenIndex(key ownedChildrenLoadKey, childrenByOwner map[string][]protocol.DetailChild) {
+	if childrenByOwner == nil {
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.ownedChildIndex) > 128 {
+		now := f.now()
+		for loadKey, entry := range f.ownedChildIndex {
+			if now.Sub(entry.fetchedAt) > ownedChildrenCacheTTL {
+				delete(f.ownedChildIndex, loadKey)
+			}
+		}
+		if len(f.ownedChildIndex) > 192 {
+			f.ownedChildIndex = map[ownedChildrenLoadKey]ownedChildrenIndexEntry{}
+		}
+	}
+	f.ownedChildIndex[key] = ownedChildrenIndexEntry{
+		childrenByOwner: cloneDetailChildrenByOwner(childrenByOwner),
+		fetchedAt:       f.now(),
+	}
+}
+
+func (f *ResourceDetailEnricher) storeOwnedChildren(key ownedChildrenCacheKey, children []protocol.DetailChild) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.ownedChildren) > 512 {
+		now := f.now()
+		for cacheKey, entry := range f.ownedChildren {
+			if now.Sub(entry.fetchedAt) > ownedChildrenCacheTTL {
+				delete(f.ownedChildren, cacheKey)
+			}
+		}
+		if len(f.ownedChildren) > 768 {
+			f.ownedChildren = map[ownedChildrenCacheKey]ownedChildrenCacheEntry{}
+		}
+	}
+	f.ownedChildren[key] = ownedChildrenCacheEntry{
+		children:  cloneDetailChildren(children),
+		fetchedAt: f.now(),
+	}
 }
 
 func ownedChildResources(parentResource string) []string {
@@ -558,18 +950,6 @@ func ownedChildResources(parentResource string) []string {
 	default:
 		return nil
 	}
-}
-
-func hasOwnerUID(owners []metav1.OwnerReference, uid string) bool {
-	if uid == "" || len(owners) == 0 {
-		return false
-	}
-	for _, owner := range owners {
-		if strings.TrimSpace(string(owner.UID)) == uid {
-			return true
-		}
-	}
-	return false
 }
 
 func detailStatusFromUnstructured(value unstructured.Unstructured) string {

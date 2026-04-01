@@ -802,15 +802,7 @@ func podsToItems(pods []corev1.Pod) []protocol.ResourceItem {
 }
 
 func podOwner(pod corev1.Pod) (kind string, name string) {
-	if len(pod.OwnerReferences) == 0 {
-		return "", ""
-	}
-	for _, owner := range pod.OwnerReferences {
-		if owner.Controller != nil && *owner.Controller {
-			return owner.Kind, owner.Name
-		}
-	}
-	return pod.OwnerReferences[0].Kind, pod.OwnerReferences[0].Name
+	return ownerFromReferences(pod.OwnerReferences)
 }
 
 func podContainerReadyCounts(pod corev1.Pod) (ready int, total int) {
@@ -837,11 +829,14 @@ func servicesToItems(services []corev1.Service) []protocol.ResourceItem {
 		if service.Spec.Type != "" {
 			status = string(service.Spec.Type)
 		}
+		ownerKind, ownerName := ownerFromReferences(service.OwnerReferences)
 		items = append(items, protocol.ResourceItem{
 			Name:      service.Name,
 			Namespace: service.Namespace,
 			Status:    status,
 			Age:       formatListAgeSince(service.CreationTimestamp.Time, now),
+			OwnerKind: ownerKind,
+			OwnerName: ownerName,
 		})
 	}
 	sortResourceItems(items)
@@ -862,11 +857,14 @@ func deploymentsToItems(deployments []appsv1.Deployment) []protocol.ResourceItem
 				status = fmt.Sprintf("%d/%d available", available, replicas)
 			}
 		}
+		ownerKind, ownerName := ownerFromReferences(deployment.OwnerReferences)
 		items = append(items, protocol.ResourceItem{
 			Name:      deployment.Name,
 			Namespace: deployment.Namespace,
 			Status:    status,
 			Age:       formatListAgeSince(deployment.CreationTimestamp.Time, now),
+			OwnerKind: ownerKind,
+			OwnerName: ownerName,
 		})
 	}
 	sortResourceItems(items)
@@ -911,11 +909,14 @@ func namespacesToItems(namespaces []corev1.Namespace) []protocol.ResourceItem {
 		if namespace.Status.Phase != "" {
 			status = string(namespace.Status.Phase)
 		}
+		ownerKind, ownerName := ownerFromReferences(namespace.OwnerReferences)
 		items = append(items, protocol.ResourceItem{
 			Name:      namespace.Name,
 			Namespace: "<cluster>",
 			Status:    status,
 			Age:       formatListAgeSince(namespace.CreationTimestamp.Time, now),
+			OwnerKind: ownerKind,
+			OwnerName: ownerName,
 		})
 	}
 	sortResourceItems(items)
@@ -1032,12 +1033,15 @@ func unstructuredToItemsForResource(values []unstructured.Unstructured, resource
 				status = "NotReady"
 			}
 		}
+		ownerKind, ownerName := podOwnerFromUnstructured(value.Object)
 
 		items = append(items, protocol.ResourceItem{
 			Name:      value.GetName(),
 			Namespace: namespace,
 			Status:    status,
 			Age:       age,
+			OwnerKind: ownerKind,
+			OwnerName: ownerName,
 		})
 	}
 	sortResourceItems(items)
@@ -1125,6 +1129,29 @@ func podOwnerFromUnstructured(object map[string]any) (kind string, name string) 
 		}
 		controller, hasController, _ := unstructured.NestedBool(owner, "controller")
 		if hasController && controller {
+			return kind, name
+		}
+	}
+	return fallbackKind, fallbackName
+}
+
+func ownerFromReferences(owners []metav1.OwnerReference) (kind string, name string) {
+	if len(owners) == 0 {
+		return "", ""
+	}
+	fallbackKind := ""
+	fallbackName := ""
+	for _, owner := range owners {
+		kind = strings.TrimSpace(owner.Kind)
+		name = strings.TrimSpace(owner.Name)
+		if kind == "" || name == "" {
+			continue
+		}
+		if fallbackKind == "" || fallbackName == "" {
+			fallbackKind = kind
+			fallbackName = name
+		}
+		if owner.Controller != nil && *owner.Controller {
 			return kind, name
 		}
 	}

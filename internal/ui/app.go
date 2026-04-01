@@ -116,8 +116,10 @@ type actionFailedMsg struct {
 	err error
 }
 
-type bulkDeleteLoadedMsg struct {
+type bulkActionLoadedMsg struct {
 	seq       int
+	action    string
+	sample    protocol.ActionQuery
 	total     int
 	succeeded int
 	failed    []string
@@ -937,28 +939,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		updatedModel, listCmd := m.startListReloadWithAnnouncement(false)
 		return updatedModel, listCmd
-	case bulkDeleteLoadedMsg:
+	case bulkActionLoadedMsg:
 		if msg.seq != m.actionActiveSeq {
 			return m, nil
 		}
 		m.actionLoading = false
 		m.clearMultiSelection()
+		actionName := bulkActionName(msg.action)
+		actionPast := bulkActionPast(msg.action)
+		actionSuffix := bulkActionSummarySuffix(msg.sample)
 		switch {
 		case msg.total <= 0:
-			m.commandMessage = "no delete targets selected"
+			m.commandMessage = "no action targets selected"
 		case len(msg.failed) == 0:
-			m.commandMessage = fmt.Sprintf("deleted %d targets", msg.succeeded)
+			m.commandMessage = fmt.Sprintf("%s %d targets%s", actionPast, msg.succeeded, actionSuffix)
 		case msg.succeeded <= 0:
 			m.commandMessage = fmt.Sprintf(
-				"delete failed for %d targets: %s",
+				"%s failed for %d targets%s: %s",
+				actionName,
 				msg.total,
+				actionSuffix,
 				summarizeBulkDeleteFailures(msg.failed),
 			)
 		default:
 			m.commandMessage = fmt.Sprintf(
-				"deleted %d/%d targets; failures: %s",
+				"%s %d/%d targets%s; failures: %s",
+				actionPast,
 				msg.succeeded,
 				msg.total,
+				actionSuffix,
 				summarizeBulkDeleteFailures(msg.failed),
 			)
 		}
@@ -1351,6 +1360,8 @@ func (m model) updateResourceViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.startDeleteConfirmationForActive(true, "shortcut")
 	case key.Matches(msg, m.keys.Edit):
 		return m.startEditForActive("shortcut")
+	case key.Matches(msg, m.keys.OpenOwner):
+		return m.navigateDetailOwner("shortcut")
 	case msg.String() == "esc":
 		m.clearDetail()
 		m.commandMessage = "closed resource view"
@@ -1716,7 +1727,7 @@ func (m model) detailNodePodIndexAtLine(line int) (int, bool) {
 	if len(m.detail.NodePods) == 0 {
 		return 0, false
 	}
-	index := line - 2 // heading + table header
+	index := line - 1 // table header
 	if index < 0 || index >= len(m.detail.NodePods) {
 		return 0, false
 	}
@@ -1754,31 +1765,54 @@ func (m model) navigateDetailOverviewAtLine(width int, line int, via string) (te
 	case "node":
 		return m.openNodeDetail(target.node, via, previousSession)
 	case "owner":
-		resource, selection, ok := ownerNavigation(target.ownerKind, target.ownerName)
-		if !ok {
-			m.commandMessage = fmt.Sprintf("owner %s/%s is not navigable yet", target.ownerKind, target.ownerName)
-			return m, nil
+		namespace := strings.TrimSpace(target.namespace)
+		if namespace == "" {
+			namespace = strings.TrimSpace(m.detail.ItemNamespace)
 		}
-		if resourceUsesNamespace(resource) {
-			namespace := strings.TrimSpace(target.namespace)
-			if namespace == "" {
-				namespace = strings.TrimSpace(m.detail.ItemNamespace)
-			}
-			if namespace != "" && namespace != "-" && !strings.EqualFold(namespace, "<cluster>") {
-				m.session.Namespace = namespace
-			}
-		}
-		m.session.Resource = resource
-		m.session.Selection = selection
-		m.pushNavigationHistory(previousSession)
-		m.clearPodView()
-		m.clearDetail()
-		m.clearFlashingItems()
-		m.commandMessage = fmt.Sprintf("opened owner %s/%s via %s", target.ownerKind, selection, via)
-		return m.startListReload()
+		return m.openOwnerDetail(target.ownerKind, target.ownerName, namespace, via, previousSession)
 	default:
 		return m, nil
 	}
+}
+
+func (m model) navigateDetailOwner(via string) (tea.Model, tea.Cmd) {
+	ownerKind, ownerName, namespace, ok := m.detailOwnerNavigationTarget()
+	if !ok {
+		m.commandMessage = "owner is not available for this resource"
+		return m, nil
+	}
+	return m.openOwnerDetail(ownerKind, ownerName, namespace, via, m.session)
+}
+
+func (m model) detailOwnerNavigationTarget() (ownerKind string, ownerName string, namespace string, ok bool) {
+	namespace = strings.TrimSpace(m.detail.ItemNamespace)
+	if namespace == "" && m.detail.Item != nil {
+		namespace = strings.TrimSpace(m.detail.Item.Namespace)
+	}
+	if namespace == "-" || strings.EqualFold(namespace, "<cluster>") {
+		namespace = ""
+	}
+
+	if m.detail.Item != nil {
+		ownerKind = strings.TrimSpace(m.detail.Item.OwnerKind)
+		ownerName = strings.TrimSpace(m.detail.Item.OwnerName)
+		if _, _, ok = ownerNavigation(ownerKind, ownerName); ok {
+			return ownerKind, ownerName, namespace, true
+		}
+	}
+
+	for _, field := range m.detail.Overview {
+		target, targetOK := m.detailOverviewNavigationTargetForField(field.Key, field.Value)
+		if !targetOK || target.kind != "owner" {
+			continue
+		}
+		resolvedNamespace := strings.TrimSpace(target.namespace)
+		if resolvedNamespace == "" {
+			resolvedNamespace = namespace
+		}
+		return target.ownerKind, target.ownerName, resolvedNamespace, true
+	}
+	return "", "", "", false
 }
 
 type detailOverviewNavigationTarget struct {
@@ -1849,7 +1883,7 @@ func (m model) detailOverviewNavigationTargetForField(key string, value string) 
 			return detailOverviewNavigationTarget{}, false
 		}
 		return detailOverviewNavigationTarget{kind: "node", node: node}, true
-	case "owner", "ownerreference", "ownerreferences", "metadata.ownerreferences":
+	case "owner", "owners", "ownerreference", "ownerreferences", "metadata.ownerreferences":
 		ownerKind, ownerName, ok := parsePodOwner(value)
 		if !ok {
 			return detailOverviewNavigationTarget{}, false
@@ -1892,25 +1926,7 @@ func (m model) navigateItemColumn(item protocol.ResourceItem, column string, via
 		}
 		return m.openNodeDetail(node, via, previousSession)
 	case "owner":
-		resource, ownerSelection, ok := ownerNavigation(item.OwnerKind, item.OwnerName)
-		if !ok {
-			m.commandMessage = fmt.Sprintf("owner %s is not navigable yet", ownerDisplay(item))
-			return m, nil
-		}
-		if resourceUsesNamespace(resource) {
-			namespace := strings.TrimSpace(item.Namespace)
-			if namespace != "" && namespace != "-" && !strings.EqualFold(namespace, "<cluster>") {
-				m.session.Namespace = namespace
-			}
-		}
-		m.session.Resource = resource
-		m.session.Selection = ownerSelection
-		m.pushNavigationHistory(previousSession)
-		m.clearPodView()
-		m.clearDetail()
-		m.clearFlashingItems()
-		m.commandMessage = fmt.Sprintf("opened owner %s/%s via %s", item.OwnerKind, ownerSelection, via)
-		return m.startListReload()
+		return m.openOwnerDetail(item.OwnerKind, item.OwnerName, item.Namespace, via, previousSession)
 	default:
 		return m, nil
 	}
@@ -1973,34 +1989,70 @@ func (m model) openNodeDetail(node string, via string, previousSession protocol.
 	}, true)
 }
 
-func (m model) navigatePodOwner(via string) (tea.Model, tea.Cmd) {
-	ownerKind, ownerName, ok := parsePodOwner(m.podView.Overview.Owner)
-	if !ok {
-		m.commandMessage = "owner is not available for this pod"
-		return m, nil
-	}
-
+func (m model) openOwnerDetail(
+	ownerKind string,
+	ownerName string,
+	ownerNamespace string,
+	via string,
+	previousSession protocol.SessionState,
+) (tea.Model, tea.Cmd) {
+	ownerKind = strings.TrimSpace(ownerKind)
+	ownerName = strings.TrimSpace(ownerName)
 	resource, selection, ok := ownerNavigation(ownerKind, ownerName)
 	if !ok {
-		m.commandMessage = fmt.Sprintf("owner %s/%s is not navigable yet", ownerKind, ownerName)
+		display := ownerName
+		if ownerKind != "" {
+			display = ownerKind + "/" + ownerName
+		}
+		m.commandMessage = fmt.Sprintf("owner %s is not navigable yet", display)
 		return m, nil
 	}
 
-	previousSession := m.session
-	if resourceUsesNamespace(resource) {
-		namespace := strings.TrimSpace(m.podView.Namespace)
+	itemNamespace := ""
+	if namespaced, knownScope := knownResourceNamespaceScope(resource); namespaced && knownScope {
+		namespace := strings.TrimSpace(ownerNamespace)
 		if namespace != "" && namespace != "-" && !strings.EqualFold(namespace, "<cluster>") {
 			m.session.Namespace = namespace
+			itemNamespace = namespace
+		} else {
+			currentNamespace := strings.TrimSpace(m.session.Namespace)
+			if currentNamespace != "" && !strings.EqualFold(currentNamespace, "all") {
+				itemNamespace = currentNamespace
+			}
+		}
+	} else if !knownScope {
+		// Unknown resources may be cluster-scoped; avoid forcing session namespace.
+		namespace := strings.TrimSpace(ownerNamespace)
+		if namespace != "" && namespace != "-" && !strings.EqualFold(namespace, "<cluster>") && !strings.EqualFold(namespace, "all") {
+			itemNamespace = namespace
 		}
 	}
+
 	m.session.Resource = resource
 	m.session.Selection = selection
 	m.pushNavigationHistory(previousSession)
 	m.clearPodView()
 	m.clearDetail()
 	m.clearFlashingItems()
-	m.commandMessage = fmt.Sprintf("opened owner %s/%s via %s", ownerKind, selection, via)
-	return m.startListReload()
+	m.commandMessage = fmt.Sprintf("opening owner %s/%s via %s...", defaultDash(ownerKind), selection, via)
+	return m.startDetailReloadWithQuery(protocol.ResourceDetailQuery{
+		KubeContext:   m.session.KubeContext,
+		Resource:      m.session.Resource,
+		Namespace:     effectiveNamespace(m.session.Resource, m.session.Namespace),
+		Filter:        m.session.Filter,
+		ItemNamespace: itemNamespace,
+		Name:          selection,
+		SimulateStale: m.simulateStale,
+	}, true)
+}
+
+func (m model) navigatePodOwner(via string) (tea.Model, tea.Cmd) {
+	ownerKind, ownerName, ok := parsePodOwner(m.podView.Overview.Owner)
+	if !ok {
+		m.commandMessage = "owner is not available for this pod"
+		return m, nil
+	}
+	return m.openOwnerDetail(ownerKind, ownerName, m.podView.Namespace, via, m.session)
 }
 
 func (m model) selectOwnedResourceFromDetail(via string) (tea.Model, tea.Cmd) {
@@ -2099,6 +2151,9 @@ func parsePodOwner(value string) (kind string, name string, ok bool) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return "", "", false
+	}
+	if head, _, hasComma := strings.Cut(value, ","); hasComma {
+		value = strings.TrimSpace(head)
 	}
 	kind, name, hasSlash := strings.Cut(value, "/")
 	if !hasSlash {
@@ -2641,13 +2696,16 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m.startEditWithInvocation(editInvocation, "command")
 		}
-		if actionQuery, isAction, actionErr := m.actionQueryFromCommand(commandText); isAction {
+		if actionQuery, bulkTargets, isAction, actionErr := m.actionQueryFromCommand(commandText); isAction {
 			if actionErr != nil {
 				m.enterCommandMode()
 				m.input.SetValue(commandText)
 				m.commandMessage = actionErr.Error()
 				m.suggestions = m.commandSuggestions(m.input.Value())
 				return m, nil
+			}
+			if len(bulkTargets) > 1 {
+				return m.startBulkAction(bulkTargets)
 			}
 			return m.startAction(actionQuery)
 		}
@@ -4000,78 +4058,189 @@ func (m model) editInvocationFromCommand(input string) (editInvocation, bool, er
 	return invocation, true, nil
 }
 
-func (m model) actionQueryFromCommand(input string) (protocol.ActionQuery, bool, error) {
+func (m model) actionQueryFromCommand(input string) (query protocol.ActionQuery, bulk []protocol.ActionQuery, handled bool, err error) {
 	fields := strings.Fields(input)
 	if len(fields) == 0 {
-		return protocol.ActionQuery{}, false, nil
+		return protocol.ActionQuery{}, nil, false, nil
 	}
 
 	command := strings.ToLower(strings.TrimSpace(fields[0]))
+	resource := strings.TrimSpace(m.session.Resource)
+	if activeResource, _, _, ok := m.activeActionTarget(); ok && strings.TrimSpace(activeResource) != "" {
+		resource = activeResource
+	}
 	switch command {
 	case "scale":
 		if len(fields) < 2 {
-			return protocol.ActionQuery{}, true, fmt.Errorf("scale requires replicas: try `:scale 3`")
+			return protocol.ActionQuery{}, nil, true, fmt.Errorf("scale requires replicas: try `:scale 3`")
 		}
 		replicasValue, err := strconv.Atoi(strings.TrimSpace(fields[1]))
 		if err != nil {
-			return protocol.ActionQuery{}, true, fmt.Errorf("invalid replicas %q", fields[1])
+			return protocol.ActionQuery{}, nil, true, fmt.Errorf("invalid replicas %q", fields[1])
 		}
 		if replicasValue < 0 {
-			return protocol.ActionQuery{}, true, fmt.Errorf("replicas must be >= 0")
+			return protocol.ActionQuery{}, nil, true, fmt.Errorf("replicas must be >= 0")
 		}
-		name, itemNamespace, targetErr := m.actionTargetFromFields(fields[2:])
+		targetArgs := fields[2:]
+		explicitTarget := len(targetArgs) > 0
+		name, itemNamespace, targetErr := m.actionTargetFromFields(targetArgs)
 		if targetErr != nil {
-			return protocol.ActionQuery{}, true, targetErr
+			return protocol.ActionQuery{}, nil, true, targetErr
 		}
 		replicas := int32(replicasValue)
-		return protocol.ActionQuery{
+		query = protocol.ActionQuery{
 			Action:        protocol.ActionScale,
 			KubeContext:   m.session.KubeContext,
-			Resource:      m.session.Resource,
+			Resource:      resource,
 			Namespace:     m.session.Namespace,
 			Filter:        m.session.Filter,
 			ItemNamespace: itemNamespace,
 			Name:          name,
 			Replicas:      &replicas,
-		}, true, nil
-	case "restart":
-		name, itemNamespace, err := m.actionTargetFromFields(fields[1:])
-		if err != nil {
-			return protocol.ActionQuery{}, true, err
 		}
-		return protocol.ActionQuery{
+		if !explicitTarget {
+			if targets := m.multiActionTargetsForList(query); len(targets) > 1 {
+				return query, targets, true, nil
+			}
+		}
+		return query, nil, true, nil
+	case "restart":
+		targetArgs := fields[1:]
+		explicitTarget := len(targetArgs) > 0
+		name, itemNamespace, err := m.actionTargetFromFields(targetArgs)
+		if err != nil {
+			return protocol.ActionQuery{}, nil, true, err
+		}
+		query = protocol.ActionQuery{
 			Action:        protocol.ActionRolloutRestart,
 			KubeContext:   m.session.KubeContext,
-			Resource:      m.session.Resource,
+			Resource:      resource,
 			Namespace:     m.session.Namespace,
 			Filter:        m.session.Filter,
 			ItemNamespace: itemNamespace,
 			Name:          name,
-		}, true, nil
+		}
+		if !explicitTarget {
+			if targets := m.multiActionTargetsForList(query); len(targets) > 1 {
+				return query, targets, true, nil
+			}
+		}
+		return query, nil, true, nil
 	case "rollout":
 		if len(fields) < 2 || !strings.EqualFold(strings.TrimSpace(fields[1]), "restart") {
-			return protocol.ActionQuery{}, true, fmt.Errorf("rollout requires subcommand: try `:rollout restart`")
+			return protocol.ActionQuery{}, nil, true, fmt.Errorf("rollout requires subcommand: try `:rollout restart`")
 		}
-		name, itemNamespace, err := m.actionTargetFromFields(fields[2:])
+		targetArgs := fields[2:]
+		explicitTarget := len(targetArgs) > 0
+		name, itemNamespace, err := m.actionTargetFromFields(targetArgs)
 		if err != nil {
-			return protocol.ActionQuery{}, true, err
+			return protocol.ActionQuery{}, nil, true, err
 		}
-		return protocol.ActionQuery{
+		query = protocol.ActionQuery{
 			Action:        protocol.ActionRolloutRestart,
 			KubeContext:   m.session.KubeContext,
-			Resource:      m.session.Resource,
+			Resource:      resource,
 			Namespace:     m.session.Namespace,
 			Filter:        m.session.Filter,
 			ItemNamespace: itemNamespace,
 			Name:          name,
-		}, true, nil
+		}
+		if !explicitTarget {
+			if targets := m.multiActionTargetsForList(query); len(targets) > 1 {
+				return query, targets, true, nil
+			}
+		}
+		return query, nil, true, nil
+	case "label":
+		if len(fields) < 2 {
+			return protocol.ActionQuery{}, nil, true, fmt.Errorf("label requires assignment: try `:label key=value`")
+		}
+		key, value, parseErr := parseMetadataAssignment(fields[1], "label")
+		if parseErr != nil {
+			return protocol.ActionQuery{}, nil, true, parseErr
+		}
+		targetArgs := fields[2:]
+		explicitTarget := len(targetArgs) > 0
+		name, itemNamespace, targetErr := m.actionTargetFromFields(targetArgs)
+		if targetErr != nil {
+			return protocol.ActionQuery{}, nil, true, targetErr
+		}
+		query = protocol.ActionQuery{
+			Action:        protocol.ActionLabel,
+			KubeContext:   m.session.KubeContext,
+			Resource:      resource,
+			Namespace:     m.session.Namespace,
+			Filter:        m.session.Filter,
+			ItemNamespace: itemNamespace,
+			Name:          name,
+			Labels: map[string]string{
+				key: value,
+			},
+		}
+		if !explicitTarget {
+			if targets := m.multiActionTargetsForList(query); len(targets) > 1 {
+				return query, targets, true, nil
+			}
+		}
+		return query, nil, true, nil
+	case "annotate":
+		if len(fields) < 2 {
+			return protocol.ActionQuery{}, nil, true, fmt.Errorf("annotate requires assignment: try `:annotate key=value`")
+		}
+		key, value, parseErr := parseMetadataAssignment(fields[1], "annotation")
+		if parseErr != nil {
+			return protocol.ActionQuery{}, nil, true, parseErr
+		}
+		targetArgs := fields[2:]
+		explicitTarget := len(targetArgs) > 0
+		name, itemNamespace, targetErr := m.actionTargetFromFields(targetArgs)
+		if targetErr != nil {
+			return protocol.ActionQuery{}, nil, true, targetErr
+		}
+		query = protocol.ActionQuery{
+			Action:        protocol.ActionAnnotate,
+			KubeContext:   m.session.KubeContext,
+			Resource:      resource,
+			Namespace:     m.session.Namespace,
+			Filter:        m.session.Filter,
+			ItemNamespace: itemNamespace,
+			Name:          name,
+			Annotations: map[string]string{
+				key: value,
+			},
+		}
+		if !explicitTarget {
+			if targets := m.multiActionTargetsForList(query); len(targets) > 1 {
+				return query, targets, true, nil
+			}
+		}
+		return query, nil, true, nil
 	default:
-		return protocol.ActionQuery{}, false, nil
+		return protocol.ActionQuery{}, nil, false, nil
 	}
+}
+
+func parseMetadataAssignment(value string, target string) (key string, assigned string, err error) {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return "", "", fmt.Errorf("%s assignment is required", target)
+	}
+	key, assigned, ok := strings.Cut(raw, "=")
+	if !ok {
+		return "", "", fmt.Errorf("invalid %s assignment %q: expected key=value", target, value)
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", "", fmt.Errorf("%s key is required", target)
+	}
+	return key, strings.TrimSpace(assigned), nil
 }
 
 func (m model) actionTargetFromFields(args []string) (name string, itemNamespace string, err error) {
 	itemNamespace = ""
+	if len(args) > 1 {
+		return "", "", fmt.Errorf("action accepts at most one target")
+	}
 	if len(args) >= 1 {
 		target := strings.TrimSpace(args[0])
 		if target == "" {
@@ -4161,24 +4330,64 @@ func deleteTargetLabel(query protocol.ActionQuery) string {
 	return name
 }
 
-func cloneDeleteTargetsWithForce(targets []protocol.ActionQuery, force bool) []protocol.ActionQuery {
+func cloneMetadataAssignments(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for rawKey, rawValue := range values {
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			continue
+		}
+		cloned[key] = strings.TrimSpace(rawValue)
+	}
+	if len(cloned) == 0 {
+		return nil
+	}
+	return cloned
+}
+
+func cloneInt32Pointer(value *int32) *int32 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneBulkActionTargets(targets []protocol.ActionQuery) []protocol.ActionQuery {
 	if len(targets) == 0 {
 		return nil
 	}
 	cloned := make([]protocol.ActionQuery, 0, len(targets))
 	for _, target := range targets {
-		target.Action = protocol.ActionDelete
+		target.Action = strings.TrimSpace(strings.ToLower(target.Action))
+		if target.Action == "" {
+			continue
+		}
 		target.Resource = normalizeResourceInput(target.Resource)
 		if target.Resource == "" {
 			target.Resource = "pods"
 		}
 		target.Name = strings.TrimSpace(target.Name)
 		target.ItemNamespace = sanitizeActionNamespace(target.ItemNamespace)
-		target.Force = force
+		target.Replicas = cloneInt32Pointer(target.Replicas)
+		target.Labels = cloneMetadataAssignments(target.Labels)
+		target.Annotations = cloneMetadataAssignments(target.Annotations)
 		if target.Name == "" {
 			continue
 		}
 		cloned = append(cloned, target)
+	}
+	return cloned
+}
+
+func cloneDeleteTargetsWithForce(targets []protocol.ActionQuery, force bool) []protocol.ActionQuery {
+	cloned := cloneBulkActionTargets(targets)
+	for i := range cloned {
+		cloned[i].Action = protocol.ActionDelete
+		cloned[i].Force = force
 	}
 	return cloned
 }
@@ -4224,6 +4433,50 @@ func summarizeBulkDeleteFailures(failures []string) string {
 	return fmt.Sprintf("%s; %s; +%d more", failures[0], failures[1], len(failures)-2)
 }
 
+func bulkActionName(action string) string {
+	switch strings.TrimSpace(strings.ToLower(action)) {
+	case protocol.ActionDelete:
+		return "delete"
+	case protocol.ActionScale:
+		return "scale"
+	case protocol.ActionRolloutRestart:
+		return "restart"
+	case protocol.ActionLabel:
+		return "label"
+	case protocol.ActionAnnotate:
+		return "annotate"
+	default:
+		return "action"
+	}
+}
+
+func bulkActionPast(action string) string {
+	switch strings.TrimSpace(strings.ToLower(action)) {
+	case protocol.ActionDelete:
+		return "deleted"
+	case protocol.ActionScale:
+		return "scaled"
+	case protocol.ActionRolloutRestart:
+		return "restarted"
+	case protocol.ActionLabel:
+		return "labeled"
+	case protocol.ActionAnnotate:
+		return "annotated"
+	default:
+		return "processed"
+	}
+}
+
+func bulkActionSummarySuffix(query protocol.ActionQuery) string {
+	switch strings.TrimSpace(strings.ToLower(query.Action)) {
+	case protocol.ActionScale:
+		if query.Replicas != nil {
+			return fmt.Sprintf(" to %d", *query.Replicas)
+		}
+	}
+	return ""
+}
+
 func (m model) startDeleteConfirmationForActive(force bool, via string) (tea.Model, tea.Cmd) {
 	if targets := m.multiDeleteTargetsForList(force); len(targets) > 1 {
 		return m.startDeleteConfirmationForTargets(targets, via)
@@ -4247,17 +4500,44 @@ func (m model) startDeleteConfirmationForActive(force bool, via string) (tea.Mod
 	return m.startDeleteConfirmation(query, via)
 }
 
-func (m model) multiDeleteTargetsForList(force bool) []protocol.ActionQuery {
+func (m model) multiActionTargetsForList(base protocol.ActionQuery) []protocol.ActionQuery {
 	if m.podViewOpen || m.resourceViewOpen {
 		return nil
 	}
 	if len(m.multiSelectedItems) <= 1 {
 		return nil
 	}
-	resource := normalizeResourceInput(m.session.Resource)
-	if resource == "" {
-		resource = "pods"
+
+	base.Action = strings.TrimSpace(strings.ToLower(base.Action))
+	if base.Action == "" {
+		return nil
 	}
+	base.Resource = normalizeResourceInput(base.Resource)
+	if base.Resource == "" {
+		base.Resource = normalizeResourceInput(m.session.Resource)
+	}
+	if base.Resource == "" {
+		base.Resource = "pods"
+	}
+	base.KubeContext = strings.TrimSpace(base.KubeContext)
+	if base.KubeContext == "" {
+		base.KubeContext = strings.TrimSpace(m.session.KubeContext)
+	}
+	base.Namespace = strings.TrimSpace(base.Namespace)
+	if base.Namespace == "" {
+		base.Namespace = strings.TrimSpace(m.session.Namespace)
+	}
+	if base.Namespace == "" {
+		base.Namespace = "default"
+	}
+	base.Filter = strings.TrimSpace(base.Filter)
+	if base.Filter == "" {
+		base.Filter = strings.TrimSpace(m.session.Filter)
+	}
+	base.Replicas = cloneInt32Pointer(base.Replicas)
+	base.Labels = cloneMetadataAssignments(base.Labels)
+	base.Annotations = cloneMetadataAssignments(base.Annotations)
+
 	targets := make([]protocol.ActionQuery, 0, len(m.multiSelectedItems))
 	for _, item := range m.resourceList.Items {
 		if _, ok := m.multiSelectedItems[resourceItemKey(item)]; !ok {
@@ -4267,18 +4547,26 @@ func (m model) multiDeleteTargetsForList(force bool) []protocol.ActionQuery {
 		if name == "" {
 			continue
 		}
-		targets = append(targets, protocol.ActionQuery{
-			Action:        protocol.ActionDelete,
-			KubeContext:   m.session.KubeContext,
-			Resource:      resource,
-			Namespace:     m.session.Namespace,
-			Filter:        m.session.Filter,
-			ItemNamespace: sanitizeActionNamespace(item.Namespace),
-			Name:          name,
-			Force:         force,
-		})
+		target := base
+		target.Name = name
+		target.ItemNamespace = sanitizeActionNamespace(item.Namespace)
+		target.Replicas = cloneInt32Pointer(base.Replicas)
+		target.Labels = cloneMetadataAssignments(base.Labels)
+		target.Annotations = cloneMetadataAssignments(base.Annotations)
+		targets = append(targets, target)
 	}
 	return targets
+}
+
+func (m model) multiDeleteTargetsForList(force bool) []protocol.ActionQuery {
+	return m.multiActionTargetsForList(protocol.ActionQuery{
+		Action:      protocol.ActionDelete,
+		KubeContext: m.session.KubeContext,
+		Resource:    m.session.Resource,
+		Namespace:   m.session.Namespace,
+		Filter:      m.session.Filter,
+		Force:       force,
+	})
 }
 
 func (m model) startDeleteConfirmationForTargets(targets []protocol.ActionQuery, via string) (tea.Model, tea.Cmd) {
@@ -4549,8 +4837,9 @@ func (m model) startDetailReloadWithQuery(query protocol.ResourceDetailQuery, an
 	sameResource := strings.EqualFold(strings.TrimSpace(m.detail.Resource), strings.TrimSpace(query.Resource)) &&
 		strings.EqualFold(strings.TrimSpace(m.detail.Name), strings.TrimSpace(query.Name)) &&
 		strings.EqualFold(detailItemNamespace(m.detail), normalizeItemNamespace(query.ItemNamespace))
-	showLoading := announce || !sameResource || !m.detail.Found
-	if !sameResource {
+	showLoading := announce || !m.detail.Found
+	if announce && !sameResource {
+		showLoading = true
 		m.resourceViewTab = 0
 		m.resourceScroll = 0
 		m.resourceChildIndex = 0
@@ -4627,13 +4916,22 @@ func (m model) startBulkDeleteAction(targets []protocol.ActionQuery, force bool)
 		m.commandMessage = "no delete targets selected"
 		return m, nil
 	}
+	return m.startBulkAction(targets)
+}
+
+func (m model) startBulkAction(targets []protocol.ActionQuery) (tea.Model, tea.Cmd) {
+	targets = cloneBulkActionTargets(targets)
+	if len(targets) == 0 {
+		m.commandMessage = "no action targets selected"
+		return m, nil
+	}
 	m.actionRequestSeq++
 	m.actionActiveSeq = m.actionRequestSeq
 	m.actionLoading = true
-	m.commandMessage = fmt.Sprintf("delete %d targets...", len(targets))
+	m.commandMessage = fmt.Sprintf("%s %d targets...", bulkActionName(targets[0].Action), len(targets))
 	ctx, cancel := context.WithCancel(context.Background())
 	m.setActionCancel(cancel)
-	return m, m.loadBulkDeleteCmd(ctx, cancel, m.actionActiveSeq, targets)
+	return m, m.loadBulkActionCmd(ctx, cancel, m.actionActiveSeq, targets)
 }
 
 func (m model) startLogs(query protocol.LogsQuery) (tea.Model, tea.Cmd) {
@@ -4792,7 +5090,7 @@ func (m model) loadActionCmd(
 	}
 }
 
-func (m model) loadBulkDeleteCmd(
+func (m model) loadBulkActionCmd(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	seq int,
@@ -4811,9 +5109,11 @@ func (m model) loadBulkDeleteCmd(
 		if cancel != nil {
 			defer cancel()
 		}
-		result := bulkDeleteLoadedMsg{
-			seq:   seq,
-			total: len(targets),
+		result := bulkActionLoadedMsg{
+			seq:    seq,
+			total:  len(targets),
+			action: targets[0].Action,
+			sample: targets[0],
 		}
 		for _, query := range targets {
 			if err := ctx.Err(); err != nil {
@@ -5515,7 +5815,9 @@ func (m model) detailOverviewLines(width int) []string {
 func (m model) detailOwnedLines(width int) []string {
 	lines := make([]string, 0, len(m.detail.Children)+4)
 	if len(m.detail.Children) == 0 {
-		lines = append(lines, m.renderDetailFieldLine("children", "owned resources: -"))
+		message, style := m.emptyDetailOwnedState()
+		line := m.renderDetailFieldLine("children", "owned resources: "+message)
+		lines = append(lines, style.Render(line))
 		return lines
 	}
 
@@ -5560,18 +5862,23 @@ func (m model) detailOwnedLines(width int) []string {
 	return lines
 }
 
+func (m model) emptyDetailOwnedState() (string, lipgloss.Style) {
+	if m.detail.ChildrenLoading || m.detail.Freshness.SnapshotTimeUnixMs <= 0 {
+		return "no items (loading)", m.styles.EmptyLoading
+	}
+	if m.detail.Freshness.State == protocol.FreshnessStateLive {
+		return "no items", m.styles.EmptyLive
+	}
+	return "no items (cached)", m.styles.EmptyCached
+}
+
 func (m model) detailNodePodsLines(width int) []string {
-	lines := make([]string, 0, len(m.detail.NodePods)+4)
+	lines := make([]string, 0, len(m.detail.NodePods)+3)
 	if len(m.detail.NodePods) == 0 {
 		lines = append(lines, m.renderDetailFieldLine("nodePods", "pods on node: -"))
 		return lines
 	}
 
-	contextLabel := defaultDash(strings.TrimSpace(m.detailKubeContext))
-	lines = append(
-		lines,
-		m.renderDetailFieldLine("nodePods", fmt.Sprintf("pods on node in %s (%d):", contextLabel, len(m.detail.NodePods))),
-	)
 	const (
 		podNamespaceWidth = 20
 		podStatusWidth    = 16
@@ -5670,10 +5977,9 @@ func (m model) detailNodePodsSelectionLine() (int, bool) {
 	if idx < 0 || idx >= len(m.detail.NodePods) {
 		return 0, false
 	}
-	// 0: "pods on node (n):"
-	// 1: table header
-	// 2..: rows
-	return 2 + idx, true
+	// 0: table header
+	// 1..: rows
+	return 1 + idx, true
 }
 
 func (m model) detailYAMLLines(_ int) []string {
@@ -6334,12 +6640,20 @@ func listColumnsForResource(resource string, contentWidth int) []listColumn {
 			{id: "node", title: "NODE", width: nodeWidth},
 			{id: "owner", title: "OWNER", width: 0},
 		}
+	case "nodes":
+		return []listColumn{
+			{id: "name", title: "NAME", width: 36},
+			{id: "namespace", title: "NAMESPACE", width: 18},
+			{id: "age", title: "AGE", width: 5},
+			{id: "status", title: "STATUS", width: 16},
+		}
 	default:
 		return []listColumn{
 			{id: "name", title: "NAME", width: 36},
 			{id: "namespace", title: "NAMESPACE", width: 18},
 			{id: "age", title: "AGE", width: 5},
-			{id: "status", title: "STATUS", width: 0},
+			{id: "status", title: "STATUS", width: 16},
+			{id: "owner", title: "OWNER", width: 0},
 		}
 	}
 }
@@ -6766,22 +7080,41 @@ func (m model) renderListItem(columns []listColumn, item protocol.ResourceItem) 
 	b.WriteString("  ")
 	for idx, column := range columns {
 		value := listValueForColumn(column.id, item)
+		valueStyle, hasValueStyle := m.listValueStyle(item, column.id)
+		navigable := m.isListValueNavigable(item, column.id)
 		if idx == len(columns)-1 || column.width <= 0 {
-			if m.isListValueNavigable(item, column.id) {
+			if navigable {
 				b.WriteString(m.styles.Clickable.Render(value))
+			} else if hasValueStyle {
+				b.WriteString(valueStyle.Render(value))
 			} else {
 				b.WriteString(value)
 			}
 			continue
 		}
-		if m.isListValueNavigable(item, column.id) {
+		if navigable {
 			b.WriteString(renderStyledValueSegment(value, column.width, m.styles.Clickable))
+		} else if hasValueStyle {
+			b.WriteString(renderStyledValueSegment(value, column.width, valueStyle))
 		} else {
 			b.WriteString(fixedWidthCell(value, column.width))
 		}
 		b.WriteByte(' ')
 	}
 	return b.String()
+}
+
+func (m model) listValueStyle(item protocol.ResourceItem, columnID string) (lipgloss.Style, bool) {
+	if columnID != "status" {
+		return lipgloss.Style{}, false
+	}
+	if podRowNotFullyReady(m.resourceList.Resource, item) {
+		return m.styles.PodNotReady, true
+	}
+	if rowSucceeded(item) {
+		return m.styles.RowSucceeded, true
+	}
+	return lipgloss.Style{}, false
 }
 
 func (m model) isListValueNavigable(item protocol.ResourceItem, columnID string) bool {
@@ -7207,6 +7540,9 @@ func (m model) legendHints() []string {
 			": cmd",
 			"q quit",
 		}
+		if m.canNavigateDetailOwner() {
+			hints = append(hints, "o owner")
+		}
 		if m.mouseCapture {
 			hints = append(hints, "click links")
 		}
@@ -7289,6 +7625,14 @@ func (m model) canNavigatePodOwner() bool {
 		return false
 	}
 	_, _, ok = ownerNavigation(ownerKind, ownerName)
+	return ok
+}
+
+func (m model) canNavigateDetailOwner() bool {
+	if !m.resourceViewOpen || m.resourceViewLoading || !m.detail.Found {
+		return false
+	}
+	_, _, _, ok := m.detailOwnerNavigationTarget()
 	return ok
 }
 
@@ -8230,6 +8574,11 @@ func (m model) commandSuggestions(input string) []string {
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "restart":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
+	case "label", "annotate":
+		if len(fields) <= 1 || (len(fields) == 2 && !hasTrailingSpace) {
+			return nil
+		}
+		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "rollout":
 		if len(fields) == 1 {
 			return prefixMatches([]string{"restart"}, valuePrefix)
@@ -8667,6 +9016,8 @@ func baseSuggestions() []string {
 		"logs",
 		"logfmt",
 		"logformat",
+		"label",
+		"annotate",
 		"restart",
 		"rollout",
 		"scale",
@@ -8713,11 +9064,21 @@ func displayNamespace(session protocol.SessionState) string {
 }
 
 func resourceUsesNamespace(resource string) bool {
+	namespaced, known := knownResourceNamespaceScope(resource)
+	if known {
+		return namespaced
+	}
+	return true
+}
+
+func knownResourceNamespaceScope(resource string) (namespaced bool, known bool) {
 	switch strings.ToLower(strings.TrimSpace(resource)) {
 	case "nodes", "namespaces", "crds":
-		return false
+		return false, true
+	case "pods", "services", "deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "cronjobs", "ingresses", "podtemplates", "crs":
+		return true, true
 	default:
-		return true
+		return false, false
 	}
 }
 
@@ -8733,9 +9094,10 @@ func effectiveNamespace(resource string, namespace string) string {
 }
 
 func ownerNavigation(ownerKind string, ownerName string) (resource string, selection string, ok bool) {
-	kind := strings.ToLower(strings.TrimSpace(ownerKind))
+	rawKind := strings.TrimSpace(ownerKind)
+	kind := strings.ToLower(rawKind)
 	name := strings.TrimSpace(ownerName)
-	if name == "" {
+	if kind == "" || name == "" {
 		return "", "", false
 	}
 	switch kind {
@@ -8753,10 +9115,13 @@ func ownerNavigation(ownerKind string, ownerName string) (resource string, selec
 		if deploymentName, ok := deploymentNameFromReplicaSet(name); ok {
 			return "deployments", deploymentName, true
 		}
-		return "", "", false
-	default:
-		return "", "", false
+		return "replicasets", name, true
 	}
+	if resolved, ok := canonicalResourceName(kind); ok {
+		return resolved, name, true
+	}
+	// Fallback to owner kind so discovered resources can resolve by Kind alias.
+	return normalizeResourceInput(rawKind), name, true
 }
 
 func deploymentNameFromReplicaSet(replicaSetName string) (string, bool) {
@@ -8968,7 +9333,7 @@ func commandSupportsArgument(token string) bool {
 		return true
 	}
 	switch token {
-	case "ctx", "context", "resource", "filter", "delete", "del", "rm", "edit", "logs", "logfmt", "logformat", "scale", "restart", "rollout", "sort", "order":
+	case "ctx", "context", "resource", "filter", "delete", "del", "rm", "edit", "logs", "logfmt", "logformat", "scale", "restart", "rollout", "label", "annotate", "sort", "order":
 		return true
 	default:
 		return false

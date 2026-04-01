@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -393,7 +394,11 @@ func executeAction(
 			Message: "action is required",
 		}
 	}
-	if query.Action != protocol.ActionDelete && query.Action != protocol.ActionScale && query.Action != protocol.ActionRolloutRestart {
+	if query.Action != protocol.ActionDelete &&
+		query.Action != protocol.ActionScale &&
+		query.Action != protocol.ActionRolloutRestart &&
+		query.Action != protocol.ActionLabel &&
+		query.Action != protocol.ActionAnnotate {
 		return protocol.ActionResult{
 			Success: false,
 			Code:    protocol.ActionCodeUnsupported,
@@ -447,6 +452,10 @@ func executeAction(
 		err = actionExecutor.Scale(ctx, query)
 	case protocol.ActionRolloutRestart:
 		err = actionExecutor.RolloutRestart(ctx, query)
+	case protocol.ActionLabel:
+		err = actionExecutor.Label(ctx, query)
+	case protocol.ActionAnnotate:
+		err = actionExecutor.Annotate(ctx, query)
 	default:
 		err = fmt.Errorf("%w: %s", kube.ErrUnsupportedActionResource, query.Action)
 	}
@@ -470,6 +479,20 @@ func executeAction(
 		successMessage = fmt.Sprintf("scaled %s %s to %d", query.Resource, target, replicas)
 	} else if query.Action == protocol.ActionRolloutRestart {
 		successMessage = fmt.Sprintf("rollout restart triggered for %s %s", query.Resource, target)
+	} else if query.Action == protocol.ActionLabel {
+		successMessage = fmt.Sprintf(
+			"labeled %s %s with %s",
+			query.Resource,
+			target,
+			formatMetadataAssignments(query.Labels),
+		)
+	} else if query.Action == protocol.ActionAnnotate {
+		successMessage = fmt.Sprintf(
+			"annotated %s %s with %s",
+			query.Resource,
+			target,
+			formatMetadataAssignments(query.Annotations),
+		)
 	}
 	return protocol.ActionResult{
 		Success: true,
@@ -538,7 +561,43 @@ func normalizeActionQuery(query protocol.ActionQuery) protocol.ActionQuery {
 	query.Filter = strings.TrimSpace(query.Filter)
 	query.ItemNamespace = strings.TrimSpace(query.ItemNamespace)
 	query.Name = strings.TrimSpace(query.Name)
+	query.Labels = normalizeMetadataMap(query.Labels)
+	query.Annotations = normalizeMetadataMap(query.Annotations)
 	return query
+}
+
+func normalizeMetadataMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	normalized := make(map[string]string, len(values))
+	for rawKey, rawValue := range values {
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			continue
+		}
+		normalized[key] = strings.TrimSpace(rawValue)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func formatMetadataAssignments(values map[string]string) string {
+	if len(values) == 0 {
+		return "-"
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%s", key, values[key]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func normalizeLogsQuery(query protocol.LogsQuery) protocol.LogsQuery {

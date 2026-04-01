@@ -8,6 +8,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/daulet/k11s/internal/protocol"
 )
@@ -189,6 +190,132 @@ func (e *ActionExecutor) RolloutRestart(ctx context.Context, query protocol.Acti
 	}
 }
 
+func (e *ActionExecutor) Label(ctx context.Context, query protocol.ActionQuery) error {
+	labels := normalizeMetadataPatch(query.Labels)
+	if len(labels) == 0 {
+		return fmt.Errorf("%w: at least one label assignment is required", ErrActionValidation)
+	}
+	return e.patchMetadata(ctx, query, labels, nil)
+}
+
+func (e *ActionExecutor) Annotate(ctx context.Context, query protocol.ActionQuery) error {
+	annotations := normalizeMetadataPatch(query.Annotations)
+	if len(annotations) == 0 {
+		return fmt.Errorf("%w: at least one annotation assignment is required", ErrActionValidation)
+	}
+	return e.patchMetadata(ctx, query, nil, annotations)
+}
+
+func (e *ActionExecutor) patchMetadata(
+	ctx context.Context,
+	query protocol.ActionQuery,
+	labels map[string]string,
+	annotations map[string]string,
+) error {
+	resource := normalizeResourceName(query.Resource)
+	name := strings.TrimSpace(query.Name)
+	if name == "" {
+		return fmt.Errorf("%w: item name is required", ErrActionValidation)
+	}
+	if len(labels) == 0 && len(annotations) == 0 {
+		return fmt.Errorf("%w: metadata patch is required", ErrActionValidation)
+	}
+
+	if resource == "crs" {
+		return e.patchCRMetadata(ctx, query, labels, annotations)
+	}
+
+	fetcher := NewResourceFetcher(e.clients)
+	target, err := fetcher.resolveDiscoveredResource(ctx, query.KubeContext, resource)
+	if err != nil {
+		return err
+	}
+	dyn, err := e.clients.DynamicForContext(query.KubeContext)
+	if err != nil {
+		return err
+	}
+	handle := dyn.Resource(target.GVR)
+
+	if target.Namespaced {
+		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
+		if err != nil {
+			return err
+		}
+		obj, err := handle.Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		applyMetadataPatchToObject(obj, labels, annotations)
+		_, err = handle.Namespace(ns).Update(ctx, obj, metav1.UpdateOptions{})
+		return err
+	}
+
+	obj, err := handle.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	applyMetadataPatchToObject(obj, labels, annotations)
+	_, err = handle.Update(ctx, obj, metav1.UpdateOptions{})
+	return err
+}
+
+func (e *ActionExecutor) patchCRMetadata(
+	ctx context.Context,
+	query protocol.ActionQuery,
+	labels map[string]string,
+	annotations map[string]string,
+) error {
+	if strings.TrimSpace(query.Filter) == "" {
+		return fmt.Errorf("%w: crd filter is required for cr metadata patch", ErrActionValidation)
+	}
+
+	fetcher := NewResourceFetcher(e.clients)
+	selected, ok, err := fetcher.resolveSelectedCRD(
+		ctx,
+		protocol.ResourceListQuery{
+			KubeContext: query.KubeContext,
+			Resource:    "crs",
+			Namespace:   query.Namespace,
+			Filter:      query.Filter,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: unable to resolve crd filter %q", ErrActionValidation, query.Filter)
+	}
+
+	dyn, err := e.clients.DynamicForContext(query.KubeContext)
+	if err != nil {
+		return err
+	}
+	resource := dyn.Resource(selected.GVR)
+	name := strings.TrimSpace(query.Name)
+
+	if selected.Namespaced {
+		ns, err := resolveActionNamespace(query.Namespace, query.ItemNamespace)
+		if err != nil {
+			return err
+		}
+		obj, err := resource.Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		applyMetadataPatchToObject(obj, labels, annotations)
+		_, err = resource.Namespace(ns).Update(ctx, obj, metav1.UpdateOptions{})
+		return err
+	}
+
+	obj, err := resource.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	applyMetadataPatchToObject(obj, labels, annotations)
+	_, err = resource.Update(ctx, obj, metav1.UpdateOptions{})
+	return err
+}
+
 func (e *ActionExecutor) deleteCR(ctx context.Context, query protocol.ActionQuery, deleteOptions metav1.DeleteOptions) error {
 	if strings.TrimSpace(query.Filter) == "" {
 		return fmt.Errorf("%w: crd filter is required for cr delete", ErrActionValidation)
@@ -226,6 +353,54 @@ func (e *ActionExecutor) deleteCR(ctx context.Context, query protocol.ActionQuer
 		return resource.Namespace(ns).Delete(ctx, name, deleteOptions)
 	}
 	return resource.Delete(ctx, name, deleteOptions)
+}
+
+func normalizeMetadataPatch(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	normalized := make(map[string]string, len(values))
+	for rawKey, rawValue := range values {
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			continue
+		}
+		normalized[key] = strings.TrimSpace(rawValue)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func applyMetadataPatchToObject(
+	obj *unstructured.Unstructured,
+	labels map[string]string,
+	annotations map[string]string,
+) {
+	if obj == nil {
+		return
+	}
+	if len(labels) > 0 {
+		next := obj.GetLabels()
+		if next == nil {
+			next = map[string]string{}
+		}
+		for key, value := range labels {
+			next[key] = value
+		}
+		obj.SetLabels(next)
+	}
+	if len(annotations) > 0 {
+		next := obj.GetAnnotations()
+		if next == nil {
+			next = map[string]string{}
+		}
+		for key, value := range annotations {
+			next[key] = value
+		}
+		obj.SetAnnotations(next)
+	}
 }
 
 func deleteOptionsForAction(force bool) metav1.DeleteOptions {

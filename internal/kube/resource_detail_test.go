@@ -1,11 +1,15 @@
 package kube
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/daulet/k11s/internal/protocol"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func TestBuildDetailYAMLOmitsStatusAndManagedFields(t *testing.T) {
@@ -106,6 +110,84 @@ func TestBuildDetailOverviewFieldsIncludesCoreMetadataAndScalars(t *testing.T) {
 	}
 }
 
+func TestBuildDetailOverviewFieldsIncludesOwnerFieldsFromOwnerReferences(t *testing.T) {
+	now := time.Date(2026, time.March, 20, 12, 0, 0, 0, time.UTC)
+	obj := unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "apps/v1",
+			"kind":       "ReplicaSet",
+			"metadata": map[string]any{
+				"name":      "api-6c9d4f6d56",
+				"namespace": "default",
+				"ownerReferences": []any{
+					map[string]any{"kind": "ReplicaSet", "name": "api-6c9d4f6d56"},
+					map[string]any{"kind": "Deployment", "name": "api", "controller": true},
+				},
+			},
+		},
+	}
+
+	fields := buildDetailOverviewFields(obj, now)
+	assertField := func(key string) string {
+		t.Helper()
+		for _, field := range fields {
+			if field.Key == key {
+				return field.Value
+			}
+		}
+		t.Fatalf("missing field %q in %#v", key, fields)
+		return ""
+	}
+
+	if got := assertField("owner"); got != "Deployment/api" {
+		t.Fatalf("expected owner field Deployment/api, got %q", got)
+	}
+	if got := assertField("owners"); got != "Deployment/api, ReplicaSet/api-6c9d4f6d56" {
+		t.Fatalf("expected owners field with both refs, got %q", got)
+	}
+}
+
+func TestFetchOwnedChildrenUsesScopeIndexForAbsentOwnerWithoutSchedulingLoad(t *testing.T) {
+	now := time.Date(2026, time.April, 1, 8, 0, 0, 0, time.UTC)
+	fetcher := NewResourceFetcher(nil)
+	fetcher.now = func() time.Time { return now }
+
+	enricher := NewResourceDetailEnricher(nil, fetcher)
+	enricher.now = func() time.Time { return now }
+	loadKey := ownedChildrenLoadKey{
+		kubeContext:      "ctx",
+		parentResource:   "widgets",
+		parentNamespace:  "default",
+		parentNamespaced: true,
+	}
+	enricher.ownedChildIndex[loadKey] = ownedChildrenIndexEntry{
+		childrenByOwner: map[string][]protocol.DetailChild{
+			"owner-a": {
+				{Resource: "pods", Namespace: "default", Name: "pod-a"},
+			},
+		},
+		fetchedAt: now,
+	}
+
+	children, loading := enricher.fetchOwnedChildren(
+		context.Background(),
+		"ctx",
+		"widgets",
+		true,
+		"default",
+		types.UID("owner-b"),
+	)
+	if loading {
+		t.Fatalf("expected no async load when scope index is fresh for absent owner")
+	}
+	if len(children) != 0 {
+		t.Fatalf("expected no children for absent owner from index, got %#v", children)
+	}
+	if len(enricher.ownedChildrenLoad) != 0 {
+		t.Fatalf("expected no in-flight loads, got %#v", enricher.ownedChildrenLoad)
+	}
+}
+
 func TestOwnedChildResources(t *testing.T) {
 	tests := []struct {
 		parent string
@@ -127,6 +209,55 @@ func TestOwnedChildResources(t *testing.T) {
 			if got[i] != tc.want[i] {
 				t.Fatalf("parent=%s expected %v, got %v", tc.parent, tc.want, got)
 			}
+		}
+	}
+}
+
+func TestOwnedChildTargetsForNamespacedParentSkipsClusterResourcesAndPrioritizesCommonKinds(t *testing.T) {
+	now := time.Date(2026, time.March, 30, 12, 0, 0, 0, time.UTC)
+	fetcher := NewResourceFetcher(nil)
+	fetcher.now = func() time.Time { return now }
+	fetcher.discovery["ctx"] = discoverySnapshot{
+		lookup: map[string]discoveredResource{
+			"pods": {
+				GVR: schema.GroupVersionResource{
+					Group:    "",
+					Version:  "v1",
+					Resource: "pods",
+				},
+				Namespaced: true,
+			},
+			"nodes": {
+				GVR: schema.GroupVersionResource{
+					Group:    "",
+					Version:  "v1",
+					Resource: "nodes",
+				},
+				Namespaced: false,
+			},
+			"widgets.example.com": {
+				GVR: schema.GroupVersionResource{
+					Group:    "example.com",
+					Version:  "v1",
+					Resource: "widgets",
+				},
+				Namespaced: true,
+			},
+		},
+		fetchedAt: now,
+	}
+	enricher := NewResourceDetailEnricher(nil, fetcher)
+
+	targets := enricher.ownedChildTargets(context.Background(), "ctx", "widgets", true)
+	if len(targets) != 2 {
+		t.Fatalf("expected two namespaced targets, got %d: %#v", len(targets), targets)
+	}
+	if got := targets[0].GVR.Resource; got != "pods" {
+		t.Fatalf("expected pods target first for generic scan, got %q", got)
+	}
+	for _, target := range targets {
+		if !target.Namespaced {
+			t.Fatalf("expected cluster-scoped targets to be excluded for namespaced parent, got %#v", target)
 		}
 	}
 }
