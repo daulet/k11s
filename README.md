@@ -12,6 +12,7 @@ Primary goals:
 ## Docs
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Organization Review And Follow-up Plan](docs/ORGANIZATION_REVIEW.md)
 - [Performance Budgets](docs/PERF_BUDGETS.md)
 - [RPC Contract](docs/RPC.md)
 - [Failure And Degraded Mode Policy](docs/FAILURE_POLICY.md)
