@@ -4781,7 +4781,7 @@ func TestFooterLegendShowsLogsShortcutsInPodLogsTab(t *testing.T) {
 	}
 
 	footer := m.renderFooter(180)
-	for _, expected := range []string{"pgup/dn page", "1..4 tail", "u raw/unjson"} {
+	for _, expected := range []string{"pgup/dn page", "1..4 tail", "u raw/unjson", "w wrap"} {
 		if !strings.Contains(footer, expected) {
 			t.Fatalf("expected logs footer legend to contain %q, got %q", expected, footer)
 		}
@@ -6871,6 +6871,85 @@ func TestPodLogsLinesDistinguishLoadingVsNoLogs(t *testing.T) {
 	}
 }
 
+func TestPodLogsLinesDoNotWrapByDefault(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "mc1-lab1",
+			Namespace:   "inference-engine",
+			Resource:    "pods",
+		},
+	})
+	m.podViewOpen = true
+	m.podViewTab = 1 // overview + logs
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "mc1-lab1",
+		Namespace:   "inference-engine",
+		Name:        "cyborg-conductor",
+		Found:       true,
+	}
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "inference-engine",
+		ItemNamespace: "inference-engine",
+		Name:          "cyborg-conductor",
+		Lines:         []string{"1234567890abcdefghij"},
+	}
+
+	lines := m.podLogsLines(8)
+	if len(lines) != 1 || lines[0] != "1234567890abcdefghij" {
+		t.Fatalf("expected unwrapped log line by default, got %#v", lines)
+	}
+}
+
+func TestPodLogsWrapShortcutTogglesWrapping(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "mc1-lab1",
+			Namespace:   "inference-engine",
+			Resource:    "pods",
+		},
+	})
+	m.podViewOpen = true
+	m.podViewTab = 1 // overview + logs
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "mc1-lab1",
+		Namespace:   "inference-engine",
+		Name:        "cyborg-conductor",
+		Found:       true,
+	}
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "inference-engine",
+		ItemNamespace: "inference-engine",
+		Name:          "cyborg-conductor",
+		Lines:         []string{"1234567890abcdefghij"},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	withWrap := updated.(model)
+	if !withWrap.logsWrap {
+		t.Fatalf("expected logs wrap enabled after w")
+	}
+	if !strings.Contains(withWrap.commandMessage, "logs wrap: on") {
+		t.Fatalf("expected logs wrap on message, got %q", withWrap.commandMessage)
+	}
+	if got := strings.Join(withWrap.podLogsLines(8), "|"); got != "12345678|90abcdef|ghij" {
+		t.Fatalf("expected wrapped log segments, got %q", got)
+	}
+
+	updated, _ = withWrap.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	withoutWrap := updated.(model)
+	if withoutWrap.logsWrap {
+		t.Fatalf("expected logs wrap disabled after second w")
+	}
+	if !strings.Contains(withoutWrap.commandMessage, "logs wrap: off") {
+		t.Fatalf("expected logs wrap off message, got %q", withoutWrap.commandMessage)
+	}
+	if len(withoutWrap.podLogsLines(8)) != 1 || withoutWrap.podLogsLines(8)[0] != "1234567890abcdefghij" {
+		t.Fatalf("expected unwrapped log line after disabling wrap, got %#v", withoutWrap.podLogsLines(8))
+	}
+}
+
 func TestPodLogsLinesPreserveANSIAndSpacing(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -6910,6 +6989,48 @@ func TestPodLogsLinesPreserveANSIAndSpacing(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "  |  /\\_/\\") {
 		t.Fatalf("expected rendered pane to retain spacing/ascii section, got %q", rendered)
+	}
+}
+
+func TestPodLogsWrappedLinesPreserveANSISequences(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "mc1-lab1",
+			Namespace:   "inference-engine",
+			Resource:    "pods",
+		},
+	})
+	m.podViewOpen = true
+	m.podViewTab = 1 // overview + logs
+	m.podView = protocol.PodViewPayload{
+		KubeContext: "mc1-lab1",
+		Namespace:   "inference-engine",
+		Name:        "cyborg-conductor",
+		Found:       true,
+	}
+	m.logsWrap = true
+	raw := "\x1b[36mcyborg-container  |  /\\_/\\ 12345\x1b[0m"
+	m.logs = protocol.LogsPayload{
+		Resource:      "pods",
+		Namespace:     "inference-engine",
+		ItemNamespace: "inference-engine",
+		Name:          "cyborg-conductor",
+		Lines:         []string{raw},
+	}
+
+	lines := m.podLogsLines(10)
+	if len(lines) < 2 {
+		t.Fatalf("expected wrapped ANSI log line, got %#v", lines)
+	}
+	if !strings.Contains(lines[0], "\x1b[36m") {
+		t.Fatalf("expected first wrapped line to keep ANSI start sequence, got %q", lines[0])
+	}
+	if !strings.Contains(lines[len(lines)-1], "\x1b[0m") {
+		t.Fatalf("expected last wrapped line to keep ANSI reset sequence, got %q", lines[len(lines)-1])
+	}
+	joined := strings.Join(lines, "")
+	if !strings.Contains(joined, "cyborg-container") || !strings.Contains(joined, "  |  /\\_/\\ 12345") {
+		t.Fatalf("expected wrapped lines to preserve log text, got %q", joined)
 	}
 }
 

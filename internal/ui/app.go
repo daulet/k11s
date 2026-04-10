@@ -597,6 +597,7 @@ type model struct {
 	logsFollow             bool
 	logsFollowQuery        protocol.LogsQuery
 	logsTailLines          int64
+	logsWrap               bool
 	logsOutputFormat       logsOutputFormat
 	logsOutputErrorShown   bool
 	logsPollEvery          time.Duration
@@ -1228,6 +1229,10 @@ func (m model) updatePodViewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.isPodLogsTabActive() {
 		if tailLines, ok := logsTailPresetForShortcut(msg.String()); ok {
 			return m.applyPodLogsTailPreset(tailLines, "shortcut")
+		}
+		if msg.String() == "w" {
+			m.toggleLogsWrap()
+			return m, nil
 		}
 		if msg.String() == "u" {
 			m.toggleLogsOutputFormat()
@@ -3659,6 +3664,19 @@ func (m *model) toggleLogsOutputFormat() {
 	}
 	m.logsOutputErrorShown = false
 	m.commandMessage = fmt.Sprintf("logs format: %s", m.logsOutputFormat)
+}
+
+func (m *model) toggleLogsWrap() {
+	wasAtBottom := m.isPodLogsTabActive() && m.isPodContentAtBottom()
+	m.logsWrap = !m.logsWrap
+	if wasAtBottom {
+		m.scrollPodToBottom()
+	}
+	if m.logsWrap {
+		m.commandMessage = "logs wrap: on"
+		return
+	}
+	m.commandMessage = "logs wrap: off"
 }
 
 func (m *model) applyLogsOutputFormatCommand(args []string) (updated bool, message string, reload bool, err error) {
@@ -6346,39 +6364,39 @@ func (m model) podLogsLines(width int) []string {
 		if len(containers) > 1 {
 			line += fmt.Sprintf(" (%d/%d, use [ and ] to switch)", idx+1, len(containers))
 		}
-		lines = append(lines, line)
+		lines = m.appendPodLogDisplayLines(lines, line, width)
 	}
 
 	if strings.TrimSpace(payload.Name) == "" && len(payload.Lines) == 0 {
 		if m.logsLoading && m.logsFollow {
-			lines = append(lines, "starting log tail...")
+			lines = m.appendPodLogDisplayLines(lines, "starting log tail...", width)
 			return lines
 		}
 		if m.logsLoading {
-			lines = append(lines, "loading logs...")
+			lines = m.appendPodLogDisplayLines(lines, "loading logs...", width)
 			return lines
 		}
-		lines = append(lines, "logs unavailable")
+		lines = m.appendPodLogDisplayLines(lines, "logs unavailable", width)
 		return lines
 	}
 	if len(payload.Lines) == 0 {
 		if m.logsFollow {
-			lines = append(lines, "no logs yet for this container (following)")
+			lines = m.appendPodLogDisplayLines(lines, "no logs yet for this container (following)", width)
 			return lines
 		}
 		if m.logsLoading {
-			lines = append(lines, "loading logs...")
+			lines = m.appendPodLogDisplayLines(lines, "loading logs...", width)
 			return lines
 		}
-		lines = append(lines, "no logs for this container")
+		lines = m.appendPodLogDisplayLines(lines, "no logs for this container", width)
 		return lines
 	}
 
-	// Keep raw log lines intact so ANSI colors and spacing/ascii formatting survive.
-	// Width clipping is handled later by fitDisplayWidth during pane rendering.
-	lines = append(lines, payload.Lines...)
+	for _, line := range payload.Lines {
+		lines = m.appendPodLogDisplayLines(lines, line, width)
+	}
 	if payload.Truncated {
-		lines = append(lines, "... output truncated")
+		lines = m.appendPodLogDisplayLines(lines, "... output truncated", width)
 	}
 	return lines
 }
@@ -6540,6 +6558,31 @@ func (m model) highlightDetailSearchMatches(lines []string) []string {
 func appendWrappedLines(lines []string, value string, width int) []string {
 	wrapped := wrapText(value, width)
 	return append(lines, wrapped...)
+}
+
+func (m model) appendPodLogDisplayLines(lines []string, value string, width int) []string {
+	if !m.logsWrap {
+		return append(lines, value)
+	}
+	return appendDisplayWrappedLines(lines, value, width)
+}
+
+func appendDisplayWrappedLines(lines []string, value string, width int) []string {
+	return append(lines, wrapDisplayText(value, width)...)
+}
+
+func wrapDisplayText(value string, width int) []string {
+	if width <= 0 {
+		width = 1
+	}
+
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\t", " ")
+	if value == "" {
+		return []string{""}
+	}
+
+	return strings.Split(ansi.Hardwrap(value, width, true), "\n")
 }
 
 func defaultDash(value string) string {
@@ -7506,7 +7549,7 @@ func (m model) legendHints() []string {
 			hints = append(hints, "[/ ] container")
 		}
 		if m.isPodLogsTabActive() {
-			hints = append(hints, "1..4 tail", "u raw/unjson")
+			hints = append(hints, "1..4 tail", "u raw/unjson", "w wrap")
 		}
 		if m.canNavigatePodNode() {
 			hints = append(hints, "v node")
