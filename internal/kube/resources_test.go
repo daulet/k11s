@@ -341,6 +341,87 @@ func TestNodesToItems(t *testing.T) {
 	}
 }
 
+func TestUsageMetricFromPodMetricsObjectSumsContainers(t *testing.T) {
+	usage, ok := usageMetricFromPodMetricsObject(map[string]any{
+		"containers": []any{
+			map[string]any{
+				"usage": map[string]any{
+					"cpu":    "125m",
+					"memory": "64Mi",
+				},
+			},
+			map[string]any{
+				"usage": map[string]any{
+					"cpu":    "250m",
+					"memory": "128Mi",
+				},
+			},
+		},
+	})
+	if !ok {
+		t.Fatalf("expected pod usage metrics to parse")
+	}
+	if usage.cpuMilli != 375 || usage.cpu != "375m" {
+		t.Fatalf("expected summed cpu usage 375m, got %#v", usage)
+	}
+	const wantMemoryBytes = 192 * 1024 * 1024
+	if usage.memoryBytes != wantMemoryBytes || usage.memory != "192Mi" {
+		t.Fatalf("expected summed memory usage 192Mi, got %#v", usage)
+	}
+}
+
+func TestUsageMetricFromNodeMetricsObjectParsesNodeUsage(t *testing.T) {
+	usage, ok := usageMetricFromNodeMetricsObject(map[string]any{
+		"usage": map[string]any{
+			"cpu":    "2",
+			"memory": "8Gi",
+		},
+	})
+	if !ok {
+		t.Fatalf("expected node usage metrics to parse")
+	}
+	const wantMemoryBytes = 8 * 1024 * 1024 * 1024
+	if usage.cpuMilli != 2000 || usage.cpu != "2" {
+		t.Fatalf("expected cpu usage 2 cores, got %#v", usage)
+	}
+	if usage.memoryBytes != wantMemoryBytes || usage.memory != "8Gi" {
+		t.Fatalf("expected memory usage 8Gi, got %#v", usage)
+	}
+}
+
+func TestFormatUsageMetricMemoryUsesCompactBinaryUnits(t *testing.T) {
+	bytes, ok := parseUsageMetricBytes("5176452Ki")
+	if !ok {
+		t.Fatalf("expected 5176452Ki to parse")
+	}
+	if got := formatUsageMetricMemory(bytes); got != "4.9Gi" {
+		t.Fatalf("expected 5176452Ki to format as 4.9Gi, got %q", got)
+	}
+}
+
+func TestWithPodUsageMetricsAppliesMetricsToMatchingItems(t *testing.T) {
+	items := []protocol.ResourceItem{
+		{Name: "api", Namespace: "payments"},
+		{Name: "worker", Namespace: "payments"},
+	}
+
+	withMetrics := withPodUsageMetrics(items, map[string]usageMetric{
+		"payments/api": {
+			cpuMilli:    375,
+			memoryBytes: 192 * 1024 * 1024,
+			cpu:         "375m",
+			memory:      "192Mi",
+		},
+	})
+
+	if withMetrics[0].CPU != "375m" || withMetrics[0].Memory != "192Mi" {
+		t.Fatalf("expected matching pod metrics on first row, got %#v", withMetrics[0])
+	}
+	if withMetrics[1].CPU != "" || withMetrics[1].Memory != "" {
+		t.Fatalf("expected non-matching pod row to remain empty, got %#v", withMetrics[1])
+	}
+}
+
 func TestNamespacesToItems(t *testing.T) {
 	items := namespacesToItems([]corev1.Namespace{
 		{

@@ -12,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	resourceapi "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -21,6 +22,18 @@ import (
 )
 
 const discoveryRefreshInterval = 30 * time.Second
+
+var (
+	podMetricsGVR  = schema.GroupVersionResource{Group: "metrics.k8s.io", Version: "v1beta1", Resource: "pods"}
+	nodeMetricsGVR = schema.GroupVersionResource{Group: "metrics.k8s.io", Version: "v1beta1", Resource: "nodes"}
+)
+
+type usageMetric struct {
+	cpuMilli    int64
+	memoryBytes int64
+	cpu         string
+	memory      string
+}
 
 type discoveredResource struct {
 	GVR        schema.GroupVersionResource
@@ -559,7 +572,262 @@ func listDiscoveredItemsWithVersion(
 	if err != nil {
 		return nil, "", err
 	}
-	return unstructuredToItemsForResource(list.Items, target.GVR.Resource), list.GetResourceVersion(), nil
+	items := unstructuredToItemsForResource(list.Items, target.GVR.Resource)
+	items = enrichDiscoveredItemsWithMetrics(ctx, client, target, namespace, items)
+	return items, list.GetResourceVersion(), nil
+}
+
+func enrichDiscoveredItemsWithMetrics(
+	ctx context.Context,
+	client dynamic.Interface,
+	target discoveredResource,
+	namespace string,
+	items []protocol.ResourceItem,
+) []protocol.ResourceItem {
+	if len(items) == 0 {
+		return items
+	}
+
+	switch strings.ToLower(strings.TrimSpace(target.GVR.Resource)) {
+	case "pods":
+		metrics, err := listPodUsageMetrics(ctx, client, namespace)
+		if err != nil {
+			return items
+		}
+		return withPodUsageMetrics(items, metrics)
+	case "nodes":
+		metrics, err := listNodeUsageMetrics(ctx, client)
+		if err != nil {
+			return items
+		}
+		return withNodeUsageMetrics(items, metrics)
+	default:
+		return items
+	}
+}
+
+func listPodUsageMetrics(
+	ctx context.Context,
+	client dynamic.Interface,
+	namespace string,
+) (map[string]usageMetric, error) {
+	apiNamespace, _ := resolveListNamespace(namespace)
+	list, err := client.Resource(podMetricsGVR).Namespace(apiNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return podUsageMetricsByKey(list.Items, apiNamespace), nil
+}
+
+func listNodeUsageMetrics(
+	ctx context.Context,
+	client dynamic.Interface,
+) (map[string]usageMetric, error) {
+	list, err := client.Resource(nodeMetricsGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return nodeUsageMetricsByName(list.Items), nil
+}
+
+func podUsageMetricsByKey(values []unstructured.Unstructured, fallbackNamespace string) map[string]usageMetric {
+	metrics := make(map[string]usageMetric, len(values))
+	for _, value := range values {
+		name := strings.TrimSpace(value.GetName())
+		if name == "" {
+			continue
+		}
+
+		namespace := strings.TrimSpace(value.GetNamespace())
+		if namespace == "" && fallbackNamespace != "" && fallbackNamespace != metav1.NamespaceAll {
+			namespace = fallbackNamespace
+		}
+
+		usage, ok := usageMetricFromPodMetricsObject(value.Object)
+		if !ok {
+			continue
+		}
+		metrics[namespacedUsageKey(namespace, name)] = usage
+	}
+	return metrics
+}
+
+func nodeUsageMetricsByName(values []unstructured.Unstructured) map[string]usageMetric {
+	metrics := make(map[string]usageMetric, len(values))
+	for _, value := range values {
+		name := strings.TrimSpace(value.GetName())
+		if name == "" {
+			continue
+		}
+		usage, ok := usageMetricFromNodeMetricsObject(value.Object)
+		if !ok {
+			continue
+		}
+		metrics[name] = usage
+	}
+	return metrics
+}
+
+func usageMetricFromPodMetricsObject(object map[string]any) (usageMetric, bool) {
+	containers, ok, _ := unstructured.NestedSlice(object, "containers")
+	if !ok || len(containers) == 0 {
+		return usageMetric{}, false
+	}
+
+	var usage usageMetric
+	found := false
+	for _, raw := range containers {
+		container, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		values, ok, _ := unstructured.NestedStringMap(container, "usage")
+		if !ok {
+			continue
+		}
+		if cpuMilli, ok := parseUsageMetricMilli(values["cpu"]); ok {
+			usage.cpuMilli += cpuMilli
+			found = true
+		}
+		if memoryBytes, ok := parseUsageMetricBytes(values["memory"]); ok {
+			usage.memoryBytes += memoryBytes
+			found = true
+		}
+	}
+	if !found {
+		return usageMetric{}, false
+	}
+	usage.cpu = formatUsageMetricCPU(usage.cpuMilli)
+	usage.memory = formatUsageMetricMemory(usage.memoryBytes)
+	return usage, true
+}
+
+func usageMetricFromNodeMetricsObject(object map[string]any) (usageMetric, bool) {
+	values, ok, _ := unstructured.NestedStringMap(object, "usage")
+	if !ok {
+		return usageMetric{}, false
+	}
+
+	var usage usageMetric
+	found := false
+	if cpuMilli, ok := parseUsageMetricMilli(values["cpu"]); ok {
+		usage.cpuMilli = cpuMilli
+		found = true
+	}
+	if memoryBytes, ok := parseUsageMetricBytes(values["memory"]); ok {
+		usage.memoryBytes = memoryBytes
+		found = true
+	}
+	if !found {
+		return usageMetric{}, false
+	}
+	usage.cpu = formatUsageMetricCPU(usage.cpuMilli)
+	usage.memory = formatUsageMetricMemory(usage.memoryBytes)
+	return usage, true
+}
+
+func parseUsageMetricMilli(value string) (int64, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	quantity, err := resourceapi.ParseQuantity(value)
+	if err != nil {
+		return 0, false
+	}
+	return quantity.MilliValue(), true
+}
+
+func parseUsageMetricBytes(value string) (int64, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	quantity, err := resourceapi.ParseQuantity(value)
+	if err != nil {
+		return 0, false
+	}
+	return quantity.Value(), true
+}
+
+func formatUsageMetricCPU(value int64) string {
+	return resourceapi.NewMilliQuantity(value, resourceapi.DecimalSI).String()
+}
+
+func formatUsageMetricMemory(value int64) string {
+	const (
+		kib = int64(1024)
+		mib = 1024 * kib
+		gib = 1024 * mib
+		tib = 1024 * gib
+	)
+
+	switch {
+	case value >= tib:
+		return formatBinaryUsageValue(float64(value)/float64(tib), "Ti")
+	case value >= gib:
+		return formatBinaryUsageValue(float64(value)/float64(gib), "Gi")
+	case value >= mib:
+		return formatBinaryUsageValue(float64(value)/float64(mib), "Mi")
+	case value >= kib:
+		return formatBinaryUsageValue(float64(value)/float64(kib), "Ki")
+	case value > 0:
+		return fmt.Sprintf("%dB", value)
+	default:
+		return "0B"
+	}
+}
+
+func formatBinaryUsageValue(value float64, suffix string) string {
+	precision := 1
+	if value >= 10 {
+		precision = 0
+	}
+	formatted := fmt.Sprintf("%.*f", precision, value)
+	formatted = strings.TrimSuffix(formatted, ".0")
+	return formatted + suffix
+}
+
+func withPodUsageMetrics(items []protocol.ResourceItem, metrics map[string]usageMetric) []protocol.ResourceItem {
+	if len(metrics) == 0 {
+		return items
+	}
+	for idx := range items {
+		usage, ok := metrics[namespacedUsageKey(items[idx].Namespace, items[idx].Name)]
+		if !ok {
+			continue
+		}
+		applyUsageMetric(&items[idx], usage)
+	}
+	return items
+}
+
+func withNodeUsageMetrics(items []protocol.ResourceItem, metrics map[string]usageMetric) []protocol.ResourceItem {
+	if len(metrics) == 0 {
+		return items
+	}
+	for idx := range items {
+		usage, ok := metrics[strings.TrimSpace(items[idx].Name)]
+		if !ok {
+			continue
+		}
+		applyUsageMetric(&items[idx], usage)
+	}
+	return items
+}
+
+func applyUsageMetric(item *protocol.ResourceItem, usage usageMetric) {
+	if item == nil {
+		return
+	}
+	item.CPU = usage.cpu
+	item.Memory = usage.memory
+	item.CPUMilli = usage.cpuMilli
+	item.MemoryBytes = usage.memoryBytes
+}
+
+func namespacedUsageKey(namespace string, name string) string {
+	return strings.TrimSpace(namespace) + "/" + strings.TrimSpace(name)
 }
 
 func watchCRList(

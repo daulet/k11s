@@ -2405,6 +2405,73 @@ func TestNodeListColumnHeadersExcludeOwner(t *testing.T) {
 	if strings.Contains(lines[0], "OWNER") {
 		t.Fatalf("expected nodes list header to exclude owner column, got %q", lines[0])
 	}
+	if !strings.Contains(lines[0], "CPU") || !strings.Contains(lines[0], "MEM") {
+		t.Fatalf("expected nodes list header to include usage columns, got %q", lines[0])
+	}
+}
+
+func TestPodListShowsUsageColumns(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{
+					Name:        "api",
+					Namespace:   "default",
+					Ready:       "1/1",
+					Status:      "Running",
+					Age:         "3m",
+					CPU:         "250m",
+					Memory:      "128Mi",
+					CPUMilli:    250,
+					MemoryBytes: 128 * 1024 * 1024,
+					Node:        "node-a",
+				},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+
+	lines := m.listLines()
+	if len(lines) < 2 {
+		t.Fatalf("expected at least header and one row, got %#v", lines)
+	}
+	if !strings.Contains(lines[0], "CPU") || !strings.Contains(lines[0], "MEM") {
+		t.Fatalf("expected pod list header to include usage columns, got %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "250m") || !strings.Contains(lines[1], "128Mi") {
+		t.Fatalf("expected pod list row to include usage values, got %q", lines[1])
+	}
+}
+
+func TestCompareResourceItemsByUsageColumnsUsesNumericValues(t *testing.T) {
+	left := protocol.ResourceItem{
+		Name:        "api",
+		CPU:         "900m",
+		Memory:      "1Gi",
+		CPUMilli:    900,
+		MemoryBytes: 1024 * 1024 * 1024,
+	}
+	right := protocol.ResourceItem{
+		Name:        "worker",
+		CPU:         "2",
+		Memory:      "512Mi",
+		CPUMilli:    2000,
+		MemoryBytes: 512 * 1024 * 1024,
+	}
+
+	if got := compareResourceItemsByColumn(left, right, "cpu"); got >= 0 {
+		t.Fatalf("expected 900m to sort before 2 cores, got %d", got)
+	}
+	if got := compareResourceItemsByColumn(left, right, "memory"); got <= 0 {
+		t.Fatalf("expected 1Gi to sort after 512Mi, got %d", got)
+	}
 }
 
 func TestPodRowNotFullyReady(t *testing.T) {
@@ -4737,7 +4804,7 @@ func TestFooterLegendShowsContextualHintsWithoutMoveJump(t *testing.T) {
 		},
 	})
 
-	footer := m.renderFooter(180)
+	footer := m.renderFooter(240)
 	if strings.Contains(footer, "move") || strings.Contains(footer, "jump") {
 		t.Fatalf("expected footer legend to omit trivial navigation hints, got %q", footer)
 	}
@@ -4746,7 +4813,7 @@ func TestFooterLegendShowsContextualHintsWithoutMoveJump(t *testing.T) {
 			t.Fatalf("expected footer legend to contain %q, got %q", expected, footer)
 		}
 	}
-	for _, expected := range []string{"1 name", "2 ns", "3 ready", "4 status", "5 age", "6 node", "7 owner", "r asc"} {
+	for _, expected := range []string{"1 name", "2 ns", "3 ready", "4 status", "5 age", "6 cpu", "7 mem", "8 node", "9 owner", "r asc"} {
 		if !strings.Contains(footer, expected) {
 			t.Fatalf("expected footer legend to contain sort hint %q, got %q", expected, footer)
 		}

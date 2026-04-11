@@ -1852,6 +1852,14 @@ func (m model) detailOverviewNavigationTargetAtLine(width int, line int) (detail
 			// ready:
 			cursor++
 		}
+		if strings.TrimSpace(m.detail.Item.CPU) != "" {
+			// cpu:
+			cursor++
+		}
+		if strings.TrimSpace(m.detail.Item.Memory) != "" {
+			// memory:
+			cursor++
+		}
 	}
 
 	for _, field := range m.detail.Overview {
@@ -3426,6 +3434,8 @@ func resourceItemSame(left protocol.ResourceItem, right protocol.ResourceItem) b
 	return left.Name == right.Name &&
 		left.Namespace == right.Namespace &&
 		left.Status == right.Status &&
+		left.CPU == right.CPU &&
+		left.Memory == right.Memory &&
 		left.Node == right.Node &&
 		left.OwnerKind == right.OwnerKind &&
 		left.OwnerName == right.OwnerName
@@ -5810,6 +5820,12 @@ func (m model) detailOverviewLines(width int) []string {
 		if strings.TrimSpace(m.detail.Item.Ready) != "" {
 			lines = append(lines, m.renderDetailFieldLine("ready", "ready: "+defaultDash(m.detail.Item.Ready)))
 		}
+		if strings.TrimSpace(m.detail.Item.CPU) != "" {
+			lines = append(lines, m.renderDetailFieldLine("cpu", "cpu: "+m.detail.Item.CPU))
+		}
+		if strings.TrimSpace(m.detail.Item.Memory) != "" {
+			lines = append(lines, m.renderDetailFieldLine("memory", "memory: "+m.detail.Item.Memory))
+		}
 	}
 	for _, field := range m.detail.Overview {
 		key := strings.TrimSpace(field.Key)
@@ -6673,22 +6689,27 @@ func (m model) listContentWidth() int {
 func listColumnsForResource(resource string, contentWidth int) []listColumn {
 	switch strings.ToLower(strings.TrimSpace(resource)) {
 	case "pods":
-		nameWidth, namespaceWidth, readyWidth, statusWidth, ageWidth, nodeWidth := podListColumnWidths(contentWidth)
+		nameWidth, namespaceWidth, readyWidth, statusWidth, ageWidth, cpuWidth, memoryWidth, nodeWidth := podListColumnWidths(contentWidth)
 		return []listColumn{
 			{id: "name", title: "NAME", width: nameWidth},
 			{id: "namespace", title: "NAMESPACE", width: namespaceWidth},
 			{id: "ready", title: "READY", width: readyWidth},
 			{id: "status", title: "STATUS", width: statusWidth},
 			{id: "age", title: "AGE", width: ageWidth},
+			{id: "cpu", title: "CPU", width: cpuWidth},
+			{id: "memory", title: "MEM", width: memoryWidth},
 			{id: "node", title: "NODE", width: nodeWidth},
 			{id: "owner", title: "OWNER", width: 0},
 		}
 	case "nodes":
+		nameWidth, namespaceWidth, ageWidth, statusWidth, cpuWidth, memoryWidth := nodeListColumnWidths(contentWidth)
 		return []listColumn{
-			{id: "name", title: "NAME", width: 36},
-			{id: "namespace", title: "NAMESPACE", width: 18},
-			{id: "age", title: "AGE", width: 5},
-			{id: "status", title: "STATUS", width: 16},
+			{id: "name", title: "NAME", width: nameWidth},
+			{id: "namespace", title: "NAMESPACE", width: namespaceWidth},
+			{id: "age", title: "AGE", width: ageWidth},
+			{id: "status", title: "STATUS", width: statusWidth},
+			{id: "cpu", title: "CPU", width: cpuWidth},
+			{id: "memory", title: "MEM", width: memoryWidth},
 		}
 	default:
 		return []listColumn{
@@ -6701,24 +6722,28 @@ func listColumnsForResource(resource string, contentWidth int) []listColumn {
 	}
 }
 
-func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, status int, age int, node int) {
+func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, status int, age int, cpu int, memory int, node int) {
 	const (
-		nameMin      = 20
-		namespaceMin = 14
+		nameMin      = 18
+		namespaceMin = 12
 		readyMin     = 5
-		statusMin    = 10
+		statusMin    = 8
 		ageMin       = 5
-		nodeMin      = 12
+		cpuMin       = 5
+		memoryMin    = 6
+		nodeMin      = 10
 
-		nameMax      = 36
-		namespaceMax = 26
+		nameMax      = 30
+		namespaceMax = 22
 		readyMax     = 7
 		statusMax    = 12
 		ageMax       = 5
-		nodeMax      = 24
+		cpuMax       = 7
+		memoryMax    = 9
+		nodeMax      = 20
 
 		ownerMinVisible = 12
-		fixedPadding    = 8 // indent + separators before the trailing owner column
+		fixedPadding    = 10 // indent + separators before the trailing owner column
 	)
 
 	name = nameMin
@@ -6726,10 +6751,12 @@ func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, 
 	ready = readyMin
 	status = statusMin
 	age = ageMin
+	cpu = cpuMin
+	memory = memoryMin
 	node = nodeMin
 
-	minSum := nameMin + namespaceMin + readyMin + statusMin + ageMin + nodeMin
-	maxSum := nameMax + namespaceMax + readyMax + statusMax + ageMax + nodeMax
+	minSum := nameMin + namespaceMin + readyMin + statusMin + ageMin + cpuMin + memoryMin + nodeMin
+	maxSum := nameMax + namespaceMax + readyMax + statusMax + ageMax + cpuMax + memoryMax + nodeMax
 	target := contentWidth - ownerMinVisible - fixedPadding
 	if target < minSum {
 		target = minSum
@@ -6757,6 +6784,14 @@ func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, 
 				break
 			}
 		}
+		if memory < memoryMax {
+			memory++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
 		if node < nodeMax {
 			node++
 			remaining--
@@ -6775,6 +6810,14 @@ func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, 
 		}
 		if namespace < namespaceMax {
 			namespace++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if cpu < cpuMax {
+			cpu++
 			remaining--
 			progressed = true
 			if remaining == 0 {
@@ -6810,7 +6853,94 @@ func podListColumnWidths(contentWidth int) (name int, namespace int, ready int, 
 		}
 	}
 
-	return name, namespace, ready, status, age, node
+	return name, namespace, ready, status, age, cpu, memory, node
+}
+
+func nodeListColumnWidths(contentWidth int) (name int, namespace int, age int, status int, cpu int, memory int) {
+	const (
+		nameMin      = 24
+		namespaceMin = 10
+		ageMin       = 5
+		statusMin    = 10
+		cpuMin       = 5
+		memoryMin    = 6
+
+		nameMax      = 36
+		namespaceMax = 18
+		ageMax       = 5
+		statusMax    = 16
+		cpuMax       = 7
+		memoryMax    = 9
+
+		fixedPadding = 7 // indent + separators for fixed-width columns
+	)
+
+	name = nameMin
+	namespace = namespaceMin
+	age = ageMin
+	status = statusMin
+	cpu = cpuMin
+	memory = memoryMin
+
+	minSum := nameMin + namespaceMin + ageMin + statusMin + cpuMin + memoryMin
+	maxSum := nameMax + namespaceMax + ageMax + statusMax + cpuMax + memoryMax
+	target := contentWidth - fixedPadding
+	if target < minSum {
+		target = minSum
+	}
+	if target > maxSum {
+		target = maxSum
+	}
+
+	remaining := target - minSum
+	for remaining > 0 {
+		progressed := false
+		if name < nameMax {
+			name++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if status < statusMax {
+			status++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if namespace < namespaceMax {
+			namespace++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if memory < memoryMax {
+			memory++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if cpu < cpuMax {
+			cpu++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+
+	return name, namespace, age, status, cpu, memory
 }
 
 func normalizeSortColumnToken(value string) (string, bool) {
@@ -6825,6 +6955,10 @@ func normalizeSortColumnToken(value string) (string, bool) {
 		return "status", true
 	case "age":
 		return "age", true
+	case "cpu":
+		return "cpu", true
+	case "mem", "memory":
+		return "memory", true
 	case "node":
 		return "node", true
 	case "owner":
@@ -6846,6 +6980,8 @@ func sortColumnLegendName(column string) string {
 	switch sortColumnDisplayName(column) {
 	case "namespace":
 		return "ns"
+	case "memory":
+		return "mem"
 	default:
 		return sortColumnDisplayName(column)
 	}
@@ -7004,6 +7140,30 @@ func compareResourceItemsByColumn(left protocol.ResourceItem, right protocol.Res
 		}
 	case "ready":
 		return compareReadyValues(left.Ready, right.Ready)
+	case "cpu":
+		leftOK := strings.TrimSpace(left.CPU) != ""
+		rightOK := strings.TrimSpace(right.CPU) != ""
+		if leftOK && rightOK {
+			return compareInt64s(left.CPUMilli, right.CPUMilli)
+		}
+		if leftOK && !rightOK {
+			return -1
+		}
+		if !leftOK && rightOK {
+			return 1
+		}
+	case "memory":
+		leftOK := strings.TrimSpace(left.Memory) != ""
+		rightOK := strings.TrimSpace(right.Memory) != ""
+		if leftOK && rightOK {
+			return compareInt64s(left.MemoryBytes, right.MemoryBytes)
+		}
+		if leftOK && !rightOK {
+			return -1
+		}
+		if !leftOK && rightOK {
+			return 1
+		}
 	}
 	leftValue := strings.ToLower(strings.TrimSpace(listValueForColumn(column, left)))
 	rightValue := strings.ToLower(strings.TrimSpace(listValueForColumn(column, right)))
@@ -7209,6 +7369,10 @@ func listValueForColumn(columnID string, item protocol.ResourceItem) string {
 		return item.Status
 	case "age":
 		return defaultDash(item.Age)
+	case "cpu":
+		return defaultDash(item.CPU)
+	case "memory":
+		return defaultDash(item.Memory)
 	case "ready":
 		value := strings.TrimSpace(item.Ready)
 		if value == "" {
@@ -8255,6 +8419,12 @@ func (m *model) updateResourceFlashing(previous protocol.ResourceDetailPayload, 
 		if strings.TrimSpace(prevItem.Ready) != strings.TrimSpace(nextItem.Ready) {
 			mark("ready")
 		}
+		if strings.TrimSpace(prevItem.CPU) != strings.TrimSpace(nextItem.CPU) {
+			mark("cpu")
+		}
+		if strings.TrimSpace(prevItem.Memory) != strings.TrimSpace(nextItem.Memory) {
+			mark("memory")
+		}
 	}
 
 	prevOverview := detailOverviewMap(previous.Overview)
@@ -9266,6 +9436,8 @@ func itemMatchesSearch(item protocol.ResourceItem, query string) bool {
 	return strings.Contains(strings.ToLower(item.Name), query) ||
 		strings.Contains(strings.ToLower(item.Namespace), query) ||
 		strings.Contains(strings.ToLower(item.Age), query) ||
+		strings.Contains(strings.ToLower(item.CPU), query) ||
+		strings.Contains(strings.ToLower(item.Memory), query) ||
 		strings.Contains(strings.ToLower(item.Status), query)
 }
 
