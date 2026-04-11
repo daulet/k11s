@@ -82,18 +82,22 @@ type ResourceListQuery struct {
 }
 
 type ResourceItem struct {
-	Name        string `json:"name"`
-	Namespace   string `json:"namespace"`
-	Ready       string `json:"ready,omitempty"`
-	Status      string `json:"status"`
-	Age         string `json:"age,omitempty"`
-	CPU         string `json:"cpu,omitempty"`
-	Memory      string `json:"memory,omitempty"`
-	CPUMilli    int64  `json:"cpuMilli,omitempty"`
-	MemoryBytes int64  `json:"memoryBytes,omitempty"`
-	Node        string `json:"node,omitempty"`
-	OwnerKind   string `json:"ownerKind,omitempty"`
-	OwnerName   string `json:"ownerName,omitempty"`
+	Name                   string `json:"name"`
+	Namespace              string `json:"namespace"`
+	Ready                  string `json:"ready,omitempty"`
+	Status                 string `json:"status"`
+	Age                    string `json:"age,omitempty"`
+	CPU                    string `json:"cpu,omitempty"`
+	Memory                 string `json:"memory,omitempty"`
+	CPUMilli               int64  `json:"cpuMilli,omitempty"`
+	MemoryBytes            int64  `json:"memoryBytes,omitempty"`
+	CPUAllocatable         string `json:"cpuAllocatable,omitempty"`
+	MemoryAllocatable      string `json:"memoryAllocatable,omitempty"`
+	CPUAllocatableMilli    int64  `json:"cpuAllocatableMilli,omitempty"`
+	MemoryAllocatableBytes int64  `json:"memoryAllocatableBytes,omitempty"`
+	Node                   string `json:"node,omitempty"`
+	OwnerKind              string `json:"ownerKind,omitempty"`
+	OwnerName              string `json:"ownerName,omitempty"`
 }
 
 type ResourceListPayload struct {

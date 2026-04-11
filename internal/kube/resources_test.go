@@ -245,6 +245,44 @@ func TestUnstructuredToItemsForPodsIncludesReadyNodeAndOwner(t *testing.T) {
 	}
 }
 
+func TestUnstructuredToItemsForNodesIncludesStatusAndAllocatable(t *testing.T) {
+	items := unstructuredToItemsForResource([]unstructured.Unstructured{
+		{
+			Object: map[string]any{
+				"kind": "Node",
+				"metadata": map[string]any{
+					"name": "node-a",
+				},
+				"spec": map[string]any{
+					"unschedulable": true,
+				},
+				"status": map[string]any{
+					"allocatable": map[string]any{
+						"cpu":    "16",
+						"memory": "64Gi",
+					},
+					"conditions": []any{
+						map[string]any{
+							"type":   "Ready",
+							"status": "True",
+						},
+					},
+				},
+			},
+		},
+	}, "nodes")
+
+	if len(items) != 1 {
+		t.Fatalf("expected one node item, got %d", len(items))
+	}
+	if items[0].Namespace != "<cluster>" || items[0].Status != "Ready (cordoned)" {
+		t.Fatalf("expected cluster-scoped ready cordoned node, got %#v", items[0])
+	}
+	if items[0].CPUAllocatable != "16" || items[0].MemoryAllocatable != "64Gi" {
+		t.Fatalf("expected allocatable totals on node item, got %#v", items[0])
+	}
+}
+
 func TestDeploymentsToItems(t *testing.T) {
 	items := deploymentsToItems([]appsv1.Deployment{
 		{

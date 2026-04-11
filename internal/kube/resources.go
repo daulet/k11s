@@ -754,6 +754,13 @@ func formatUsageMetricCPU(value int64) string {
 	return resourceapi.NewMilliQuantity(value, resourceapi.DecimalSI).String()
 }
 
+func formatOptionalUsageMetricCPU(value int64) string {
+	if value <= 0 {
+		return ""
+	}
+	return formatUsageMetricCPU(value)
+}
+
 func formatUsageMetricMemory(value int64) string {
 	const (
 		kib = int64(1024)
@@ -776,6 +783,13 @@ func formatUsageMetricMemory(value int64) string {
 	default:
 		return "0B"
 	}
+}
+
+func formatOptionalUsageMetricMemory(value int64) string {
+	if value <= 0 {
+		return ""
+	}
+	return formatUsageMetricMemory(value)
 }
 
 func formatBinaryUsageValue(value float64, suffix string) string {
@@ -1158,11 +1172,17 @@ func nodesToItems(nodes []corev1.Node) []protocol.ResourceItem {
 		if node.Spec.Unschedulable {
 			status += " (cordoned)"
 		}
+		cpuAllocatableMilli := node.Status.Allocatable.Cpu().MilliValue()
+		memoryAllocatableBytes := node.Status.Allocatable.Memory().Value()
 		items = append(items, protocol.ResourceItem{
-			Name:      node.Name,
-			Namespace: "<cluster>",
-			Status:    status,
-			Age:       formatListAgeSince(node.CreationTimestamp.Time, now),
+			Name:                   node.Name,
+			Namespace:              "<cluster>",
+			Status:                 status,
+			Age:                    formatListAgeSince(node.CreationTimestamp.Time, now),
+			CPUAllocatable:         formatOptionalUsageMetricCPU(cpuAllocatableMilli),
+			MemoryAllocatable:      formatOptionalUsageMetricMemory(memoryAllocatableBytes),
+			CPUAllocatableMilli:    cpuAllocatableMilli,
+			MemoryAllocatableBytes: memoryAllocatableBytes,
 		})
 	}
 	sortResourceItems(items)
@@ -1269,8 +1289,9 @@ func unstructuredToItemsForResource(values []unstructured.Unstructured, resource
 			namespace = "-"
 		}
 		age := formatListAgeSince(value.GetCreationTimestamp().Time, now)
+		kind := strings.TrimSpace(value.GetKind())
 
-		if resource == "pods" || strings.EqualFold(strings.TrimSpace(value.GetKind()), "pod") {
+		if resource == "pods" || strings.EqualFold(kind, "pod") {
 			phase := "Unknown"
 			if v, ok, _ := unstructured.NestedString(value.Object, "status", "phase"); ok && strings.TrimSpace(v) != "" {
 				phase = strings.TrimSpace(v)
@@ -1287,6 +1308,21 @@ func unstructuredToItemsForResource(values []unstructured.Unstructured, resource
 				Node:      strings.TrimSpace(node),
 				OwnerKind: ownerKind,
 				OwnerName: ownerName,
+			})
+			continue
+		}
+		if resource == "nodes" || strings.EqualFold(kind, "node") {
+			status := nodeStatusFromUnstructured(value.Object)
+			cpuAllocatableMilli, memoryAllocatableBytes := nodeAllocatableFromUnstructured(value.Object)
+			items = append(items, protocol.ResourceItem{
+				Name:                   value.GetName(),
+				Namespace:              "<cluster>",
+				Status:                 status,
+				Age:                    age,
+				CPUAllocatable:         formatOptionalUsageMetricCPU(cpuAllocatableMilli),
+				MemoryAllocatable:      formatOptionalUsageMetricMemory(memoryAllocatableBytes),
+				CPUAllocatableMilli:    cpuAllocatableMilli,
+				MemoryAllocatableBytes: memoryAllocatableBytes,
 			})
 			continue
 		}
@@ -1314,6 +1350,49 @@ func unstructuredToItemsForResource(values []unstructured.Unstructured, resource
 	}
 	sortResourceItems(items)
 	return items
+}
+
+func nodeStatusFromUnstructured(object map[string]any) string {
+	status := "Unknown"
+	conditions, ok, _ := unstructured.NestedSlice(object, "status", "conditions")
+	if ok {
+		for _, raw := range conditions {
+			condition, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			conditionType := strings.TrimSpace(fmt.Sprintf("%v", condition["type"]))
+			if !strings.EqualFold(conditionType, string(corev1.NodeReady)) {
+				continue
+			}
+			conditionStatus := strings.TrimSpace(fmt.Sprintf("%v", condition["status"]))
+			if strings.EqualFold(conditionStatus, string(corev1.ConditionTrue)) {
+				status = "Ready"
+			} else {
+				status = "NotReady"
+			}
+			break
+		}
+	}
+	unschedulable, ok, _ := unstructured.NestedBool(object, "spec", "unschedulable")
+	if ok && unschedulable {
+		status += " (cordoned)"
+	}
+	return status
+}
+
+func nodeAllocatableFromUnstructured(object map[string]any) (cpuMilli int64, memoryBytes int64) {
+	values, ok, _ := unstructured.NestedStringMap(object, "status", "allocatable")
+	if !ok {
+		return 0, 0
+	}
+	if parsed, ok := parseUsageMetricMilli(values["cpu"]); ok {
+		cpuMilli = parsed
+	}
+	if parsed, ok := parseUsageMetricBytes(values["memory"]); ok {
+		memoryBytes = parsed
+	}
+	return cpuMilli, memoryBytes
 }
 
 func formatListAgeSince(createdAt time.Time, now time.Time) string {

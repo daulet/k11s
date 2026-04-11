@@ -2388,10 +2388,32 @@ func TestNodeListColumnHeadersExcludeOwner(t *testing.T) {
 			Namespace: "all",
 			Items: []protocol.ResourceItem{
 				{
-					Name:      "node-a",
-					Namespace: "<cluster>",
-					Status:    "Ready",
-					Age:       "2d",
+					Name:                   "node-a",
+					Namespace:              "<cluster>",
+					Status:                 "Ready",
+					Age:                    "2d",
+					CPU:                    "619m",
+					Memory:                 "11Gi",
+					CPUMilli:               619,
+					MemoryBytes:            11 * 1024 * 1024 * 1024,
+					CPUAllocatable:         "63950m",
+					MemoryAllocatable:      "148Gi",
+					CPUAllocatableMilli:    63950,
+					MemoryAllocatableBytes: 148 * 1024 * 1024 * 1024,
+				},
+				{
+					Name:                   "node-b",
+					Namespace:              "<cluster>",
+					Status:                 "Ready",
+					Age:                    "2d",
+					CPU:                    "1731m",
+					Memory:                 "6.5Gi",
+					CPUMilli:               1731,
+					MemoryBytes:            6979321856,
+					CPUAllocatable:         "63950m",
+					MemoryAllocatable:      "148Gi",
+					CPUAllocatableMilli:    63950,
+					MemoryAllocatableBytes: 148 * 1024 * 1024 * 1024,
 				},
 			},
 			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
@@ -2407,6 +2429,18 @@ func TestNodeListColumnHeadersExcludeOwner(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "CPU") || !strings.Contains(lines[0], "MEM") {
 		t.Fatalf("expected nodes list header to include usage columns, got %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "619m/63950m") || !strings.Contains(lines[1], "11Gi/148Gi") {
+		t.Fatalf("expected nodes row to show usage/allocatable totals, got %q", lines[1])
+	}
+	if !strings.Contains(lines[2], "1731m/63950m") || !strings.Contains(lines[2], "6.5Gi/148Gi") {
+		t.Fatalf("expected second nodes row to show usage/allocatable totals, got %q", lines[2])
+	}
+	if strings.Index(lines[1], "/63950m") != strings.Index(lines[2], "/63950m") {
+		t.Fatalf("expected cpu totals to align vertically, got %q and %q", lines[1], lines[2])
+	}
+	if strings.Index(lines[1], "/148Gi") != strings.Index(lines[2], "/148Gi") {
+		t.Fatalf("expected memory totals to align vertically, got %q and %q", lines[1], lines[2])
 	}
 }
 

@@ -1852,11 +1852,11 @@ func (m model) detailOverviewNavigationTargetAtLine(width int, line int) (detail
 			// ready:
 			cursor++
 		}
-		if strings.TrimSpace(m.detail.Item.CPU) != "" {
+		if strings.TrimSpace(detailItemCPUDisplay(*m.detail.Item)) != "" && detailItemCPUDisplay(*m.detail.Item) != "-" {
 			// cpu:
 			cursor++
 		}
-		if strings.TrimSpace(m.detail.Item.Memory) != "" {
+		if strings.TrimSpace(detailItemMemoryDisplay(*m.detail.Item)) != "" && detailItemMemoryDisplay(*m.detail.Item) != "-" {
 			// memory:
 			cursor++
 		}
@@ -3436,6 +3436,8 @@ func resourceItemSame(left protocol.ResourceItem, right protocol.ResourceItem) b
 		left.Status == right.Status &&
 		left.CPU == right.CPU &&
 		left.Memory == right.Memory &&
+		left.CPUAllocatable == right.CPUAllocatable &&
+		left.MemoryAllocatable == right.MemoryAllocatable &&
 		left.Node == right.Node &&
 		left.OwnerKind == right.OwnerKind &&
 		left.OwnerName == right.OwnerName
@@ -5574,10 +5576,14 @@ func renderStyledSegment(value string, width int, style lipgloss.Style) string {
 }
 
 func renderStyledValueSegment(value string, width int, style lipgloss.Style) string {
+	return renderStyledValueSegmentAligned(value, width, style, false)
+}
+
+func renderStyledValueSegmentAligned(value string, width int, style lipgloss.Style, alignRight bool) string {
 	if width <= 0 {
 		return style.Render(value)
 	}
-	text := fixedWidthCell(value, width)
+	text := fixedWidthCellAligned(value, width, alignRight)
 	trimmed := strings.TrimRight(text, " ")
 	padding := text[len(trimmed):]
 	if trimmed == "" {
@@ -5820,11 +5826,11 @@ func (m model) detailOverviewLines(width int) []string {
 		if strings.TrimSpace(m.detail.Item.Ready) != "" {
 			lines = append(lines, m.renderDetailFieldLine("ready", "ready: "+defaultDash(m.detail.Item.Ready)))
 		}
-		if strings.TrimSpace(m.detail.Item.CPU) != "" {
-			lines = append(lines, m.renderDetailFieldLine("cpu", "cpu: "+m.detail.Item.CPU))
+		if cpuDisplay := detailItemCPUDisplay(*m.detail.Item); cpuDisplay != "-" {
+			lines = append(lines, m.renderDetailFieldLine("cpu", "cpu: "+cpuDisplay))
 		}
-		if strings.TrimSpace(m.detail.Item.Memory) != "" {
-			lines = append(lines, m.renderDetailFieldLine("memory", "memory: "+m.detail.Item.Memory))
+		if memoryDisplay := detailItemMemoryDisplay(*m.detail.Item); memoryDisplay != "-" {
+			lines = append(lines, m.renderDetailFieldLine("memory", "memory: "+memoryDisplay))
 		}
 	}
 	for _, field := range m.detail.Overview {
@@ -6668,9 +6674,11 @@ func (m model) renderEmptyItemsLine() string {
 }
 
 type listColumn struct {
-	id    string
-	title string
-	width int
+	id         string
+	title      string
+	width      int
+	alignRight bool
+	alignSlash bool
 }
 
 func (m model) listColumns() []listColumn {
@@ -6708,8 +6716,8 @@ func listColumnsForResource(resource string, contentWidth int) []listColumn {
 			{id: "namespace", title: "NAMESPACE", width: namespaceWidth},
 			{id: "age", title: "AGE", width: ageWidth},
 			{id: "status", title: "STATUS", width: statusWidth},
-			{id: "cpu", title: "CPU", width: cpuWidth},
-			{id: "memory", title: "MEM", width: memoryWidth},
+			{id: "cpu", title: "CPU", width: cpuWidth, alignRight: true, alignSlash: true},
+			{id: "memory", title: "MEM", width: memoryWidth, alignRight: true, alignSlash: true},
 		}
 	default:
 		return []listColumn{
@@ -6862,15 +6870,15 @@ func nodeListColumnWidths(contentWidth int) (name int, namespace int, age int, s
 		namespaceMin = 10
 		ageMin       = 5
 		statusMin    = 10
-		cpuMin       = 5
-		memoryMin    = 6
+		cpuMin       = 8
+		memoryMin    = 12
 
 		nameMax      = 36
 		namespaceMax = 18
 		ageMax       = 5
 		statusMax    = 16
-		cpuMax       = 7
-		memoryMax    = 9
+		cpuMax       = 12
+		memoryMax    = 16
 
 		fixedPadding = 7 // indent + separators for fixed-width columns
 	)
@@ -6895,8 +6903,16 @@ func nodeListColumnWidths(contentWidth int) (name int, namespace int, age int, s
 	remaining := target - minSum
 	for remaining > 0 {
 		progressed := false
-		if name < nameMax {
-			name++
+		if memory < memoryMax {
+			memory++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if cpu < cpuMax {
+			cpu++
 			remaining--
 			progressed = true
 			if remaining == 0 {
@@ -6911,24 +6927,16 @@ func nodeListColumnWidths(contentWidth int) (name int, namespace int, age int, s
 				break
 			}
 		}
+		if name < nameMax {
+			name++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
 		if namespace < namespaceMax {
 			namespace++
-			remaining--
-			progressed = true
-			if remaining == 0 {
-				break
-			}
-		}
-		if memory < memoryMax {
-			memory++
-			remaining--
-			progressed = true
-			if remaining == 0 {
-				break
-			}
-		}
-		if cpu < cpuMax {
-			cpu++
 			remaining--
 			progressed = true
 			if remaining == 0 {
@@ -7285,7 +7293,7 @@ func (m model) renderListItem(columns []listColumn, item protocol.ResourceItem) 
 		value := listValueForColumn(column.id, item)
 		valueStyle, hasValueStyle := m.listValueStyle(item, column.id)
 		navigable := m.isListValueNavigable(item, column.id)
-		if idx == len(columns)-1 || column.width <= 0 {
+		if column.width <= 0 {
 			if navigable {
 				b.WriteString(m.styles.Clickable.Render(value))
 			} else if hasValueStyle {
@@ -7293,18 +7301,33 @@ func (m model) renderListItem(columns []listColumn, item protocol.ResourceItem) 
 			} else {
 				b.WriteString(value)
 			}
-			continue
-		}
-		if navigable {
-			b.WriteString(renderStyledValueSegment(value, column.width, m.styles.Clickable))
-		} else if hasValueStyle {
-			b.WriteString(renderStyledValueSegment(value, column.width, valueStyle))
 		} else {
-			b.WriteString(fixedWidthCell(value, column.width))
+			if navigable {
+				b.WriteString(renderStyledListValueSegment(value, column, m.styles.Clickable))
+			} else if hasValueStyle {
+				b.WriteString(renderStyledListValueSegment(value, column, valueStyle))
+			} else {
+				b.WriteString(fixedWidthCellForColumn(value, column))
+			}
 		}
-		b.WriteByte(' ')
+		if idx < len(columns)-1 {
+			b.WriteByte(' ')
+		}
 	}
 	return b.String()
+}
+
+func renderStyledListValueSegment(value string, column listColumn, style lipgloss.Style) string {
+	if column.width <= 0 {
+		return style.Render(value)
+	}
+	text := fixedWidthCellForColumn(value, column)
+	trimmed := strings.TrimRight(text, " ")
+	padding := text[len(trimmed):]
+	if trimmed == "" {
+		return padding
+	}
+	return style.Render(trimmed) + padding
 }
 
 func (m model) listValueStyle(item protocol.ResourceItem, columnID string) (lipgloss.Style, bool) {
@@ -7349,12 +7372,14 @@ func renderListValues(columns []listColumn, values []string) string {
 		if idx < len(values) {
 			value = values[idx]
 		}
-		if idx == len(columns)-1 || column.width <= 0 {
+		if column.width <= 0 {
 			b.WriteString(value)
-			continue
+		} else {
+			b.WriteString(fixedWidthCellForColumn(value, column))
 		}
-		b.WriteString(fixedWidthCell(value, column.width))
-		b.WriteByte(' ')
+		if idx < len(columns)-1 {
+			b.WriteByte(' ')
+		}
 	}
 	return b.String()
 }
@@ -7370,9 +7395,9 @@ func listValueForColumn(columnID string, item protocol.ResourceItem) string {
 	case "age":
 		return defaultDash(item.Age)
 	case "cpu":
-		return defaultDash(item.CPU)
+		return detailItemCPUDisplay(item)
 	case "memory":
-		return defaultDash(item.Memory)
+		return detailItemMemoryDisplay(item)
 	case "ready":
 		value := strings.TrimSpace(item.Ready)
 		if value == "" {
@@ -7389,6 +7414,29 @@ func listValueForColumn(columnID string, item protocol.ResourceItem) string {
 		return ownerDisplay(item)
 	default:
 		return ""
+	}
+}
+
+func detailItemCPUDisplay(item protocol.ResourceItem) string {
+	return usageWithTotalDisplay(item.CPU, item.CPUAllocatable)
+}
+
+func detailItemMemoryDisplay(item protocol.ResourceItem) string {
+	return usageWithTotalDisplay(item.Memory, item.MemoryAllocatable)
+}
+
+func usageWithTotalDisplay(used string, total string) string {
+	used = strings.TrimSpace(used)
+	total = strings.TrimSpace(total)
+	switch {
+	case used == "" && total == "":
+		return "-"
+	case total == "":
+		return defaultDash(used)
+	case used == "":
+		return "-/" + total
+	default:
+		return used + "/" + total
 	}
 }
 
@@ -7443,6 +7491,17 @@ func parseReadyFraction(value string) (ready int, total int, ok bool) {
 }
 
 func fixedWidthCell(value string, width int) string {
+	return fixedWidthCellAligned(value, width, false)
+}
+
+func fixedWidthCellForColumn(value string, column listColumn) string {
+	if column.alignSlash {
+		return fixedWidthUsageTotalCell(value, column.width)
+	}
+	return fixedWidthCellAligned(value, column.width, column.alignRight)
+}
+
+func fixedWidthCellAligned(value string, width int, alignRight bool) string {
 	if width <= 0 {
 		return value
 	}
@@ -7456,7 +7515,39 @@ func fixedWidthCell(value string, width int) string {
 	if len(runes) == width {
 		return value
 	}
-	return value + strings.Repeat(" ", width-len(runes))
+	padding := strings.Repeat(" ", width-len(runes))
+	if alignRight {
+		return padding + value
+	}
+	return value + padding
+}
+
+func fixedWidthUsageTotalCell(value string, width int) string {
+	if width <= 0 {
+		return value
+	}
+	used, total, ok := splitUsageTotalValue(value)
+	if !ok {
+		return fixedWidthCellAligned(value, width, true)
+	}
+	totalWidth := len([]rune(total)) + 1
+	if totalWidth >= width {
+		return fixedWidthCellAligned(value, width, true)
+	}
+	return fixedWidthCellAligned(used, width-totalWidth, true) + "/" + total
+}
+
+func splitUsageTotalValue(value string) (used string, total string, ok bool) {
+	left, right, hasSlash := strings.Cut(strings.TrimSpace(value), "/")
+	if !hasSlash {
+		return "", "", false
+	}
+	used = strings.TrimSpace(left)
+	total = strings.TrimSpace(right)
+	if total == "" {
+		return "", "", false
+	}
+	return used, total, true
 }
 
 func (m model) firstItemBodyLine() int {
@@ -8419,10 +8510,10 @@ func (m *model) updateResourceFlashing(previous protocol.ResourceDetailPayload, 
 		if strings.TrimSpace(prevItem.Ready) != strings.TrimSpace(nextItem.Ready) {
 			mark("ready")
 		}
-		if strings.TrimSpace(prevItem.CPU) != strings.TrimSpace(nextItem.CPU) {
+		if detailItemCPUDisplay(*prevItem) != detailItemCPUDisplay(*nextItem) {
 			mark("cpu")
 		}
-		if strings.TrimSpace(prevItem.Memory) != strings.TrimSpace(nextItem.Memory) {
+		if detailItemMemoryDisplay(*prevItem) != detailItemMemoryDisplay(*nextItem) {
 			mark("memory")
 		}
 	}
@@ -9436,8 +9527,8 @@ func itemMatchesSearch(item protocol.ResourceItem, query string) bool {
 	return strings.Contains(strings.ToLower(item.Name), query) ||
 		strings.Contains(strings.ToLower(item.Namespace), query) ||
 		strings.Contains(strings.ToLower(item.Age), query) ||
-		strings.Contains(strings.ToLower(item.CPU), query) ||
-		strings.Contains(strings.ToLower(item.Memory), query) ||
+		strings.Contains(strings.ToLower(detailItemCPUDisplay(item)), query) ||
+		strings.Contains(strings.ToLower(detailItemMemoryDisplay(item)), query) ||
 		strings.Contains(strings.ToLower(item.Status), query)
 }
 
