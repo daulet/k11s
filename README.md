@@ -104,6 +104,12 @@ Command line examples:
 - `:scale <replicas>` (scale selected item), or `:scale <replicas> <name>`
 - `:restart` (rollout restart selected item), or `:rollout restart [name]`
 - `:logs` (tail selected pod logs), or `:logs <pod-name> [tail-lines]`
+- `:attach` (attach stdin/stdout to the selected pod process), or `:attach <pod-name> [container]`
+- `:shell` (run `/bin/sh` in the selected pod), or `:shell <pod-name> [container]`
+
+Pod terminal actions:
+- `attach` connects to the container's existing main process. Use it when the workload already exposes an interactive REPL or console on PID 1.
+- `shell` starts a new `/bin/sh` process with `kubectl exec`. Use it when you want an interactive shell inside the container filesystem/process namespace.
 
 Autocomplete notes:
 - `:ctx ` / `:context ` suggestions are loaded from kubeconfig (`KUBECONFIG` or `~/.kube/config`).

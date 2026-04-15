@@ -130,6 +130,12 @@ type editCompletedMsg struct {
 	err    error
 }
 
+type podTerminalCompletedMsg struct {
+	mode   podTerminalMode
+	target string
+	err    error
+}
+
 type logsLoadedMsg struct {
 	seq      int
 	payload  protocol.LogsPayload
@@ -999,6 +1005,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		updatedModel, listCmd := m.startListReloadWithAnnouncement(false)
 		return updatedModel, listCmd
+	case podTerminalCompletedMsg:
+		if msg.err != nil {
+			m.commandMessage = fmt.Sprintf("%s failed: %v", msg.mode, msg.err)
+			return m, nil
+		}
+		switch msg.mode {
+		case podTerminalAttach:
+			m.commandMessage = fmt.Sprintf("attach session ended for %s", msg.target)
+		case podTerminalShell:
+			m.commandMessage = fmt.Sprintf("shell exited for %s", msg.target)
+		default:
+			m.commandMessage = fmt.Sprintf("interactive session ended for %s", msg.target)
+		}
+		return m, nil
 	case logsLoadedMsg:
 		if msg.seq != m.logsActiveSeq {
 			return m, nil
@@ -2709,6 +2729,16 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m.startEditWithInvocation(editInvocation, "command")
 		}
+		if terminalInvocation, handled, terminalErr := m.podTerminalInvocationFromCommand(commandText); handled {
+			if terminalErr != nil {
+				m.enterCommandMode()
+				m.input.SetValue(commandText)
+				m.commandMessage = terminalErr.Error()
+				m.suggestions = m.commandSuggestions(m.input.Value())
+				return m, nil
+			}
+			return m.startPodTerminalWithInvocation(terminalInvocation, "command")
+		}
 		if actionQuery, bulkTargets, isAction, actionErr := m.actionQueryFromCommand(commandText); isAction {
 			if actionErr != nil {
 				m.enterCommandMode()
@@ -3807,6 +3837,20 @@ type editInvocation struct {
 	namespace     string
 }
 
+type podTerminalMode string
+
+const (
+	podTerminalAttach podTerminalMode = "attach"
+	podTerminalShell  podTerminalMode = "shell"
+)
+
+type podTerminalInvocation struct {
+	mode      podTerminalMode
+	name      string
+	namespace string
+	container string
+}
+
 type directOpenInvocation struct {
 	resource      string
 	name          string
@@ -4717,15 +4761,231 @@ func (m model) startEditWithInvocation(invocation editInvocation, via string) (t
 		m.commandMessage = fmt.Sprintf("opening editor for %s via %s...", target, strings.TrimSpace(via))
 	}
 
-	cmd := exec.Command("kubectl", args...)
-	// kubectl edit launches another interactive editor process; using the real
-	// terminal fds avoids nested-tty hangs when returning from the editor.
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd := interactiveKubectlCommand(args...)
 	return m, m.execProcess(cmd, func(err error) tea.Msg {
 		return editCompletedMsg{target: target, err: err}
 	})
+}
+
+func (m model) podTerminalInvocationFromCommand(input string) (podTerminalInvocation, bool, error) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return podTerminalInvocation{}, false, nil
+	}
+
+	command := strings.ToLower(strings.TrimSpace(fields[0]))
+	var mode podTerminalMode
+	switch command {
+	case string(podTerminalAttach):
+		mode = podTerminalAttach
+	case string(podTerminalShell):
+		mode = podTerminalShell
+	default:
+		return podTerminalInvocation{}, false, nil
+	}
+
+	resource, _, _, ok := m.activeActionTarget()
+	if !ok {
+		return podTerminalInvocation{}, true, fmt.Errorf("%s target required: select a pod or pass `<name>`", command)
+	}
+	if normalizeResourceInput(resource) != "pods" {
+		return podTerminalInvocation{}, true, fmt.Errorf("%s is only supported for pods", command)
+	}
+
+	targetToken, container, err := parsePodTerminalArgs(fields[1:])
+	if err != nil {
+		return podTerminalInvocation{}, true, fmt.Errorf("%s %v", command, err)
+	}
+
+	var name, itemNamespace string
+	if strings.TrimSpace(targetToken) != "" {
+		name, itemNamespace, err = m.actionTargetFromFields([]string{targetToken})
+	} else {
+		name, itemNamespace, err = m.actionTargetFromFields(nil)
+	}
+	if err != nil {
+		return podTerminalInvocation{}, true, err
+	}
+
+	namespace := sanitizeActionNamespace(itemNamespace)
+	if namespace == "" {
+		currentNamespace := strings.TrimSpace(m.session.Namespace)
+		if currentNamespace != "" && !strings.EqualFold(currentNamespace, "all") {
+			namespace = currentNamespace
+		}
+	}
+	if namespace == "" {
+		return podTerminalInvocation{}, true, fmt.Errorf("%s requires a concrete pod namespace", command)
+	}
+
+	if strings.TrimSpace(container) == "" {
+		container = m.defaultPodTerminalContainer(name, namespace)
+	}
+
+	return podTerminalInvocation{
+		mode:      mode,
+		name:      strings.TrimSpace(name),
+		namespace: namespace,
+		container: strings.TrimSpace(container),
+	}, true, nil
+}
+
+func parsePodTerminalArgs(args []string) (target string, container string, err error) {
+	for i := 0; i < len(args); i++ {
+		value := strings.TrimSpace(args[i])
+		if value == "" {
+			continue
+		}
+		switch {
+		case value == "-c" || value == "--container":
+			if container != "" {
+				return "", "", fmt.Errorf("accepts at most one container")
+			}
+			i++
+			if i >= len(args) || strings.TrimSpace(args[i]) == "" {
+				return "", "", fmt.Errorf("container value required after %q", value)
+			}
+			container = strings.TrimSpace(args[i])
+			continue
+		case strings.HasPrefix(value, "--container="):
+			if container != "" {
+				return "", "", fmt.Errorf("accepts at most one container")
+			}
+			container = strings.TrimSpace(strings.TrimPrefix(value, "--container="))
+			if container == "" {
+				return "", "", fmt.Errorf("container value required after --container=")
+			}
+			continue
+		case strings.HasPrefix(value, "-c="):
+			if container != "" {
+				return "", "", fmt.Errorf("accepts at most one container")
+			}
+			container = strings.TrimSpace(strings.TrimPrefix(value, "-c="))
+			if container == "" {
+				return "", "", fmt.Errorf("container value required after -c=")
+			}
+			continue
+		case strings.HasPrefix(value, "-"):
+			return "", "", fmt.Errorf("unsupported option %q", value)
+		case target == "":
+			target = value
+		case container == "":
+			container = value
+		default:
+			return "", "", fmt.Errorf("accepts at most one target and one container")
+		}
+	}
+	return target, container, nil
+}
+
+func (m model) defaultPodTerminalContainer(name string, namespace string) string {
+	if !m.podViewOpen {
+		return ""
+	}
+	if strings.TrimSpace(m.podView.Name) != strings.TrimSpace(name) ||
+		strings.TrimSpace(m.podView.Namespace) != strings.TrimSpace(namespace) {
+		return ""
+	}
+
+	if tab, ok := m.activePodTab(); ok && tab.kind == podTabContainer {
+		return strings.TrimSpace(tab.container)
+	}
+	if m.isPodLogsTabActive() {
+		containers := m.podLogContainers()
+		if len(containers) == 0 {
+			return ""
+		}
+		index := m.podViewLogIndex
+		if index < 0 || index >= len(containers) {
+			index = 0
+		}
+		return strings.TrimSpace(containers[index])
+	}
+
+	containers := m.podLogContainers()
+	if len(containers) == 1 {
+		return strings.TrimSpace(containers[0])
+	}
+	return ""
+}
+
+func (m model) startPodTerminalWithInvocation(invocation podTerminalInvocation, via string) (tea.Model, tea.Cmd) {
+	if m.execProcess == nil {
+		m.commandMessage = fmt.Sprintf("%s is unavailable in this build", invocation.mode)
+		return m, nil
+	}
+
+	target := podTerminalTargetLabel(invocation)
+	args := podTerminalKubectlArgs(m.session.KubeContext, invocation)
+	switch invocation.mode {
+	case podTerminalAttach:
+		if strings.TrimSpace(via) == "" {
+			m.commandMessage = fmt.Sprintf("attaching to %s...", target)
+		} else {
+			m.commandMessage = fmt.Sprintf("attaching to %s via %s...", target, strings.TrimSpace(via))
+		}
+	case podTerminalShell:
+		if strings.TrimSpace(via) == "" {
+			m.commandMessage = fmt.Sprintf("opening shell in %s...", target)
+		} else {
+			m.commandMessage = fmt.Sprintf("opening shell in %s via %s...", target, strings.TrimSpace(via))
+		}
+	default:
+		m.commandMessage = fmt.Sprintf("opening interactive session for %s...", target)
+	}
+
+	cmd := interactiveKubectlCommand(args...)
+	return m, m.execProcess(cmd, func(err error) tea.Msg {
+		return podTerminalCompletedMsg{
+			mode:   invocation.mode,
+			target: target,
+			err:    err,
+		}
+	})
+}
+
+func podTerminalKubectlArgs(kubeContext string, invocation podTerminalInvocation) []string {
+	args := []string{}
+	switch invocation.mode {
+	case podTerminalAttach:
+		args = append(args, "attach")
+	case podTerminalShell:
+		args = append(args, "exec")
+	default:
+		args = append(args, "exec")
+	}
+	if kubeContext = strings.TrimSpace(kubeContext); kubeContext != "" {
+		args = append(args, "--context", kubeContext)
+	}
+	if namespace := strings.TrimSpace(invocation.namespace); namespace != "" {
+		args = append(args, "-n", namespace)
+	}
+	args = append(args, "-i", "-t", strings.TrimSpace(invocation.name))
+	if container := strings.TrimSpace(invocation.container); container != "" {
+		args = append(args, "-c", container)
+	}
+	if invocation.mode == podTerminalShell {
+		args = append(args, "--", "/bin/sh")
+	}
+	return args
+}
+
+func podTerminalTargetLabel(invocation podTerminalInvocation) string {
+	target := "pods " + strings.TrimSpace(invocation.namespace) + "/" + strings.TrimSpace(invocation.name)
+	if container := strings.TrimSpace(invocation.container); container != "" {
+		target += " (container " + container + ")"
+	}
+	return target
+}
+
+func interactiveKubectlCommand(args ...string) *exec.Cmd {
+	cmd := exec.Command("kubectl", args...)
+	// Interactive kubectl commands need the real terminal fds so the child
+	// process can own the TTY cleanly and return control afterwards.
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
 }
 
 func (m model) logsQueryFromCommand(input string) (protocol.LogsQuery, bool, error) {
@@ -8867,6 +9127,8 @@ func (m model) commandSuggestions(input string) []string {
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "edit":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
+	case "attach", "shell":
+		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "logs":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "logfmt", "logformat":
@@ -9317,6 +9579,8 @@ func baseSuggestions() []string {
 		"del",
 		"rm",
 		"edit",
+		"attach",
+		"shell",
 		"logs",
 		"logfmt",
 		"logformat",
@@ -9639,7 +9903,7 @@ func commandSupportsArgument(token string) bool {
 		return true
 	}
 	switch token {
-	case "ctx", "context", "resource", "filter", "delete", "del", "rm", "edit", "logs", "logfmt", "logformat", "scale", "restart", "rollout", "label", "annotate", "sort", "order":
+	case "ctx", "context", "resource", "filter", "delete", "del", "rm", "edit", "attach", "shell", "logs", "logfmt", "logformat", "scale", "restart", "rollout", "label", "annotate", "sort", "order":
 		return true
 	default:
 		return false

@@ -943,6 +943,165 @@ func TestEditShortcutRunsKubectlEdit(t *testing.T) {
 	}
 }
 
+func TestAttachCommandRunsKubectlAttach(t *testing.T) {
+	var seenArgs []string
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.execProcess = func(cmd *exec.Cmd, callback tea.ExecCallback) tea.Cmd {
+		seenArgs = append([]string(nil), cmd.Args...)
+		return func() tea.Msg {
+			return callback(nil)
+		}
+	}
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("attach")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	withAttach := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected attach command to run external kubectl attach")
+	}
+	if !strings.Contains(strings.ToLower(withAttach.commandMessage), "attaching to") {
+		t.Fatalf("expected attach start message, got %q", withAttach.commandMessage)
+	}
+	if len(seenArgs) == 0 || seenArgs[0] != "kubectl" {
+		t.Fatalf("expected kubectl command, got %#v", seenArgs)
+	}
+	joined := strings.Join(seenArgs, " ")
+	if !strings.Contains(joined, "attach") || !strings.Contains(joined, "-i -t api") {
+		t.Fatalf("expected kubectl attach args, got %q", joined)
+	}
+	if !strings.Contains(joined, "--context dev-cluster") || !strings.Contains(joined, "-n default") {
+		t.Fatalf("expected context and namespace flags in attach args, got %q", joined)
+	}
+
+	updated, _ = withAttach.Update(cmd())
+	final := updated.(model)
+	if !strings.Contains(strings.ToLower(final.commandMessage), "attach session ended for pods default/api") {
+		t.Fatalf("expected attach completion feedback, got %q", final.commandMessage)
+	}
+}
+
+func TestShellCommandRunsKubectlExecWithSelectedPodViewContainer(t *testing.T) {
+	var seenArgs []string
+
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.podViewOpen = true
+	m.podView = protocol.PodViewPayload{
+		Found:     true,
+		Name:      "api",
+		Namespace: "default",
+		Containers: []protocol.PodContainer{
+			{Name: "app"},
+			{Name: "sidecar"},
+		},
+	}
+	m.podViewTab = 3 // overview + 2 containers + logs
+	m.podViewLogIndex = 1
+	m.execProcess = func(cmd *exec.Cmd, callback tea.ExecCallback) tea.Cmd {
+		seenArgs = append([]string(nil), cmd.Args...)
+		return func() tea.Msg {
+			return callback(nil)
+		}
+	}
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("shell")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	withShell := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected shell command to run external kubectl exec")
+	}
+	if !strings.Contains(strings.ToLower(withShell.commandMessage), "opening shell") {
+		t.Fatalf("expected shell start message, got %q", withShell.commandMessage)
+	}
+	if len(seenArgs) == 0 || seenArgs[0] != "kubectl" {
+		t.Fatalf("expected kubectl command, got %#v", seenArgs)
+	}
+	joined := strings.Join(seenArgs, " ")
+	if !strings.Contains(joined, "exec") || !strings.Contains(joined, "-i -t api") {
+		t.Fatalf("expected kubectl exec args, got %q", joined)
+	}
+	if !strings.Contains(joined, "-c sidecar") {
+		t.Fatalf("expected selected container in shell args, got %q", joined)
+	}
+	if !strings.Contains(joined, "-- /bin/sh") {
+		t.Fatalf("expected shell command in exec args, got %q", joined)
+	}
+
+	updated, _ = withShell.Update(cmd())
+	final := updated.(model)
+	if !strings.Contains(strings.ToLower(final.commandMessage), "shell exited for pods default/api (container sidecar)") {
+		t.Fatalf("expected shell completion feedback, got %q", final.commandMessage)
+	}
+}
+
+func TestShellCommandRequiresPodsTarget(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "deployments",
+			Selection:   "api",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "deployments",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Available"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+		},
+	})
+	m.commandMode = true
+	m.input.Focus()
+	m.input.SetValue("shell")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatalf("expected no async command on validation error")
+	}
+	if !next.commandMode {
+		t.Fatalf("expected command mode to remain open")
+	}
+	if !strings.Contains(strings.ToLower(next.commandMessage), "only supported for pods") {
+		t.Fatalf("expected pod-only validation message, got %q", next.commandMessage)
+	}
+}
+
 func TestScaleCommandRunsActionAndReloadsList(t *testing.T) {
 	var actionSeen protocol.ActionQuery
 	var listSeen protocol.ResourceListQuery
