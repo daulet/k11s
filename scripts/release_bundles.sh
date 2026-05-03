@@ -28,18 +28,20 @@ rm -rf "${DIST_DIR}" "${BUILD_DIR}"
 mkdir -p "${DIST_DIR}" "${BUILD_DIR}"
 
 build_one() {
-  local goarch="$1"
-  local archive_suffix="$2"
+  local goos="$1"
+  local goarch="$2"
+  local archive_suffix="$3"
+  local deb_arch="${4:-}"
   local out_dir="${BUILD_DIR}/${archive_suffix}"
 
   mkdir -p "${out_dir}"
 
-  echo "building darwin/${goarch}..."
+  echo "building ${goos}/${goarch}..."
   (
     cd "${ROOT_DIR}"
-    CGO_ENABLED=0 GOOS=darwin GOARCH="${goarch}" \
+    CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
       go build -trimpath -ldflags "${LDFLAGS}" -o "${out_dir}/k11s" ./cmd/k11s
-    CGO_ENABLED=0 GOOS=darwin GOARCH="${goarch}" \
+    CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
       go build -trimpath -ldflags "${LDFLAGS}" -o "${out_dir}/k11sd" ./cmd/k11sd
   )
 
@@ -47,20 +49,32 @@ build_one() {
 
   local tarball="${DIST_DIR}/k11s-${archive_suffix}.tar.gz"
   tar -C "${out_dir}" -czf "${tarball}" k11s k11sd
+
+  if [[ -n "${deb_arch}" ]]; then
+    "${ROOT_DIR}/scripts/package_deb.sh" \
+      --cli "${out_dir}/k11s" \
+      --daemon "${out_dir}/k11sd" \
+      --version "${VERSION}" \
+      --arch "${deb_arch}" \
+      --out-dir "${DIST_DIR}" \
+      --desc "Speed-first CLI/TUI for Kubernetes navigation and operations"
+  fi
 }
 
-build_one amd64 x86_64-apple-darwin
-build_one arm64 aarch64-apple-darwin
+build_one darwin amd64 x86_64-apple-darwin
+build_one darwin arm64 aarch64-apple-darwin
+build_one linux amd64 x86_64-unknown-linux-gnu amd64
+build_one linux arm64 aarch64-unknown-linux-gnu arm64
 
 if command -v sha256sum >/dev/null 2>&1; then
   (
     cd "${DIST_DIR}"
-    sha256sum k11s-*.tar.gz > checksums.txt
+    sha256sum k11s-*.tar.gz k11s_*.deb > checksums.txt
   )
 else
   (
     cd "${DIST_DIR}"
-    shasum -a 256 k11s-*.tar.gz > checksums.txt
+    shasum -a 256 k11s-*.tar.gz k11s_*.deb > checksums.txt
   )
 fi
 

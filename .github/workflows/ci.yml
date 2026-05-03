@@ -23,7 +23,7 @@ jobs:
 
       - name: Verify Formatting
         run: |
-          UNFORMATTED=$(gofmt -l $(find . -name '*.go' -type f))
+          UNFORMATTED=$(find . -name '*.go' -type f -print0 | xargs -0 gofmt -l)
           if [ -n "$UNFORMATTED" ]; then
             echo "Unformatted Go files:"
             echo "$UNFORMATTED"
