@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/daulet/k11s/internal/listfilter"
 	"github.com/daulet/k11s/internal/protocol"
 )
 
@@ -826,12 +827,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !resourceUsesNamespace(msg.payload.Resource) {
 				scope = "<cluster>"
 			}
-			m.commandMessage = fmt.Sprintf(
-				"loaded %d %s in %s",
-				len(m.resourceList.Items),
-				m.resourceList.Resource,
-				scope,
-			)
+			if strings.TrimSpace(msg.payload.ListFilter) != "" {
+				m.commandMessage = fmt.Sprintf(
+					"loaded %s in %s (%s)",
+					resourceListCountSummary(msg.payload),
+					scope,
+					msg.payload.ListFilter,
+				)
+			} else {
+				m.commandMessage = fmt.Sprintf(
+					"loaded %d %s in %s",
+					len(m.resourceList.Items),
+					m.resourceList.Resource,
+					scope,
+				)
+			}
 		}
 		return m, nil
 	case listFailedMsg:
@@ -3379,6 +3389,7 @@ func sessionStateEqualsForHistory(left protocol.SessionState, right protocol.Ses
 		strings.TrimSpace(left.Namespace) == strings.TrimSpace(right.Namespace) &&
 		strings.TrimSpace(left.Resource) == strings.TrimSpace(right.Resource) &&
 		strings.TrimSpace(left.Filter) == strings.TrimSpace(right.Filter) &&
+		strings.TrimSpace(left.ListFilter) == strings.TrimSpace(right.ListFilter) &&
 		strings.TrimSpace(left.Selection) == strings.TrimSpace(right.Selection)
 }
 
@@ -3499,10 +3510,28 @@ func (m *model) applyCommand(input string) (updated bool, message string, reload
 		return true, fmt.Sprintf("context switched to %s", m.session.KubeContext), true, nil
 	case "filter":
 		if len(fields) < 2 {
-			return false, "", false, fmt.Errorf("filter value required: try `:filter widgets.example.com`")
+			return false, "", false, fmt.Errorf("filter value required: try `:filter node~c1r12-lpu*` or `:filter clear`")
 		}
-		m.session.Filter = fields[1]
-		return true, fmt.Sprintf("filter set to %s", m.session.Filter), true, nil
+		value := strings.TrimSpace(strings.Join(fields[1:], " "))
+		switch strings.ToLower(value) {
+		case "clear", "off", "none", "-":
+			if strings.TrimSpace(m.session.ListFilter) == "" {
+				return false, "filter already clear", false, nil
+			}
+			wasActive := m.activeListFilter() != ""
+			m.session.ListFilter = ""
+			return true, "filter cleared", wasActive, nil
+		default:
+			normalized, parseErr := listfilter.Normalize(value)
+			if parseErr != nil {
+				return false, "", false, fmt.Errorf("%v: try `:filter node~c1r12-lpu*` or `:filter node=node-a`", parseErr)
+			}
+			m.session.ListFilter = normalized
+			if !strings.EqualFold(strings.TrimSpace(m.session.Resource), "pods") {
+				return true, fmt.Sprintf("filter set to %s (applies to pods)", normalized), false, nil
+			}
+			return true, fmt.Sprintf("filter set to %s", normalized), true, nil
+		}
 	case "crd":
 		if len(fields) < 2 {
 			return false, "", false, fmt.Errorf("crd value required: try `:crd widgets.example.com`")
@@ -5089,6 +5118,7 @@ func (m model) startListReloadWithAnnouncement(announce bool) (tea.Model, tea.Cm
 		Resource:      m.session.Resource,
 		Namespace:     effectiveNamespace(m.session.Resource, m.session.Namespace),
 		Filter:        m.session.Filter,
+		ListFilter:    listFilterForResource(m.session.Resource, m.session.ListFilter),
 		SimulateStale: m.simulateStale,
 	}
 	return m, m.loadListCmd(ctx, cancel, m.activeSeq, query, announce)
@@ -5105,6 +5135,7 @@ func (m model) startBackgroundReload() (tea.Model, tea.Cmd) {
 		Resource:      m.session.Resource,
 		Namespace:     effectiveNamespace(m.session.Resource, m.session.Namespace),
 		Filter:        m.session.Filter,
+		ListFilter:    listFilterForResource(m.session.Resource, m.session.ListFilter),
 		SimulateStale: m.simulateStale,
 	}
 	return m, m.loadListCmd(ctx, cancel, m.activeSeq, query, false)
@@ -5914,9 +5945,58 @@ func (m model) mainPaneTitle() string {
 	contextText := displayContext(m.session)
 	resourceText := displayResource(m.session)
 	if !m.mainPaneUsesNamespace() {
-		return fmt.Sprintf("%s > %s", contextText, resourceText)
+		return m.decorateListTitle(fmt.Sprintf("%s > %s", contextText, resourceText))
 	}
-	return fmt.Sprintf("%s > %s > %s", contextText, displayNamespace(m.session), resourceText)
+	return m.decorateListTitle(fmt.Sprintf("%s > %s > %s", contextText, displayNamespace(m.session), resourceText))
+}
+
+func (m model) decorateListTitle(title string) string {
+	filter := m.activeListFilter()
+	if filter == "" {
+		return title
+	}
+	title += " [" + filter + "]"
+	if summary := m.filteredListCountSummary(); summary != "" {
+		title += " " + summary
+	}
+	return title
+}
+
+func (m model) activeListFilter() string {
+	return listFilterForResource(m.session.Resource, m.session.ListFilter)
+}
+
+func listFilterForResource(resource string, raw string) string {
+	if !listfilter.AppliesToResource(resource, raw) {
+		return ""
+	}
+	normalized, err := listfilter.Normalize(raw)
+	if err != nil {
+		return ""
+	}
+	return normalized
+}
+
+func (m model) filteredListCountSummary() string {
+	if m.activeListFilter() == "" {
+		return ""
+	}
+	if m.resourceList.Freshness.SnapshotTimeUnixMs <= 0 && m.resourceList.TotalItems == 0 && len(m.resourceList.Items) == 0 {
+		return ""
+	}
+	return resourceListCountSummary(m.resourceList)
+}
+
+func resourceListCountSummary(payload protocol.ResourceListPayload) string {
+	total := payload.TotalItems
+	if total <= 0 {
+		total = len(payload.Items)
+	}
+	resource := strings.TrimSpace(payload.Resource)
+	if resource == "" {
+		resource = "items"
+	}
+	return fmt.Sprintf("%d/%d %s", len(payload.Items), total, resource)
 }
 
 func (m model) mainPaneUsesNamespace() bool {
@@ -7901,6 +7981,12 @@ func (m model) emptyPaneState() (string, lipgloss.Style) {
 	if meta.SnapshotTimeUnixMs <= 0 {
 		return "no items (loading)", m.styles.EmptyLoading
 	}
+	if filter := m.activeListFilter(); filter != "" {
+		if meta.State == protocol.FreshnessStateLive {
+			return "no pods match " + filter, m.styles.EmptyLive
+		}
+		return "no pods match " + filter + " (cached)", m.styles.EmptyCached
+	}
 	if meta.State == protocol.FreshnessStateLive {
 		return "no items", m.styles.EmptyLive
 	}
@@ -9121,8 +9207,10 @@ func (m model) commandSuggestions(input string) []string {
 		return prefixMatches(m.namespaceCandidates(), valuePrefix)
 	case "ctx", "context":
 		return prefixMatches(m.contextCandidates(), valuePrefix)
-	case "cr", "crs", "crd", "filter", "customresource", "customresources":
+	case "cr", "crs", "crd", "customresource", "customresources":
 		return m.crdCandidates(valuePrefix)
+	case "filter":
+		return m.listFilterCandidates(valuePrefix)
 	case "delete", "del", "rm":
 		return prefixMatches(m.deleteCandidates(), valuePrefix)
 	case "edit":
@@ -9520,6 +9608,28 @@ func (m model) crdCandidateIndex() crdCandidateIndex {
 		aliases:      aliases,
 		aliasToNames: aliasToNames,
 	}
+}
+
+func (m model) listFilterCandidates(prefix string) []string {
+	candidates := []string{"clear", "node=", "node~"}
+	for _, node := range m.podNodeCandidates() {
+		candidates = append(candidates, "node="+node, "node~"+node)
+	}
+	return prefixMatches(dedupeStrings(candidates), prefix)
+}
+
+func (m model) podNodeCandidates() []string {
+	values := make([]string, 0, len(m.resourceList.Items)+1)
+	if predicate, active, err := listfilter.Parse(m.session.ListFilter); err == nil && active && predicate.Field == "node" {
+		values = append(values, predicate.Value)
+	}
+	for _, item := range m.resourceList.Items {
+		node := strings.TrimSpace(item.Node)
+		if node != "" && node != "-" {
+			values = append(values, node)
+		}
+	}
+	return dedupeStrings(values)
 }
 
 func (m model) deleteCandidates() []string {

@@ -48,6 +48,7 @@ func TestBuildSessionGetResponse(t *testing.T) {
 		Namespace:   "ns-a",
 		Resource:    "pods",
 		Filter:      "app=web",
+		ListFilter:  "node=node-a",
 		Selection:   "pod-a",
 		UpdatedAtMs: 10,
 	}
@@ -67,6 +68,9 @@ func TestBuildSessionGetResponse(t *testing.T) {
 	}
 	if resp.Session.KubeContext != "ctx-a" {
 		t.Fatalf("unexpected session context: %q", resp.Session.KubeContext)
+	}
+	if resp.Session.ListFilter != "node=node-a" {
+		t.Fatalf("unexpected session list filter: %q", resp.Session.ListFilter)
 	}
 }
 

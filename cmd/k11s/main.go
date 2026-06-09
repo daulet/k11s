@@ -48,6 +48,7 @@ type startupOptions struct {
 	namespaceOverride   string
 	resourceOverride    string
 	filterOverride      string
+	listFilterOverride  string
 	selectionOverride   string
 	simulateStale       bool
 }
@@ -114,7 +115,8 @@ func parseStartupFlags(args []string, includePerfFlags bool, stderr io.Writer) (
 	kubeContextOverride := fs.String("context", "", "override restored kube context and persist it")
 	namespaceOverride := fs.String("namespace", "", "override restored namespace and persist it")
 	resourceOverride := fs.String("resource", "", "override restored resource and persist it")
-	filterOverride := fs.String("filter", "", "override restored filter and persist it")
+	filterOverride := fs.String("filter", "", "override restored CRD filter and persist it")
+	listFilterOverride := fs.String("list-filter", "", "override restored list filter and persist it")
 	selectionOverride := fs.String("selection", "", "override restored selection and persist it")
 	simulateStale := fs.Bool("simulate-stale", false, "simulate stale view freshness for status bar validation")
 
@@ -143,6 +145,7 @@ func parseStartupFlags(args []string, includePerfFlags bool, stderr io.Writer) (
 		namespaceOverride:   *namespaceOverride,
 		resourceOverride:    *resourceOverride,
 		filterOverride:      *filterOverride,
+		listFilterOverride:  *listFilterOverride,
 		selectionOverride:   *selectionOverride,
 		simulateStale:       *simulateStale,
 	}, jsonOnly, nil
@@ -180,6 +183,7 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 		opts.namespaceOverride,
 		opts.resourceOverride,
 		opts.filterOverride,
+		opts.listFilterOverride,
 		opts.selectionOverride,
 	)
 	if updated {
@@ -224,6 +228,7 @@ func bootstrapAndRestore(processStart time.Time, opts startupOptions) (startupSt
 			Resource:      sessionState.Resource,
 			Namespace:     sessionState.Namespace,
 			Filter:        sessionState.Filter,
+			ListFilter:    sessionState.ListFilter,
 			SimulateStale: opts.simulateStale,
 		},
 	)
@@ -260,11 +265,12 @@ func renderStartupOutput(out io.Writer, state startupState, startMode string) ti
 	)
 	fmt.Fprintf(
 		out,
-		"session: context=%q namespace=%q resource=%q filter=%q selection=%q\n",
+		"session: context=%q namespace=%q resource=%q filter=%q list_filter=%q selection=%q\n",
 		state.Session.KubeContext,
 		state.Session.Namespace,
 		state.Session.Resource,
 		state.Session.Filter,
+		state.Session.ListFilter,
 		state.Session.Selection,
 	)
 	fmt.Fprintf(
@@ -414,6 +420,7 @@ func applySessionOverrides(
 	namespace string,
 	resource string,
 	filter string,
+	listFilter string,
 	selection string,
 ) bool {
 	updated := false
@@ -432,6 +439,10 @@ func applySessionOverrides(
 	}
 	if filter != "" {
 		state.Filter = filter
+		updated = true
+	}
+	if listFilter != "" {
+		state.ListFilter = listFilter
 		updated = true
 	}
 	if selection != "" {

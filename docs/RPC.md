@@ -58,10 +58,11 @@ message ResourceScope {
 message ListResourcesRequest {
   string request_id = 1;
   ResourceScope scope = 2;
-  string filter = 3;
+  string filter = 3;       // resource-specific selector, e.g. CRD target for CRs
   string sort_by = 4;
   int32 page_size = 5;
   string page_token = 6;
+  string list_filter = 7;  // UI list predicate, e.g. node~c1r12-lpu*
 }
 
 enum FreshnessState {

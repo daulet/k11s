@@ -52,6 +52,7 @@ type SessionState struct {
 	Namespace   string `json:"namespace"`
 	Resource    string `json:"resource"`
 	Filter      string `json:"filter"`
+	ListFilter  string `json:"listFilter,omitempty"`
 	Selection   string `json:"selection"`
 	UpdatedAtMs int64  `json:"updatedAtMs"`
 }
@@ -78,6 +79,7 @@ type ResourceListQuery struct {
 	Resource      string `json:"resource"`
 	Namespace     string `json:"namespace"`
 	Filter        string `json:"filter,omitempty"`
+	ListFilter    string `json:"listFilter,omitempty"`
 	SimulateStale bool   `json:"simulateStale,omitempty"`
 }
 
@@ -101,10 +103,12 @@ type ResourceItem struct {
 }
 
 type ResourceListPayload struct {
-	Resource  string         `json:"resource"`
-	Namespace string         `json:"namespace"`
-	Items     []ResourceItem `json:"items"`
-	Freshness FreshnessMeta  `json:"freshness"`
+	Resource   string         `json:"resource"`
+	Namespace  string         `json:"namespace"`
+	ListFilter string         `json:"listFilter,omitempty"`
+	TotalItems int            `json:"totalItems,omitempty"`
+	Items      []ResourceItem `json:"items"`
+	Freshness  FreshnessMeta  `json:"freshness"`
 }
 
 type ResourceDetailQuery struct {
@@ -436,6 +440,7 @@ func DefaultSessionState() SessionState {
 		Namespace:   "default",
 		Resource:    "pods",
 		Filter:      "",
+		ListFilter:  "",
 		Selection:   "",
 		UpdatedAtMs: 0,
 	}

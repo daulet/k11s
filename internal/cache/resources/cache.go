@@ -9,6 +9,7 @@ import (
 	"time"
 
 	cacheutil "github.com/daulet/k11s/internal/cache"
+	"github.com/daulet/k11s/internal/listfilter"
 	"github.com/daulet/k11s/internal/protocol"
 )
 
@@ -100,6 +101,8 @@ func New(ctx context.Context, fetcher Fetcher, logger *log.Logger) *Cache {
 
 func (c *Cache) Get(query protocol.ResourceListQuery) protocol.ResourceListPayload {
 	query = normalizeQuery(query)
+	cacheQuery := query
+	cacheQuery.ListFilter = ""
 	now := c.now()
 	key := cacheKey{
 		kubeContext: query.KubeContext,
@@ -121,10 +124,10 @@ func (c *Cache) Get(query protocol.ResourceListQuery) protocol.ResourceListPaylo
 		entry.refreshing = true
 		watchCtx, watchCancel := context.WithCancel(c.ctx)
 		entry.watchCancel = watchCancel
-		go c.watch(watchCtx, key, query)
+		go c.watch(watchCtx, key, cacheQuery)
 	} else if c.shouldRefresh(entry, now) {
 		entry.refreshing = true
-		go c.refresh(key, query)
+		go c.refresh(key, cacheQuery)
 	}
 
 	payload := c.buildPayload(query, entry, now)
@@ -365,11 +368,20 @@ func (c *Cache) buildPayload(
 	now time.Time,
 ) protocol.ResourceListPayload {
 	meta := c.buildFreshnessMeta(entry, now, query.SimulateStale)
+	items := listfilter.FilterItems(query.Resource, entry.items, query.ListFilter)
+	activeListFilter := ""
+	if listfilter.AppliesToResource(query.Resource, query.ListFilter) {
+		if normalized, err := listfilter.Normalize(query.ListFilter); err == nil {
+			activeListFilter = normalized
+		}
+	}
 	return protocol.ResourceListPayload{
-		Resource:  query.Resource,
-		Namespace: query.Namespace,
-		Items:     append([]protocol.ResourceItem(nil), entry.items...),
-		Freshness: meta,
+		Resource:   query.Resource,
+		Namespace:  query.Namespace,
+		ListFilter: activeListFilter,
+		TotalItems: len(entry.items),
+		Items:      items,
+		Freshness:  meta,
 	}
 }
 
@@ -452,6 +464,7 @@ func normalizeQuery(query protocol.ResourceListQuery) protocol.ResourceListQuery
 
 	query.KubeContext = strings.TrimSpace(query.KubeContext)
 	query.Filter = strings.TrimSpace(query.Filter)
+	query.ListFilter = strings.TrimSpace(query.ListFilter)
 	return query
 }
 

@@ -21,6 +21,7 @@ func TestSaveAndLoadSession(t *testing.T) {
 		Namespace:   "payments",
 		Resource:    "pods",
 		Filter:      "app=api",
+		ListFilter:  "node=node-a",
 		Selection:   "api-0",
 	}
 
@@ -41,6 +42,9 @@ func TestSaveAndLoadSession(t *testing.T) {
 	}
 	if got.Selection != input.Selection {
 		t.Fatalf("expected selection %q, got %q", input.Selection, got.Selection)
+	}
+	if got.ListFilter != input.ListFilter {
+		t.Fatalf("expected list filter %q, got %q", input.ListFilter, got.ListFilter)
 	}
 	if got.UpdatedAtMs == 0 {
 		t.Fatalf("expected updated timestamp to be set")

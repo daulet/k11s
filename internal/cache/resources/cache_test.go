@@ -221,6 +221,65 @@ func TestCacheKeysIncludeFilter(t *testing.T) {
 	}
 }
 
+func TestListFilterAppliesWithoutRefetching(t *testing.T) {
+	fetcher := &listFilterFetcher{}
+	cache := New(context.Background(), fetcher, nil)
+
+	query := protocol.ResourceListQuery{
+		KubeContext: "dev",
+		Resource:    "pods",
+		Namespace:   "default",
+	}
+	_ = cache.Get(query)
+	_ = waitForCondition(t, 250*time.Millisecond, func() (protocol.ResourceListPayload, bool) {
+		next := cache.Get(query)
+		return next, next.Freshness.State == protocol.FreshnessStateLive && len(next.Items) == 3
+	})
+
+	filtered := cache.Get(protocol.ResourceListQuery{
+		KubeContext: "dev",
+		Resource:    "pods",
+		Namespace:   "default",
+		ListFilter:  "node~rack-a*",
+	})
+	if len(filtered.Items) != 2 {
+		t.Fatalf("expected two filtered pods, got %#v", filtered.Items)
+	}
+	if filtered.TotalItems != 3 {
+		t.Fatalf("expected total item count before filtering to be 3, got %d", filtered.TotalItems)
+	}
+	if filtered.ListFilter != "node~rack-a*" {
+		t.Fatalf("expected normalized list filter, got %q", filtered.ListFilter)
+	}
+	if fetcher.callCount() != 1 {
+		t.Fatalf("expected filtered query to reuse warm cache, got %d fetches", fetcher.callCount())
+	}
+}
+
+func TestListFilterIgnoredForNonPodResources(t *testing.T) {
+	fetcher := &listFilterFetcher{}
+	cache := New(context.Background(), fetcher, nil)
+
+	query := protocol.ResourceListQuery{
+		KubeContext: "dev",
+		Resource:    "services",
+		Namespace:   "default",
+		ListFilter:  "node=rack-a-1",
+	}
+	_ = cache.Get(query)
+	payload := waitForCondition(t, 250*time.Millisecond, func() (protocol.ResourceListPayload, bool) {
+		next := cache.Get(query)
+		return next, next.Freshness.State == protocol.FreshnessStateLive
+	})
+
+	if len(payload.Items) != 3 {
+		t.Fatalf("expected non-pod resource to ignore node filter, got %#v", payload.Items)
+	}
+	if payload.ListFilter != "" {
+		t.Fatalf("expected inactive list filter for non-pod resource, got %q", payload.ListFilter)
+	}
+}
+
 func TestCoreResourceTabSwitchUsesWarmCacheWithoutRefetch(t *testing.T) {
 	fetcher := &countingCoreFetcher{}
 	cache := New(context.Background(), fetcher, nil)
@@ -471,6 +530,29 @@ func (f *filterAwareFetcher) List(ctx context.Context, query protocol.ResourceLi
 	return []protocol.ResourceItem{
 		{Name: name + "-item", Namespace: query.Namespace, Status: "Running"},
 	}, nil
+}
+
+type listFilterFetcher struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *listFilterFetcher) List(context.Context, protocol.ResourceListQuery) ([]protocol.ResourceItem, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+
+	return []protocol.ResourceItem{
+		{Name: "api-a", Namespace: "default", Status: "Running", Node: "rack-a-1"},
+		{Name: "api-b", Namespace: "default", Status: "Running", Node: "rack-a-2"},
+		{Name: "api-c", Namespace: "default", Status: "Running", Node: "rack-b-1"},
+	}, nil
+}
+
+func (f *listFilterFetcher) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 type countingCoreFetcher struct {

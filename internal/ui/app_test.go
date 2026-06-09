@@ -215,6 +215,73 @@ func TestApplyCommandCRDTargetsCRs(t *testing.T) {
 	}
 }
 
+func TestApplyCommandListFilterSetsPodNodeFilter(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace: "default",
+			Resource:  "pods",
+			Filter:    "widgets.example.com",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+	})
+
+	updated, message, reload, err := m.applyCommand("filter node~c1r12-lpu*")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected pod list filter to update session and reload")
+	}
+	if m.session.Filter != "widgets.example.com" {
+		t.Fatalf("expected crd filter to remain unchanged, got %q", m.session.Filter)
+	}
+	if m.session.ListFilter != "node~c1r12-lpu*" {
+		t.Fatalf("expected list filter to be set, got %q", m.session.ListFilter)
+	}
+	if !strings.Contains(message, "node~c1r12-lpu*") {
+		t.Fatalf("expected filter message, got %q", message)
+	}
+}
+
+func TestApplyCommandListFilterClear(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			Namespace:   "default",
+			Resource:    "pods",
+			ListFilter:  "node=node-a",
+			Selection:   "api",
+			KubeContext: "dev",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:   "pods",
+			Namespace:  "default",
+			ListFilter: "node=node-a",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a"},
+			},
+			TotalItems: 1,
+			Freshness:  protocol.FreshnessMeta{State: protocol.FreshnessStateLive, SnapshotTimeUnixMs: 10},
+		},
+	})
+
+	updated, message, reload, err := m.applyCommand("filter clear")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated || !reload {
+		t.Fatalf("expected active pod list filter clear to reload")
+	}
+	if m.session.ListFilter != "" {
+		t.Fatalf("expected list filter to be clear, got %q", m.session.ListFilter)
+	}
+	if message != "filter cleared" {
+		t.Fatalf("expected clear message, got %q", message)
+	}
+}
+
 func TestApplyCommandCRAliasSwitchesToCRs(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -2099,6 +2166,33 @@ func TestCRDSuggestionsFromCRDList(t *testing.T) {
 	}
 }
 
+func TestCommandSuggestionsForPodNodeFilter(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev",
+			Namespace:   "default",
+			Resource:    "pods",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "default", Status: "Running", Node: "node-a"},
+				{Name: "worker", Namespace: "default", Status: "Running", Node: "node-b"},
+			},
+		},
+	})
+
+	suggestions := strings.Join(m.commandSuggestions("filter node="), "\n")
+	if !strings.Contains(suggestions, "node=node-a") || !strings.Contains(suggestions, "node=node-b") {
+		t.Fatalf("expected node suggestions, got %q", suggestions)
+	}
+	clearSuggestions := strings.Join(m.commandSuggestions("filter c"), "\n")
+	if !strings.Contains(clearSuggestions, "clear") {
+		t.Fatalf("expected clear suggestion, got %q", clearSuggestions)
+	}
+}
+
 func TestCRAliasSuggestionsFromCRDList(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -3790,6 +3884,55 @@ func TestRenderMainPaneTitleUsesNamespaceForPods(t *testing.T) {
 	}
 }
 
+func TestRenderMainPaneTitleShowsPodListFilterAndCounts(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "payments",
+			Resource:    "pods",
+			ListFilter:  "node~c1r12*",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:   "pods",
+			Namespace:  "payments",
+			ListFilter: "node~c1r12*",
+			TotalItems: 3,
+			Items: []protocol.ResourceItem{
+				{Name: "api", Namespace: "payments", Status: "Running", Node: "c1r12-lpu1"},
+			},
+			Freshness: protocol.FreshnessMeta{State: protocol.FreshnessStateLive, SnapshotTimeUnixMs: 10},
+		},
+	})
+
+	mainPane := m.renderMainPane(100, 8)
+	if !strings.Contains(mainPane, "dev-cluster > payments > pods [node~c1r12*] 1/3 pods") {
+		t.Fatalf("expected pod filter and count in title, got %q", mainPane)
+	}
+}
+
+func TestRenderEmptyPaneShowsPodListFilter(t *testing.T) {
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "payments",
+			Resource:    "pods",
+			ListFilter:  "node=node-a",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:   "pods",
+			Namespace:  "payments",
+			ListFilter: "node=node-a",
+			TotalItems: 2,
+			Freshness:  protocol.FreshnessMeta{State: protocol.FreshnessStateLive, SnapshotTimeUnixMs: 10},
+		},
+	})
+
+	mainPane := m.renderMainPane(80, 8)
+	if !strings.Contains(mainPane, "no pods match node=node-a") {
+		t.Fatalf("expected filter-aware empty state, got %q", mainPane)
+	}
+}
+
 func TestRenderMainPaneTitleUsesClusterScopeForClusterScopedCRs(t *testing.T) {
 	m := newModel(Options{
 		Session: protocol.SessionState{
@@ -3845,6 +3988,7 @@ func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 			Namespace:   "default",
 			Resource:    "pods",
 			Filter:      "widgets.example.com",
+			ListFilter:  "node=node-a",
 		},
 		ResourceList: protocol.ResourceListPayload{
 			Resource:  "pods",
@@ -3890,11 +4034,57 @@ func TestEnterExecutesCommandAndReloadsList(t *testing.T) {
 	if seen.Filter != "widgets.example.com" {
 		t.Fatalf("expected filter in list query, got %q", seen.Filter)
 	}
+	if seen.ListFilter != "" {
+		t.Fatalf("expected pod-only list filter to be omitted for services, got %q", seen.ListFilter)
+	}
 	if final.resourceList.Resource != "services" {
 		t.Fatalf("expected reloaded resource services, got %q", final.resourceList.Resource)
 	}
 	if final.session.Selection != "svc-a" {
 		t.Fatalf("expected selection svc-a, got %q", final.session.Selection)
+	}
+}
+
+func TestStartListReloadIncludesPodListFilter(t *testing.T) {
+	var seen protocol.ResourceListQuery
+	m := newModel(Options{
+		Session: protocol.SessionState{
+			KubeContext: "dev-cluster",
+			Namespace:   "default",
+			Resource:    "pods",
+			ListFilter:  "node=node-a",
+		},
+		ResourceList: protocol.ResourceListPayload{
+			Resource:  "pods",
+			Namespace: "default",
+		},
+		LoadResourceList: func(_ context.Context, query protocol.ResourceListQuery) (protocol.ResourceListPayload, error) {
+			seen = query
+			return protocol.ResourceListPayload{
+				Resource:   query.Resource,
+				Namespace:  query.Namespace,
+				ListFilter: query.ListFilter,
+				Items: []protocol.ResourceItem{
+					{Name: "api", Namespace: "default", Status: "Running", Node: "node-a"},
+				},
+				TotalItems: 1,
+				Freshness:  protocol.FreshnessMeta{State: protocol.FreshnessStateLive},
+			}, nil
+		},
+	})
+
+	updatedModel, cmd := m.startListReload()
+	next := updatedModel.(model)
+	if cmd == nil {
+		t.Fatalf("expected reload command")
+	}
+	updatedModel, _ = next.Update(cmd())
+	final := updatedModel.(model)
+	if seen.ListFilter != "node=node-a" {
+		t.Fatalf("expected pod list filter in query, got %q", seen.ListFilter)
+	}
+	if final.resourceList.ListFilter != "node=node-a" {
+		t.Fatalf("expected payload list filter to be preserved, got %q", final.resourceList.ListFilter)
 	}
 }
 

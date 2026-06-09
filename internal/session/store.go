@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,6 +80,9 @@ func normalizeState(state protocol.SessionState) protocol.SessionState {
 	if state.Resource == "" {
 		state.Resource = defaults.Resource
 	}
+	state.Filter = strings.TrimSpace(state.Filter)
+	state.ListFilter = strings.TrimSpace(state.ListFilter)
+	state.Selection = strings.TrimSpace(state.Selection)
 
 	return state
 }

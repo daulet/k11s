@@ -57,7 +57,8 @@ Session override flags (persisted through daemon):
 - `--context`
 - `--namespace`
 - `--resource`
-- `--filter`
+- `--filter` (CRD selector for `crs`)
+- `--list-filter`
 - `--selection`
 - `--simulate-stale` (for stale-state visual validation)
 
@@ -98,6 +99,9 @@ Command line examples:
 - `:ns all` (all namespaces view)
 - `:ctx dev-cluster` or `:context dev-cluster`
 - `:pods`, `:services`, `:deployments`, `:nodes`, `:namespaces` (switch resource view)
+- `:filter node~c1r12-lpu*` (show pods on nodes matching a glob/substring pattern)
+- `:filter node=node-a` (show pods on an exact node)
+- `:filter clear` (clear the active list filter)
 - `:crds` (list custom resource definitions)
 - `:crs widgets.example.com` or `:crd widgets.example.com` (list CRs for a selected CRD)
 - `:delete` (delete selected row), `:delete <name>`, or `:delete <namespace>/<name>` when in `all` namespace
@@ -114,7 +118,8 @@ Pod terminal actions:
 Autocomplete notes:
 - `:ctx ` / `:context ` suggestions are loaded from kubeconfig (`KUBECONFIG` or `~/.kube/config`).
 - `:ns ` / `:namespace ` suggestions are loaded via daemon RPC and refreshed per selected kube context.
-- `:crd ` / `:crs ` / `:filter ` suggestions are loaded from cached `crds` via daemon RPC and refreshed per selected kube context.
+- `:filter ` suggestions include `node=`, `node~`, `clear`, and node names from the current pod list.
+- `:crd ` / `:crs ` suggestions are loaded from cached `crds` via daemon RPC and refreshed per selected kube context.
 - Mutating commands require a `LIVE` view; stale or recovering views fail with `STALE_DATA` guardrail feedback.
 
 CI checks:
